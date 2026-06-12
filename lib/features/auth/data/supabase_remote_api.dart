@@ -1183,11 +1183,16 @@ class SupabaseRemoteApi {
       return null;
     }
 
-    final discoveredFarmId = _asString(
-      invite['farm_id'] ?? invite['farmId'] ?? invite['tenant_id'],
-    );
-    final discoveredRole = _asString(invite['role']).trim().toUpperCase();
-    if (discoveredFarmId.isEmpty || discoveredRole.isEmpty) {
+    final assignedFarmId =
+        (invite['farm_id'] ?? invite['farmId'] ?? invite['tenant_id'])
+            ?.toString()
+            .trim() ??
+        '';
+    final assignedRole =
+        invite['role']?.toString().toLowerCase().trim() ?? 'worker';
+    final discoveredRole = assignedRole.isEmpty ? 'worker' : assignedRole;
+    final dbRole = discoveredRole.toUpperCase();
+    if (assignedFarmId.isEmpty) {
       throw const AuthException(
         'The farm invitation is missing a farm or role assignment. Please request a fresh invite from your Farm Owner.',
       );
@@ -1214,7 +1219,7 @@ class SupabaseRemoteApi {
       'firstname': firstName,
       'surname': lastName,
       'name': fullName.isEmpty ? '$firstName $lastName' : fullName,
-      'role': discoveredRole,
+      'role': dbRole,
       'created_at': now,
       'updated_at': now,
       'must_change_password': false,
@@ -1224,37 +1229,40 @@ class SupabaseRemoteApi {
     await _safeUpsertLegacyProfileForInvite(
       authUser: authUser,
       email: normalizedEmail,
-      farmId: discoveredFarmId,
+      farmId: assignedFarmId,
       role: discoveredRole,
       fullName: fullName.isEmpty ? '$firstName $lastName' : fullName,
       createdAt: now,
     );
 
     await client.from('farm_members').upsert({
-      'id': _stableJoinId('farm_member', discoveredFarmId, authUser.id),
-      'farmId': discoveredFarmId,
+      'id': _stableJoinId('farm_member', assignedFarmId, authUser.id),
+      'farmId': assignedFarmId,
       'userId': authUser.id,
-      'role': discoveredRole,
+      'role': dbRole,
       'createdAt': now,
       'updatedAt': now,
     });
 
     await client.from('user_permissions').upsert({
-      'id': _stableJoinId('permission', discoveredFarmId, authUser.id),
+      'id': _stableJoinId('permission', assignedFarmId, authUser.id),
       'user_id': authUser.id,
-      'farm_id': discoveredFarmId,
+      'farm_id': assignedFarmId,
       ..._defaultPermissionsForRole(discoveredRole),
     });
 
-    await client
-        .from('invitations')
-        .update({'status': 'accepted', 'updated_at': now})
-        .eq('id', _asString(invite['id']));
+    final inviteId = invite['id']?.toString().trim() ?? '';
+    if (inviteId.isNotEmpty) {
+      await client
+          .from('invitations')
+          .update({'status': 'accepted', 'updated_at': now})
+          .eq('id', inviteId);
+    }
 
     await client.auth.updateUser(
       UserAttributes(
         data: {
-          'farm_id': discoveredFarmId,
+          'farm_id': assignedFarmId,
           'role': discoveredRole,
           'mobile_invitation_linked': true,
         },
@@ -1262,7 +1270,7 @@ class SupabaseRemoteApi {
     );
 
     debugPrint(
-      'HatchLog Auth Engine: Linked Google user $normalizedEmail to farm $discoveredFarmId as $discoveredRole.',
+      'HatchLog Auth Engine: Linked Google user $normalizedEmail to farm $assignedFarmId as $discoveredRole.',
     );
     return profile;
   }

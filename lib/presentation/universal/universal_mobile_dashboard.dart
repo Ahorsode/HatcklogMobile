@@ -190,15 +190,11 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
   Stream<List<Map<String, dynamic>>> _streamFor(_HatchModuleConfig module) {
     final supabase = _supabase;
     if (supabase == null) {
-      return Stream<List<Map<String, dynamic>>>.value(
-        const <Map<String, dynamic>>[],
-      );
+      return const Stream<List<Map<String, dynamic>>>.empty();
     }
     final activeFarmId = _activeFarmId(supabase);
     if (activeFarmId.isEmpty || module.tenantColumn == null) {
-      return Stream<List<Map<String, dynamic>>>.value(
-        const <Map<String, dynamic>>[],
-      );
+      return const Stream<List<Map<String, dynamic>>>.empty();
     }
 
     final stream = supabase
@@ -1295,50 +1291,65 @@ class _DashboardKpiCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       elevation: 0,
+      clipBehavior: Clip.antiAlias,
       color: color.withValues(alpha: 0.1),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(8),
         side: BorderSide(color: color.withValues(alpha: 0.18)),
       ),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(icon, color: color, size: 32),
-            const SizedBox(height: 10),
-            if (error != null)
-              const Icon(Icons.sync_problem_outlined, color: Colors.redAccent)
-            else if (isLoading)
-              SizedBox.square(
-                dimension: 24,
-                child: CircularProgressIndicator(strokeWidth: 2, color: color),
-              )
-            else
-              FittedBox(
-                fit: BoxFit.scaleDown,
-                child: Text(
-                  metric,
-                  maxLines: 1,
-                  style: const TextStyle(
-                    color: _UniversalColors.ink,
-                    fontSize: 24,
-                    fontWeight: FontWeight.w900,
+      child: InkWell(
+        onTap: () {
+          HapticFeedback.selectionClick();
+          showHatchLogDetailsPopup(context, {
+            'metric': metric,
+            'label': label,
+            'isLoading': isLoading,
+            if (error != null) 'error': error.toString(),
+          }, '$label Details');
+        },
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: color, size: 32),
+              const SizedBox(height: 10),
+              if (error != null)
+                const Icon(Icons.sync_problem_outlined, color: Colors.redAccent)
+              else if (isLoading)
+                SizedBox.square(
+                  dimension: 24,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: color,
+                  ),
+                )
+              else
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    metric,
+                    maxLines: 1,
+                    style: const TextStyle(
+                      color: _UniversalColors.ink,
+                      fontSize: 24,
+                      fontWeight: FontWeight.w900,
+                    ),
                   ),
                 ),
+              const SizedBox(height: 7),
+              Text(
+                error == null ? label : 'Data Sync Interrupted',
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: _UniversalColors.muted,
+                  fontWeight: FontWeight.w800,
+                ),
               ),
-            const SizedBox(height: 7),
-            Text(
-              error == null ? label : 'Data Sync Interrupted',
-              textAlign: TextAlign.center,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: _UniversalColors.muted,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -1440,9 +1451,7 @@ Stream<List<Map<String, dynamic>>> _dashboardStream(
   Map<String, Object> equals = const {},
 }) {
   if (supabase == null || activeFarmId.isEmpty) {
-    return Stream<List<Map<String, dynamic>>>.value(
-      const <Map<String, dynamic>>[],
-    );
+    return const Stream<List<Map<String, dynamic>>>.empty();
   }
   final stream = supabase
       .from(table)
@@ -2172,50 +2181,63 @@ class _SummaryCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       elevation: 0,
+      clipBehavior: Clip.antiAlias,
       color: module.color,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-      child: Padding(
-        padding: const EdgeInsets.all(18),
-        child: Row(
-          children: [
-            Container(
-              width: 58,
-              height: 58,
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.16),
-                borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        onTap: () {
+          HapticFeedback.selectionClick();
+          showHatchLogDetailsPopup(context, {
+            'module': module.title,
+            'summaryTitle': module.summaryTitle,
+            'summaryValue': module.summaryValue(rows),
+            'visibleRows': rows.length,
+          }, '${module.shortLabel} Summary');
+        },
+        child: Padding(
+          padding: const EdgeInsets.all(18),
+          child: Row(
+            children: [
+              Container(
+                width: 58,
+                height: 58,
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.16),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Icon(module.icon, color: Colors.white, size: 32),
               ),
-              child: Icon(module.icon, color: Colors.white, size: 32),
-            ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    module.summaryTitle,
-                    style: const TextStyle(
-                      color: Colors.white70,
-                      fontWeight: FontWeight.w800,
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      module.summaryTitle,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    module.summaryValue(rows),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 0,
+                    const SizedBox(height: 4),
+                    Text(
+                      module.summaryValue(rows),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.headlineSmall
+                          ?.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 0,
+                          ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
-            ),
-            const SizedBox(width: 8),
-            _SummaryCountBadge(count: rows.length),
-          ],
+              const SizedBox(width: 8),
+              _SummaryCountBadge(count: rows.length),
+            ],
+          ),
         ),
       ),
     );
