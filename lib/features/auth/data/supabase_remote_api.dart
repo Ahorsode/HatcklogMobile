@@ -184,6 +184,7 @@ class SupabaseRemoteApi {
       lookupEmail,
     );
     if (profile == null) {
+      await client.auth.signOut();
       throw const AuthException(
         'No active farm assignment found for this email address. Please request an invite from your Farm Owner.',
       );
@@ -195,6 +196,7 @@ class SupabaseRemoteApi {
       preferredProfile: profile,
     );
     if (user.activeFarmId.trim().isEmpty) {
+      await client.auth.signOut();
       throw const AuthException(
         'No active farm assignment found for this email address. Please request an invite from your Farm Owner.',
       );
@@ -1219,6 +1221,14 @@ class SupabaseRemoteApi {
       'is_payment_admin': false,
     };
     await client.from('users').upsert(profile);
+    await _safeUpsertLegacyProfileForInvite(
+      authUser: authUser,
+      email: normalizedEmail,
+      farmId: discoveredFarmId,
+      role: discoveredRole,
+      fullName: fullName.isEmpty ? '$firstName $lastName' : fullName,
+      createdAt: now,
+    );
 
     await client.from('farm_members').upsert({
       'id': _stableJoinId('farm_member', discoveredFarmId, authUser.id),
@@ -1255,6 +1265,30 @@ class SupabaseRemoteApi {
       'HatchLog Auth Engine: Linked Google user $normalizedEmail to farm $discoveredFarmId as $discoveredRole.',
     );
     return profile;
+  }
+
+  Future<void> _safeUpsertLegacyProfileForInvite({
+    required User authUser,
+    required String email,
+    required String farmId,
+    required String role,
+    required String fullName,
+    required String createdAt,
+  }) async {
+    try {
+      await _requireClient().from('profiles').upsert({
+        'id': authUser.id,
+        'email': email,
+        'farm_id': farmId,
+        'role': role,
+        'full_name': fullName,
+        'createdAt': createdAt,
+      });
+    } on Object catch (error) {
+      debugPrint(
+        'HatchLog Auth Engine: Optional legacy profiles upsert skipped -> $error',
+      );
+    }
   }
 
   Future<Map<String, dynamic>?> _readPendingInvitationByEmail(

@@ -172,8 +172,11 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
           if (privileged) {
             return true;
           }
-          final viewKey = module.viewPermissionKey;
-          return viewKey != null && _permissionEnabled(permissions[viewKey]);
+          return _hasModulePermission(
+            permissions,
+            module.viewPermissionKey,
+            module.viewPermissionAliases,
+          );
         })
         .toList(growable: false);
   }
@@ -198,12 +201,16 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       );
     }
 
-    return supabase
+    final stream = supabase
         .from(module.table)
         .stream(primaryKey: ['id'])
         .eq(module.tenantColumn!, activeFarmId)
         .order(module.orderBy, ascending: false)
         .limit(100);
+    if (module.streamEquals.isEmpty) {
+      return stream;
+    }
+    return stream.map((rows) => _applyEqualsFilters(rows, module.streamEquals));
   }
 
   String _activeFarmId(SupabaseClient supabase) {
@@ -387,9 +394,28 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
     if (_isPrivilegedRole(widget.currentUser.role)) {
       return true;
     }
-    final editKey = module.editPermissionKey;
-    return editKey != null && _permissionEnabled(_permissions[editKey]);
+    return _hasModulePermission(
+      _permissions,
+      module.editPermissionKey,
+      module.editPermissionAliases,
+    );
   }
+}
+
+bool _hasModulePermission(
+  Map<String, dynamic> permissions,
+  String? primaryKey,
+  List<String> aliases,
+) {
+  if (primaryKey != null && _permissionEnabled(permissions[primaryKey])) {
+    return true;
+  }
+  for (final alias in aliases) {
+    if (_permissionEnabled(permissions[alias])) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool _isPrivilegedRole(UserRole role) {
@@ -650,6 +676,7 @@ class FarmDashboardHomeView extends StatelessWidget {
                   farmColumn: 'farm_id',
                   activeFarmId: activeFarmId,
                   orderBy: 'transaction_date',
+                  equals: const {'type': 'sale'},
                 ),
                 builder: (context, snapshot) {
                   final salesRows =
@@ -734,6 +761,7 @@ class FarmDashboardHomeView extends StatelessWidget {
                   activeFarmId: activeFarmId,
                   orderBy: 'transaction_date',
                   limit: 5,
+                  equals: const {'type': 'sale'},
                 ).map(
                   (rows) => rows
                       .where(_includeRevenueTransaction)
@@ -1005,6 +1033,7 @@ class _AccountantDashboardHomeView extends StatelessWidget {
                   farmColumn: 'farm_id',
                   activeFarmId: activeFarmId,
                   orderBy: 'transaction_date',
+                  equals: const {'type': 'sale'},
                 ),
                 builder: (context, snapshot) {
                   final todayRows =
@@ -1110,6 +1139,7 @@ class _AccountantDashboardHomeView extends StatelessWidget {
                   activeFarmId: activeFarmId,
                   orderBy: 'transaction_date',
                   limit: 5,
+                  equals: const {'type': 'sale'},
                 ).map(
                   (rows) => rows
                       .where(_includeRevenueTransaction)
@@ -1407,18 +1437,40 @@ Stream<List<Map<String, dynamic>>> _dashboardStream(
   required String activeFarmId,
   required String orderBy,
   int limit = 100,
+  Map<String, Object> equals = const {},
 }) {
   if (supabase == null || activeFarmId.isEmpty) {
     return Stream<List<Map<String, dynamic>>>.value(
       const <Map<String, dynamic>>[],
     );
   }
-  return supabase
+  final stream = supabase
       .from(table)
       .stream(primaryKey: ['id'])
       .eq(farmColumn, activeFarmId)
       .order(orderBy, ascending: false)
       .limit(limit);
+  if (equals.isEmpty) {
+    return stream;
+  }
+  return stream.map((rows) => _applyEqualsFilters(rows, equals));
+}
+
+List<Map<String, dynamic>> _applyEqualsFilters(
+  List<Map<String, dynamic>> rows,
+  Map<String, Object> equals,
+) {
+  return rows
+      .where((row) {
+        for (final filter in equals.entries) {
+          if (row[filter.key]?.toString().toLowerCase() !=
+              filter.value.toString().toLowerCase()) {
+            return false;
+          }
+        }
+        return true;
+      })
+      .toList(growable: false);
 }
 
 bool _isLoading(AsyncSnapshot<Object?> snapshot) {
@@ -2720,6 +2772,9 @@ class _HatchModuleConfig {
     this.creatorColumn,
     this.viewPermissionKey,
     this.editPermissionKey,
+    this.viewPermissionAliases = const [],
+    this.editPermissionAliases = const [],
+    this.streamEquals = const {},
     this.includeRow = _includeEveryRow,
     this.progress,
   });
@@ -2741,6 +2796,9 @@ class _HatchModuleConfig {
   final String? creatorColumn;
   final String? viewPermissionKey;
   final String? editPermissionKey;
+  final List<String> viewPermissionAliases;
+  final List<String> editPermissionAliases;
+  final Map<String, Object> streamEquals;
   final String Function(List<Map<String, dynamic>> rows) summaryValue;
   final _RecordVm Function(Map<String, dynamic> row) record;
   final bool Function(Map<String, dynamic> row) includeRow;
@@ -2832,6 +2890,8 @@ List<_HatchModuleConfig> _buildModules() {
       creatorColumn: 'userId',
       viewPermissionKey: 'can_view_batches',
       editPermissionKey: 'can_edit_batches',
+      viewPermissionAliases: const ['can_view_livestock'],
+      editPermissionAliases: const ['can_edit_livestock'],
       icon: Icons.groups_3_outlined,
       color: const Color(0xff1f7a4d),
       emptyText: 'Add a livestock batch to begin tracking flock movement.',
@@ -3326,6 +3386,7 @@ List<_HatchModuleConfig> _buildModules() {
       creatorColumn: 'user_id',
       viewPermissionKey: 'can_view_sales',
       editPermissionKey: 'can_edit_sales',
+      streamEquals: const {'type': 'sale'},
       includeRow: _includeRevenueTransaction,
       icon: Icons.receipt_long_outlined,
       color: const Color(0xff16845c),
@@ -3390,7 +3451,7 @@ List<_HatchModuleConfig> _buildModules() {
         final total = quantity * unitPrice;
         final received = _numPayload(payload, 'amount_received');
         return {
-          'type': 'SALE',
+          'type': 'sale',
           'category': 'SALES',
           'amount': total,
           'payment_status': received >= total ? 'PAID' : 'PARTIALLY_PAID',
