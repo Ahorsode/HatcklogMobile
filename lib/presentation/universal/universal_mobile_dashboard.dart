@@ -11,6 +11,7 @@ import '../../features/management/data/management_repository.dart';
 import '../../features/sync/data/worker_input_sink.dart';
 import '../../services/local_sales_queue.dart';
 import '../../services/pdf_invoice_service.dart';
+import '../analytics/farm_analytics_screen.dart';
 import '../shared/hatchlog_details_popup.dart';
 import '../shared/session_mode_badge.dart';
 
@@ -363,6 +364,22 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
     await widget.onSignOut();
   }
 
+  Future<void> _openAnalytics() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => FarmAnalyticsScreen(
+          currentUser: widget.currentUser,
+          managementRepository: widget.managementRepository,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final module = _visibleModules[_selectedIndex];
@@ -378,6 +395,9 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
           HapticFeedback.lightImpact();
           setState(() => _selectedIndex = index);
           Navigator.of(context).maybePop();
+        },
+        onOpenAnalytics: () {
+          _openAnalytics();
         },
         onSignOut: _signOut,
       ),
@@ -2068,6 +2088,7 @@ class _UniversalDrawer extends StatelessWidget {
     required this.modules,
     required this.selectedIndex,
     required this.onSelected,
+    required this.onOpenAnalytics,
     required this.onSignOut,
   });
 
@@ -2075,6 +2096,7 @@ class _UniversalDrawer extends StatelessWidget {
   final List<_HatchModuleConfig> modules;
   final int selectedIndex;
   final ValueChanged<int> onSelected;
+  final VoidCallback onOpenAnalytics;
   final VoidCallback onSignOut;
 
   @override
@@ -2132,6 +2154,13 @@ class _UniversalDrawer extends StatelessWidget {
                   );
                 },
               ),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.bar_chart),
+              title: const Text('Farm Analytics'),
+              subtitle: const Text('Charts for eggs, losses, feed, and cash'),
+              onTap: onOpenAnalytics,
             ),
             const Divider(height: 1),
             ListTile(

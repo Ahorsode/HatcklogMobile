@@ -8,6 +8,7 @@ import 'package:hatchlog_m/features/management/data/management_models.dart';
 import 'package:hatchlog_m/features/management/data/management_repository.dart';
 import 'package:hatchlog_m/features/role_gateway/presentation/role_gateway.dart';
 import 'package:hatchlog_m/features/sync/data/worker_input_sink.dart';
+import 'package:hatchlog_m/presentation/analytics/analytics_models.dart';
 import 'package:hatchlog_m/core/storage/local_database.dart';
 import 'package:hatchlog_m/services/encryption_service.dart';
 import 'package:hatchlog_m/services/local_sales_queue.dart';
@@ -227,6 +228,21 @@ class _FakeManagementDataSource implements ManagementDataSource {
   @override
   Future<ManagementSnapshot> loadSnapshot(AppUser user) async {
     return _snapshot();
+  }
+
+  @override
+  Future<FarmAnalyticsSnapshot> loadAnalytics(AppUser user) async {
+    return const FarmAnalyticsSnapshot(
+      eggProduction7d: [],
+      mortality7d: [],
+      feedUsage7d: [],
+      revenue14d: [],
+      expenses14d: [],
+      peakEggDay: 0,
+      avgDailyMortality: 0,
+      totalFeedUsed7d: 0,
+      netProfit14d: 0,
+    );
   }
 
   @override

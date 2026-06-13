@@ -1,10 +1,13 @@
 import '../../../core/models/app_user.dart';
 import '../../../core/storage/local_database.dart';
+import '../../../presentation/analytics/analytics_models.dart';
 import '../../auth/data/supabase_remote_api.dart';
 import 'management_models.dart';
 
 abstract class ManagementDataSource {
   Future<ManagementSnapshot> loadSnapshot(AppUser user);
+
+  Future<FarmAnalyticsSnapshot> loadAnalytics(AppUser user);
 
   Stream<ManagementSnapshot> watchSnapshot(AppUser user);
 
@@ -96,6 +99,74 @@ class ManagementRepository implements ManagementDataSource {
       customerRecords: customerRecords,
       supplierRecords: supplierRecords,
       financeRecords: financeRecords,
+    );
+  }
+
+  @override
+  Future<FarmAnalyticsSnapshot> loadAnalytics(AppUser user) async {
+    final farmId = user.activeFarmId;
+    final today = _dayOnly(DateTime.now());
+    final sevenDayStart = today.subtract(const Duration(days: 6));
+    final fourteenDayStart = today.subtract(const Duration(days: 13));
+
+    final eggRows = await _localDatabase.rawLocalQuery(
+      'select date(log_date) as day, coalesce(sum(eggs_collected), 0) as total '
+      'from egg_production '
+      'where farm_id = ? and date(log_date) >= date(?) and is_deleted = 0 '
+      'group by date(log_date) order by day asc',
+      [farmId, sevenDayStart.toIso8601String()],
+    );
+    final mortalityRows = await _localDatabase.rawLocalQuery(
+      'select date(log_date) as day, coalesce(sum(count), 0) as total '
+      'from mortality '
+      "where farm_id = ? and date(log_date) >= date(?) and is_deleted = 0 and upper(type) = 'DEAD' "
+      'group by date(log_date) order by day asc',
+      [farmId, sevenDayStart.toIso8601String()],
+    );
+    final feedRows = await _localDatabase.rawLocalQuery(
+      'select date(log_date) as day, coalesce(sum(amount_consumed), 0) as total '
+      'from daily_feeding_logs '
+      'where farm_id = ? and date(log_date) >= date(?) and is_deleted = 0 '
+      'group by date(log_date) order by day asc',
+      [farmId, sevenDayStart.toIso8601String()],
+    );
+    final revenueRows = await _localDatabase.rawLocalQuery(
+      'select date(transaction_date) as day, coalesce(sum(amount), 0) as total '
+      'from financial_transactions '
+      "where farm_id = ? and date(transaction_date) >= date(?) and is_deleted = 0 and upper(type) = 'REVENUE' "
+      'group by date(transaction_date) order by day asc',
+      [farmId, fourteenDayStart.toIso8601String()],
+    );
+    final expenseRows = await _localDatabase.rawLocalQuery(
+      'select date(transaction_date) as day, coalesce(sum(amount), 0) as total '
+      'from financial_transactions '
+      "where farm_id = ? and date(transaction_date) >= date(?) and is_deleted = 0 and upper(type) = 'EXPENSE' "
+      'group by date(transaction_date) order by day asc',
+      [farmId, fourteenDayStart.toIso8601String()],
+    );
+
+    final eggPoints = _pointsForWindow(eggRows, sevenDayStart, 7);
+    final mortalityPoints = _pointsForWindow(mortalityRows, sevenDayStart, 7);
+    final feedPoints = _pointsForWindow(feedRows, sevenDayStart, 7);
+    final revenuePoints = _pointsForWindow(revenueRows, fourteenDayStart, 14);
+    final expensePoints = _pointsForWindow(expenseRows, fourteenDayStart, 14);
+    final totalRevenue = revenuePoints.fold(0.0, (sum, p) => sum + p.value);
+    final totalExpenses = expensePoints.fold(0.0, (sum, p) => sum + p.value);
+
+    return FarmAnalyticsSnapshot(
+      eggProduction7d: eggPoints,
+      mortality7d: mortalityPoints,
+      feedUsage7d: feedPoints,
+      revenue14d: revenuePoints,
+      expenses14d: expensePoints,
+      peakEggDay: eggPoints.fold(0, (peak, p) {
+        final value = p.value.round();
+        return value > peak ? value : peak;
+      }),
+      avgDailyMortality:
+          mortalityPoints.fold(0.0, (sum, p) => sum + p.value) / 7,
+      totalFeedUsed7d: feedPoints.fold(0.0, (sum, p) => sum + p.value),
+      netProfit14d: totalRevenue - totalExpenses,
     );
   }
 
@@ -704,5 +775,25 @@ class ManagementRepository implements ManagementDataSource {
 
   String _moneyText(double value) {
     return 'GHS ${value.toStringAsFixed(2)}';
+  }
+
+  DateTime _dayOnly(DateTime date) {
+    return DateTime(date.year, date.month, date.day);
+  }
+
+  List<DailyDataPoint> _pointsForWindow(
+    List<Map<String, Object?>> rows,
+    DateTime start,
+    int dayCount,
+  ) {
+    final totalsByDay = <String, double>{
+      for (final row in rows) _string(row['day']): _double(row['total']),
+    };
+    return List<DailyDataPoint>.generate(dayCount, (index) {
+      final date = start.add(Duration(days: index));
+      final key =
+          '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+      return DailyDataPoint(date: date, value: totalsByDay[key] ?? 0);
+    });
   }
 }
