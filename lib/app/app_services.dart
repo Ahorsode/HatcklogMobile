@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import '../core/connectivity/connectivity_service.dart';
+import '../core/storage/device_identity_store.dart';
 import '../core/storage/local_database.dart';
 import '../core/storage/secure_credential_store.dart';
 import '../features/auth/data/auth_repository.dart';
@@ -78,7 +79,7 @@ class AppServices {
     );
 
     final encryptionService = EncryptionService();
-    final deviceId = 'device-${DateTime.now().millisecondsSinceEpoch}';
+    final deviceId = await DeviceIdentityStore.getOrCreate();
     final localSalesQueue = LocalSalesQueue(
       localDatabase: localDatabase,
       encryptionService: encryptionService,

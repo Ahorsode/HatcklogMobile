@@ -2,6 +2,12 @@
 
 A new Flutter project.
 
+## Environment setup
+
+Copy `.env.example` to `.env.mobile` and fill in the Supabase and Google OAuth
+values for your own environment. `.env.mobile` is used as a Flutter asset at
+build time, but it must stay local and must not be committed.
+
 ## Getting Started
 
 This project is a starting point for a Flutter application.

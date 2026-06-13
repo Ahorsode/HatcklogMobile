@@ -1090,8 +1090,11 @@ class SupabaseRemoteApi {
   }
 
   bool _hasEnvironmentState(Map<String, dynamic> row) {
-    return _asString(row['currentTemperature']).isNotEmpty ||
-        _asString(row['currentHumidity']).isNotEmpty;
+    final temperature = row['currentTemperature'];
+    final humidity = row['currentHumidity'];
+    final hasTemp = temperature != null && _asDouble(temperature) != 0.0;
+    final hasHumidity = humidity != null && _asDouble(humidity) != 0.0;
+    return hasTemp || hasHumidity;
   }
 
   String _environmentState(Map<String, dynamic> row) {

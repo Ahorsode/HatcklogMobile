@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
+
 import '../features/auth/data/auth_repository.dart';
 import '../features/auth/data/supabase_remote_api.dart';
 import '../core/storage/local_database.dart';
@@ -13,6 +15,7 @@ class SessionWatcher {
     required this.localDatabase,
     required this.currentUser,
     required this.connectivityService,
+    required this.onForcedSignOut,
     this.pollInterval = const Duration(seconds: 12),
   });
 
@@ -21,6 +24,7 @@ class SessionWatcher {
   final LocalDatabase localDatabase;
   final AppUser currentUser;
   final ConnectivityService connectivityService;
+  final VoidCallback onForcedSignOut;
   final Duration pollInterval;
 
   Timer? _timer;
@@ -51,6 +55,7 @@ class SessionWatcher {
           remoteUserRole != currentUser.role) {
         // Role changed remotely — force logout
         await authRepository.signOut();
+        onForcedSignOut();
       }
     } catch (_) {
       // ignore network errors

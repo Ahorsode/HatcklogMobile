@@ -53,8 +53,14 @@ class SupabaseConfig {
       );
     }
 
-    throw Exception(
-      'CRITICAL FATAL ERROR: Configuration tokens are unresolvable via Asset Vault or Engine Environment.',
+    debugPrint(
+      'WARN: Supabase credentials not found in packed asset or compile-time '
+      'tokens. App will operate in offline-only mode.',
+    );
+    return const SupabaseConfig(
+      url: '',
+      clientKey: '',
+      source: SupabaseConfigSource.packedAsset,
     );
   }
 }

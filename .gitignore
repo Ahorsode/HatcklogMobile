@@ -5,7 +5,6 @@
 *.swp
 .env
 .env.*
-!.env.mobile
 !.env.example
 .DS_Store
 .atom/

@@ -8,6 +8,9 @@ import 'package:hatchlog_m/features/management/data/management_models.dart';
 import 'package:hatchlog_m/features/management/data/management_repository.dart';
 import 'package:hatchlog_m/features/role_gateway/presentation/role_gateway.dart';
 import 'package:hatchlog_m/features/sync/data/worker_input_sink.dart';
+import 'package:hatchlog_m/core/storage/local_database.dart';
+import 'package:hatchlog_m/services/encryption_service.dart';
+import 'package:hatchlog_m/services/local_sales_queue.dart';
 
 void main() {
   test('phone identifiers are masked as internal email auth identities', () {
@@ -28,6 +31,28 @@ void main() {
       '+233554101675',
     );
   });
+
+  test(
+    'local sales queue rejects invalid quantities before storage writes',
+    () {
+      final queue = LocalSalesQueue(
+        localDatabase: LocalDatabase(),
+        encryptionService: EncryptionService(),
+        deviceId: 'device-test',
+      );
+
+      expect(
+        () => queue.enqueueSale(
+          userId: 'user-1',
+          farmId: 'farm-1',
+          quantityCrates: 0,
+          amountReceived: 20,
+          unit: 'CRATE',
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    },
+  );
 
   test('owner and admin role aliases retain universal access', () {
     expect(UserRole.fromString('OWNER'), UserRole.owner);

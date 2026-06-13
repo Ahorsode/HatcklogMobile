@@ -22,6 +22,21 @@ class LocalSalesQueue {
     required String unit, // 'CRATE' or 'BIRD'
     String paymentMethod = 'CASH',
   }) async {
+    if (quantityCrates <= 0) {
+      throw ArgumentError.value(
+        quantityCrates,
+        'quantityCrates',
+        'Quantity must be greater than zero.',
+      );
+    }
+    if (amountReceived <= 0) {
+      throw ArgumentError.value(
+        amountReceived,
+        'amountReceived',
+        'Amount received must be greater than zero.',
+      );
+    }
+
     final deviceTimestamp = DateTime.now().toUtc();
 
     // Check recent inputs to detect backwards time travel

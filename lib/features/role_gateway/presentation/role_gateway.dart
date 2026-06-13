@@ -41,6 +41,10 @@ class RoleGateway extends StatelessWidget {
       connectionChanges: connectionChanges,
       isOnline: isOnline,
       onSignOut: onSignOut,
+      inputSink: inputSink,
+      managementRepository: managementRepository,
+      localSalesQueue: localSalesQueue,
+      pdfInvoiceService: pdfInvoiceService,
     );
   }
 }

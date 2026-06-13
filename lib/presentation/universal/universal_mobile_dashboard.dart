@@ -6,6 +6,11 @@ import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/models/app_user.dart';
+import '../../core/models/worker_input_type.dart';
+import '../../features/management/data/management_repository.dart';
+import '../../features/sync/data/worker_input_sink.dart';
+import '../../services/local_sales_queue.dart';
+import '../../services/pdf_invoice_service.dart';
 import '../shared/hatchlog_details_popup.dart';
 import '../shared/session_mode_badge.dart';
 
@@ -16,12 +21,20 @@ class UniversalMobileDashboard extends StatefulWidget {
     required this.connectionChanges,
     required this.isOnline,
     required this.onSignOut,
+    required this.inputSink,
+    required this.managementRepository,
+    this.localSalesQueue,
+    this.pdfInvoiceService,
   });
 
   final AppUser currentUser;
   final Stream<bool> connectionChanges;
   final Future<bool> Function() isOnline;
   final Future<void> Function() onSignOut;
+  final WorkerInputSink inputSink;
+  final ManagementDataSource managementRepository;
+  final LocalSalesQueue? localSalesQueue;
+  final PdfInvoiceService? pdfInvoiceService;
 
   @override
   State<UniversalMobileDashboard> createState() =>
@@ -222,6 +235,16 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
     _HatchModuleConfig module,
     Map<String, dynamic> row,
   ) async {
+    final queuedInput = _queuedWorkerInputFor(module, row);
+    if (queuedInput != null) {
+      await widget.inputSink.enqueueWorkerInput(
+        user: widget.currentUser,
+        type: queuedInput.type,
+        payload: queuedInput.payload,
+      );
+      return;
+    }
+
     final supabase = _supabase;
     if (supabase == null) {
       throw Exception('Supabase is not initialized for this session.');
@@ -249,6 +272,66 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       ...metadata,
       ...row,
     });
+  }
+
+  _QueuedWorkerInput? _queuedWorkerInputFor(
+    _HatchModuleConfig module,
+    Map<String, dynamic> row,
+  ) {
+    switch (module.table) {
+      case 'egg_production':
+        return _QueuedWorkerInput(
+          type: WorkerInputType.eggCollection,
+          payload: {
+            'batch_id': _objectText(row['batchId'] ?? row['batch_id']),
+            'house_id': _objectText(row['houseId'] ?? row['house_id']),
+            'crates': _objectDouble(
+              row['cratesCollected'] ?? row['crates_collected'],
+            ),
+            'single_eggs': 0,
+            'eggs_per_crate': 30,
+            'device_logged_at':
+                _objectText(row['logDate'] ?? row['log_date']).isEmpty
+                ? DateTime.now().toIso8601String()
+                : _objectText(row['logDate'] ?? row['log_date']),
+          },
+        );
+      case 'daily_feeding_logs':
+        return _QueuedWorkerInput(
+          type: WorkerInputType.feedUsage,
+          payload: {
+            'batch_id': _objectText(row['batch_id'] ?? row['batchId']),
+            'bags': _objectDouble(row['amount_consumed'] ?? row['sacks_used']),
+            'feed_type': _objectText(row['feed_type'] ?? row['feed_variant']),
+            'feed_type_id': _objectText(row['feed_type_id']),
+            'formulation_id': _objectText(row['formulation_id']),
+            'note': _objectText(row['note'] ?? row['notes']),
+            'device_logged_at':
+                _objectText(row['log_date'] ?? row['logged_at']).isEmpty
+                ? DateTime.now().toIso8601String()
+                : _objectText(row['log_date'] ?? row['logged_at']),
+          },
+        );
+      case 'mortality':
+        if (_objectText(row['type']).toUpperCase() != 'DEAD') {
+          return null;
+        }
+        return _QueuedWorkerInput(
+          type: WorkerInputType.mortality,
+          payload: {
+            'batch_id': _objectText(row['batchId'] ?? row['batch_id']),
+            'count': _objectInt(row['count'] ?? row['dead_count']),
+            'reason': _objectText(row['reason'] ?? row['suspected_cause']),
+            'category': _objectText(row['category']),
+            'sub_category': _objectText(row['sub_category']),
+            'device_logged_at':
+                _objectText(row['logDate'] ?? row['log_date']).isEmpty
+                ? DateTime.now().toIso8601String()
+                : _objectText(row['logDate'] ?? row['log_date']),
+          },
+        );
+    }
+    return null;
   }
 
   Future<void> _openEntryForm(_HatchModuleConfig module) async {
@@ -2829,6 +2912,13 @@ class _HatchModuleConfig {
   final Map<String, dynamic> Function(Map<String, dynamic> payload) toRow;
 }
 
+class _QueuedWorkerInput {
+  const _QueuedWorkerInput({required this.type, required this.payload});
+
+  final WorkerInputType type;
+  final Map<String, dynamic> payload;
+}
+
 class _RecordVm {
   const _RecordVm({
     required this.title,
@@ -4266,6 +4356,30 @@ int _ageWeeks(Map<String, dynamic> row) {
 
 double _numPayload(Map<String, dynamic> payload, String key) {
   final value = payload[key];
+  if (value is num) {
+    return value.toDouble();
+  }
+  return double.tryParse(value?.toString() ?? '') ?? 0;
+}
+
+String _objectText(Object? value) {
+  return value?.toString().trim() ?? '';
+}
+
+int _objectInt(Object? value) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.round();
+  }
+  return int.tryParse(value?.toString() ?? '') ?? 0;
+}
+
+double _objectDouble(Object? value) {
+  if (value is double) {
+    return value;
+  }
   if (value is num) {
     return value.toDouble();
   }

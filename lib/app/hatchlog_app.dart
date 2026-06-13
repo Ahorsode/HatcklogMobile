@@ -52,8 +52,19 @@ class _HatchLogAppState extends State<HatchLogApp> {
       localDatabase: widget.services.localDatabase,
       currentUser: user,
       connectivityService: widget.services.connectivityService,
+      onForcedSignOut: _handleForcedSignOut,
     );
     _sessionWatcher?.start();
+  }
+
+  void _handleForcedSignOut() {
+    if (!mounted) {
+      return;
+    }
+    _sessionWatcher?.dispose();
+    _sessionWatcher = null;
+    widget.services.syncRepository.setActiveUser(null);
+    setState(() => _currentUser = null);
   }
 
   Future<void> _signOut() async {
