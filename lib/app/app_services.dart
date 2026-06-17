@@ -1,6 +1,8 @@
 import 'dart:async';
 
 import '../core/connectivity/connectivity_service.dart';
+import '../core/license/license_service.dart';
+import '../core/permissions/permissions_repository.dart';
 import '../core/storage/device_identity_store.dart';
 import '../core/storage/local_database.dart';
 import '../core/storage/secure_credential_store.dart';
@@ -19,6 +21,7 @@ class AppServices {
     required this.authRepository,
     required this.connectivityService,
     required this.managementRepository,
+    required this.permissionsRepository,
     required this.syncRepository,
     required this.syncRunner,
     required this.encryptionService,
@@ -26,12 +29,14 @@ class AppServices {
     required this.pdfInvoiceService,
     required this.remoteApi,
     required this.localDatabase,
+    required this.licenseService,
     required this.authRefreshSubscription,
   });
 
   final AuthRepository authRepository;
   final ConnectivityService connectivityService;
   final ManagementRepository managementRepository;
+  final PermissionsRepository permissionsRepository;
   final SyncRepository syncRepository;
   final SyncRunner syncRunner;
   final EncryptionService encryptionService;
@@ -39,11 +44,14 @@ class AppServices {
   final PdfInvoiceService pdfInvoiceService;
   final SupabaseRemoteApi remoteApi;
   final LocalDatabase localDatabase;
+  final LicenseService licenseService;
   final StreamSubscription<bool> authRefreshSubscription;
 
   static Future<AppServices> bootstrap() async {
     final localDatabase = LocalDatabase();
     await localDatabase.initialize();
+    final licenseService = LicenseService(localDatabase);
+    localDatabase.setLicenseTouchHandler(licenseService.touchLastUsed);
 
     final connectivityService = ConnectivityService();
     final initiallyOnline = await connectivityService.isOnline;
@@ -70,10 +78,14 @@ class AppServices {
       localDatabase: localDatabase,
       remoteApi: remoteApi,
     );
+    final permissionsRepository = PermissionsRepository(
+      localDatabase: localDatabase,
+    );
 
     final authRepository = AuthRepository(
       connectivityService: connectivityService,
       credentialStore: SecureCredentialStore(),
+      licenseService: licenseService,
       localDatabase: localDatabase,
       remoteApi: remoteApi,
     );
@@ -91,6 +103,7 @@ class AppServices {
       authRepository: authRepository,
       connectivityService: connectivityService,
       managementRepository: managementRepository,
+      permissionsRepository: permissionsRepository,
       syncRepository: syncRepository,
       syncRunner: syncRunner,
       encryptionService: encryptionService,
@@ -98,6 +111,7 @@ class AppServices {
       pdfInvoiceService: pdfService,
       remoteApi: remoteApi,
       localDatabase: localDatabase,
+      licenseService: licenseService,
       authRefreshSubscription: authRefreshSubscription,
     );
   }

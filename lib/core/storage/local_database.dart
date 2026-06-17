@@ -120,6 +120,8 @@ class PendingSyncInput {
 
 class LocalDatabase {
   Database? _database;
+  Future<void> Function()? _licenseTouchHandler;
+  bool _isTouchingLicense = false;
   final StreamController<Set<String>> _tableChangeController =
       StreamController<Set<String>>.broadcast();
 
@@ -128,10 +130,14 @@ class LocalDatabase {
     final fullPath = path.join(databasePath, 'hatchlog_mobile.db');
     _database = await openDatabase(
       fullPath,
-      version: 6,
+      version: 8,
       onCreate: _createSchema,
       onUpgrade: _upgradeSchema,
     );
+  }
+
+  void setLicenseTouchHandler(Future<void> Function()? handler) {
+    _licenseTouchHandler = handler;
   }
 
   Stream<void> watchTables(Iterable<String> tableNames) async* {
@@ -387,6 +393,36 @@ class LocalDatabase {
     return _db.rawQuery(sql, arguments);
   }
 
+  Future<void> rawLocalInsertOrReplace(
+    String table,
+    Map<String, Object?> values,
+  ) async {
+    await _db.insert(
+      table,
+      values,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    _notifyTablesChanged([table]);
+  }
+
+  Future<int> rawLocalUpdate(
+    String table,
+    Map<String, Object?> values,
+    String where, [
+    List<Object?>? whereArgs,
+  ]) async {
+    final count = await _db.update(
+      table,
+      values,
+      where: where,
+      whereArgs: whereArgs,
+    );
+    if (count > 0) {
+      _notifyTablesChanged([table]);
+    }
+    return count;
+  }
+
   Database get _db {
     final database = _database;
     if (database == null) {
@@ -404,6 +440,17 @@ class LocalDatabase {
         .toSet();
     if (changedTables.isNotEmpty) {
       _tableChangeController.add(changedTables);
+      final touchHandler = _licenseTouchHandler;
+      if (touchHandler != null &&
+          !changedTables.contains('license_configs') &&
+          !_isTouchingLicense) {
+        _isTouchingLicense = true;
+        unawaited(
+          touchHandler().whenComplete(() {
+            _isTouchingLicense = false;
+          }),
+        );
+      }
     }
   }
 
@@ -446,6 +493,7 @@ class LocalDatabase {
     );
 
     await _createSyncStateTable(db);
+    await _createLicenseConfigsTable(db);
   }
 
   Future<void> _upgradeSchema(
@@ -479,6 +527,30 @@ class LocalDatabase {
       await _ensureCoreHubColumns(db);
       await _createSyncStateTable(db);
     }
+    if (oldVersion < 7) {
+      await _createWebSchemaCacheTables(db);
+      await _ensureFinanceAllocationColumns(db);
+      await _createExpenseAllocationsTable(db);
+    }
+    if (oldVersion < 8) {
+      await _createLicenseConfigsTable(db);
+    }
+  }
+
+  Future<void> _createLicenseConfigsTable(Database db) async {
+    await db.execute('''
+      create table if not exists license_configs (
+        id text primary key,
+        mode text not null default 'OFFLINE',
+        farm_id text,
+        user_id text,
+        hardware_id text,
+        installed_at text not null,
+        expires_at text not null,
+        last_used text not null,
+        last_cloud_check_at text
+      )
+    ''');
   }
 
   Future<void> _createSyncStateTable(Database db) async {
@@ -629,6 +701,12 @@ class LocalDatabase {
     ]) {
       await _addColumnIfMissing(db, 'inventory', column, 'text');
     }
+    await _addColumnIfMissing(
+      db,
+      'inventory',
+      'is_synced',
+      'integer not null default 1',
+    );
 
     for (final column in const [
       'customer_id',
@@ -676,6 +754,7 @@ class LocalDatabase {
 
     await _addColumnIfMissing(db, 'expenses', 'created_at', 'text');
     await _addColumnIfMissing(db, 'expenses', 'deleted_at', 'text');
+    await _ensureFinanceAllocationColumns(db);
     await _addColumnIfMissing(db, 'orders', 'created_at', 'text');
     await _addColumnIfMissing(db, 'orders', 'paid_at', 'text');
     await _addColumnIfMissing(db, 'orders', 'invoice_number', 'integer');
@@ -886,6 +965,7 @@ class LocalDatabase {
         egg_category_id text,
         supplier_id text,
         is_deleted integer not null default 0,
+        is_synced integer not null default 1,
         created_at text,
         deleted_at text,
         last_restocked_at text,
@@ -1001,14 +1081,19 @@ class LocalDatabase {
         category text not null,
         description text,
         expense_date text not null,
+        reference text,
+        allocation_mode text,
         batch_id text,
         supplier_id text,
         is_deleted integer not null default 0,
+        is_synced integer not null default 0,
         created_at text,
         deleted_at text,
         updated_at text
       )
     ''');
+
+    await _createExpenseAllocationsTable(db);
 
     await db.execute('''
       create table if not exists financial_transactions (
@@ -1270,8 +1355,38 @@ class LocalDatabase {
       'on expenses(farm_id, expense_date)',
     );
     await db.execute(
+      'create index if not exists idx_expense_allocations_expense '
+      'on expense_allocations(expense_id)',
+    );
+    await db.execute(
       'create index if not exists idx_transactions_farm_date '
       'on financial_transactions(farm_id, transaction_date)',
     );
+  }
+
+  Future<void> _ensureFinanceAllocationColumns(Database db) async {
+    await _addColumnIfMissing(db, 'expenses', 'reference', 'text');
+    await _addColumnIfMissing(db, 'expenses', 'allocation_mode', 'text');
+    await _addColumnIfMissing(
+      db,
+      'expenses',
+      'is_synced',
+      'integer not null default 0',
+    );
+  }
+
+  Future<void> _createExpenseAllocationsTable(Database db) async {
+    await db.execute('''
+      create table if not exists expense_allocations (
+        id text primary key,
+        expense_id text not null,
+        batch_id text not null,
+        farm_id text not null,
+        allocated_amount real,
+        allocation_percentage real,
+        created_at text,
+        is_synced integer not null default 0
+      )
+    ''');
   }
 }

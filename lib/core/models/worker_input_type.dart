@@ -1,7 +1,9 @@
 enum WorkerInputType {
   eggCollection,
   feedUsage,
-  mortality;
+  mortality,
+  inventoryItem,
+  expenseAllocation;
 
   static WorkerInputType fromStorageKey(String value) {
     switch (value) {
@@ -11,6 +13,10 @@ enum WorkerInputType {
         return WorkerInputType.feedUsage;
       case 'mortality':
         return WorkerInputType.mortality;
+      case 'inventory_item':
+        return WorkerInputType.inventoryItem;
+      case 'expense_allocation':
+        return WorkerInputType.expenseAllocation;
       default:
         return WorkerInputType.eggCollection;
     }
@@ -24,6 +30,10 @@ enum WorkerInputType {
         return 'feed_usage';
       case WorkerInputType.mortality:
         return 'mortality';
+      case WorkerInputType.inventoryItem:
+        return 'inventory_item';
+      case WorkerInputType.expenseAllocation:
+        return 'expense_allocation';
     }
   }
 
@@ -35,6 +45,10 @@ enum WorkerInputType {
         return 'Feed Usage';
       case WorkerInputType.mortality:
         return 'Mortality';
+      case WorkerInputType.inventoryItem:
+        return 'Inventory Item';
+      case WorkerInputType.expenseAllocation:
+        return 'Expense';
     }
   }
 
@@ -46,6 +60,10 @@ enum WorkerInputType {
         return 'Feed used';
       case WorkerInputType.mortality:
         return 'Bird count';
+      case WorkerInputType.inventoryItem:
+        return 'Stock level';
+      case WorkerInputType.expenseAllocation:
+        return 'Expense amount';
     }
   }
 
@@ -57,6 +75,10 @@ enum WorkerInputType {
         return 'Example: 3 bags';
       case WorkerInputType.mortality:
         return 'Example: 2';
+      case WorkerInputType.inventoryItem:
+        return 'Example: 12 bags';
+      case WorkerInputType.expenseAllocation:
+        return 'Example: 250.00';
     }
   }
 }

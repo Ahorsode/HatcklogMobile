@@ -189,7 +189,14 @@ class SyncRepository implements WorkerInputSink {
         final eggsPerCrate = _asInt(payload['eggs_per_crate'], fallback: 30);
         final crates = _asDouble(payload['crates']);
         final singleEggs = _asInt(payload['single_eggs']);
-        final eggsCollected = (crates * eggsPerCrate).round() + singleEggs;
+        final payloadEggs = _asInt(payload['eggs_collected']);
+        final eggsCollected = payloadEggs > 0
+            ? payloadEggs
+            : (crates * eggsPerCrate).round() + singleEggs;
+        final unusableCount = _asInt(payload['unusable_count']);
+        final logDate = _optionalString(payload['log_date']).isEmpty
+            ? input.createdAt.toIso8601String()
+            : _optionalString(payload['log_date']);
         await _localDatabase.insertLocalRecord('egg_production', {
           'id': serverRecordId,
           'local_queue_id': queueId,
@@ -200,12 +207,22 @@ class SyncRepository implements WorkerInputSink {
           'eggs_collected': eggsCollected,
           'crates_collected': crates,
           'eggs_remaining': eggsCollected,
-          'unusable_count': 0,
-          'log_date': input.createdAt.toIso8601String(),
+          'unusable_count': unusableCount,
+          'cracked_count': unusableCount,
+          'quality_grade': payload['quality_grade'],
+          'small_count': _asInt(payload['small_count']),
+          'medium_count': _asInt(payload['medium_count']),
+          'large_count': _asInt(payload['large_count']),
+          'is_sorted': _asBool(payload['is_sorted']) ? 1 : 0,
+          'log_date': logDate,
+          'created_at': input.createdAt.toIso8601String(),
           'is_deleted': 0,
           'is_synced': 0,
         });
       case 'feed_usage':
+        final logDate = _optionalString(payload['log_date']).isEmpty
+            ? input.createdAt.toIso8601String()
+            : _optionalString(payload['log_date']);
         await _localDatabase.insertLocalRecord('daily_feeding_logs', {
           'id': serverRecordId,
           'local_queue_id': queueId,
@@ -214,15 +231,24 @@ class SyncRepository implements WorkerInputSink {
           'formulation_id': payload['formulation_id'],
           'farm_id': payload['farm_id'],
           'user_id': input.userId,
-          'amount_consumed': _asDouble(payload['bags']),
+          'amount_consumed': _asDouble(
+            payload['amount_consumed'] ?? payload['bags'],
+          ),
           'feed_type_label': payload['feed_type'],
           'note': payload['note'],
-          'log_date': input.createdAt.toIso8601String(),
+          'log_date': logDate,
           'created_at': input.createdAt.toIso8601String(),
           'is_deleted': 0,
           'is_synced': 0,
         });
       case 'mortality':
+        final healthType = _optionalString(
+          payload['health_type'] ?? payload['type'],
+        ).toUpperCase();
+        final resolvedHealthType = healthType == 'SICK' ? 'SICK' : 'DEAD';
+        final logDate = _optionalString(payload['log_date']).isEmpty
+            ? input.createdAt.toIso8601String()
+            : _optionalString(payload['log_date']);
         await _localDatabase.insertLocalRecord('mortality', {
           'id': serverRecordId,
           'local_queue_id': queueId,
@@ -230,17 +256,80 @@ class SyncRepository implements WorkerInputSink {
           'farm_id': payload['farm_id'],
           'user_id': input.userId,
           'count': _asInt(payload['count']),
-          'type': 'DEAD',
+          'type': resolvedHealthType,
           'reason': payload['reason'],
           'category': payload['category'],
           'sub_category': payload['sub_category'],
+          'isolation_room_id': payload['isolation_room_id'],
           'mortality_percent': 0,
           'loss_trend': 'LOCAL_ENTRY',
-          'log_date': input.createdAt.toIso8601String(),
+          'log_date': logDate,
           'created_at': input.createdAt.toIso8601String(),
           'is_deleted': 0,
           'is_synced': 0,
         });
+      case 'inventory_item':
+        final now = input.createdAt.toIso8601String();
+        await _localDatabase.insertLocalRecord('inventory', {
+          'id': serverRecordId,
+          'farm_id': payload['farm_id'],
+          'user_id': input.userId,
+          'item_name': payload['item_name'],
+          'stock_level': _asDouble(payload['stock_level']),
+          'unit': _optionalString(payload['unit']).isEmpty
+              ? 'bags'
+              : payload['unit'],
+          'category': payload['category'],
+          'item_group': payload['category'],
+          'is_deleted': 0,
+          'is_synced': 0,
+          'created_at': now,
+          'updated_at': now,
+        });
+      case 'expense_allocation':
+        final now = input.createdAt.toIso8601String();
+        final expenseId = '${serverRecordId}_expense';
+        await _localDatabase.insertLocalRecord('expenses', {
+          'id': expenseId,
+          'farm_id': payload['farm_id'],
+          'user_id': input.userId,
+          'amount': _asDouble(payload['amount']),
+          'category': _optionalString(payload['category']).toUpperCase(),
+          'description': payload['description'],
+          'expense_date': _optionalString(payload['expense_date']).isEmpty
+              ? now
+              : payload['expense_date'],
+          'reference': payload['reference'],
+          'allocation_mode':
+              payload['allocationMode'] ?? payload['allocation_mode'],
+          'batch_id': null,
+          'is_deleted': 0,
+          'is_synced': 0,
+          'created_at': now,
+          'updated_at': now,
+        });
+        final allocations = (payload['allocations'] as List?) ?? const [];
+        for (var index = 0; index < allocations.length; index += 1) {
+          final allocation = Map<String, dynamic>.from(
+            allocations[index] as Map,
+          );
+          final batchId = _optionalString(
+            allocation['batch_id'] ?? allocation['batchId'],
+          );
+          if (batchId.isEmpty) {
+            continue;
+          }
+          await _localDatabase.insertLocalRecord('expense_allocations', {
+            'id': '${expenseId}_allocation_$index',
+            'expense_id': expenseId,
+            'batch_id': batchId,
+            'farm_id': payload['farm_id'],
+            'allocated_amount': _asDouble(allocation['amount']),
+            'allocation_percentage': _asDouble(allocation['percentage']),
+            'created_at': now,
+            'is_synced': 0,
+          });
+        }
     }
   }
 
@@ -249,17 +338,30 @@ class SyncRepository implements WorkerInputSink {
       'egg_collection' => 'egg_production',
       'feed_usage' => 'daily_feeding_logs',
       'mortality' => 'mortality',
+      'inventory_item' => 'inventory',
+      'expense_allocation' => 'expenses',
       _ => '',
     };
     if (table.isEmpty) {
       return;
     }
+    final recordId = input.inputType == 'expense_allocation'
+        ? '${input.resolvedServerRecordId}_expense'
+        : input.resolvedServerRecordId;
     await _localDatabase.updateLocalRecord(
       table,
       {'is_synced': 1},
       where: 'id = ?',
-      whereArgs: [input.resolvedServerRecordId],
+      whereArgs: [recordId],
     );
+    if (input.inputType == 'expense_allocation') {
+      await _localDatabase.updateLocalRecord(
+        'expense_allocations',
+        {'is_synced': 1},
+        where: 'expense_id = ?',
+        whereArgs: [recordId],
+      );
+    }
   }
 
   String _summaryFor(PendingSyncInput input) {
@@ -277,7 +379,15 @@ class SyncRepository implements WorkerInputSink {
         return '$bags bags of $feedType feed';
       case WorkerInputType.mortality:
         final count = _numberText(payload['count']);
-        return '$count bird losses logged';
+        final type = _optionalString(payload['health_type']).toUpperCase();
+        return type == 'SICK'
+            ? '$count sick birds logged'
+            : '$count bird losses logged';
+      case WorkerInputType.inventoryItem:
+        return '${payload['item_name'] ?? 'Inventory item'} added';
+      case WorkerInputType.expenseAllocation:
+        final amount = _asDouble(payload['amount']).toStringAsFixed(2);
+        return 'GHS $amount ${payload['category'] ?? 'expense'} logged';
     }
   }
 
@@ -306,6 +416,17 @@ class SyncRepository implements WorkerInputSink {
       return value.toDouble();
     }
     return double.tryParse(value?.toString() ?? '') ?? fallback;
+  }
+
+  bool _asBool(Object? value) {
+    if (value is bool) {
+      return value;
+    }
+    if (value is num) {
+      return value != 0;
+    }
+    final text = value?.toString().trim().toLowerCase() ?? '';
+    return text == 'true' || text == '1' || text == 'yes';
   }
 
   String _optionalString(Object? value) {

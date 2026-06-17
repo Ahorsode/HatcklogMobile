@@ -60,6 +60,27 @@ class SupabaseRemoteApi {
     }
   }
 
+  Future<Map<String, Object?>?> fetchUserPermissionsRow({
+    required String userId,
+    required String farmId,
+  }) async {
+    if (userId.isEmpty || farmId.isEmpty) {
+      return null;
+    }
+    final client = _requireClient();
+    final row = await client
+        .from('user_permissions')
+        .select()
+        .eq('user_id', userId)
+        .eq('farm_id', farmId)
+        .limit(1)
+        .maybeSingle();
+    if (row == null) {
+      return null;
+    }
+    return _mapUserPermission(row);
+  }
+
   Future<AppUser> signInWithPhone({
     required String phoneNumber,
     required String password,
@@ -244,6 +265,8 @@ class SupabaseRemoteApi {
         await _pushFeedUsage(input);
       case 'mortality':
         await _pushMortality(input);
+      case 'inventory_item':
+        await _pushInventoryItem(input);
       case 'expense_allocation':
         await _pushExpenseAllocation(input);
       case 'sales_invoice':
@@ -252,6 +275,8 @@ class SupabaseRemoteApi {
         await _pushFarmGateSale(input);
       case 'role_promotion':
         await _pushRolePromotion(input);
+      case 'restore_record':
+        await _pushRestoreRecord(input);
       default:
         throw StateError('Unsupported worker input type: ${input.inputType}');
     }
@@ -732,6 +757,7 @@ class SupabaseRemoteApi {
       'egg_category_id': _asString(row['eggCategoryId']),
       'supplier_id': _asString(row['supplierId']),
       'is_deleted': _boolInt(row['is_deleted']),
+      'is_synced': 1,
       'created_at': _timestamp(row['createdAt']),
       'deleted_at': _timestamp(row['deleted_at']),
       'last_restocked_at': _timestamp(row['lastRestockedAt']),
@@ -850,9 +876,12 @@ class SupabaseRemoteApi {
       'category': _asString(row['category']),
       'description': _asString(row['description']),
       'expense_date': _timestamp(row['expense_date']),
+      'reference': _asString(row['reference']),
+      'allocation_mode': _asString(row['allocationMode']),
       'batch_id': _asString(row['batch_id']),
       'supplier_id': _asString(row['supplierId']),
       'is_deleted': _boolInt(row['is_deleted']),
+      'is_synced': 1,
       'created_at': _timestamp(row['created_at']),
       'deleted_at': _timestamp(row['deleted_at']),
       'updated_at': _timestamp(row['updated_at']),
@@ -1590,7 +1619,14 @@ class SupabaseRemoteApi {
     final crates = _asDouble(payload['crates']);
     final singleEggs = _asInt(payload['single_eggs']);
     final eggsPerCrate = _asInt(payload['eggs_per_crate'], fallback: 30);
-    final eggsCollected = (crates * eggsPerCrate).round() + singleEggs;
+    final payloadEggs = _asInt(payload['eggs_collected']);
+    final eggsCollected = payloadEggs > 0
+        ? payloadEggs
+        : (crates * eggsPerCrate).round() + singleEggs;
+    final logDate = _optionalString(payload, 'log_date').isEmpty
+        ? input.createdAt.toIso8601String()
+        : _optionalString(payload, 'log_date');
+    final unusableCount = _asInt(payload['unusable_count']);
 
     await _verifiedUpsert('egg_production', {
       'id': input.resolvedServerRecordId,
@@ -1600,12 +1636,13 @@ class SupabaseRemoteApi {
       'eggsCollected': eggsCollected,
       'cratesCollected': crates,
       'eggsRemaining': eggsCollected,
-      'unusableCount': 0,
-      'isSorted': false,
-      'smallCount': 0,
-      'mediumCount': 0,
-      'largeCount': 0,
-      'logDate': input.createdAt.toIso8601String(),
+      'unusableCount': unusableCount,
+      'qualityGrade': _nullIfEmpty(_optionalString(payload, 'quality_grade')),
+      'isSorted': _boolInt(payload['is_sorted']) == 1,
+      'smallCount': _asInt(payload['small_count']),
+      'mediumCount': _asInt(payload['medium_count']),
+      'largeCount': _asInt(payload['large_count']),
+      'logDate': logDate,
     });
   }
 
@@ -1613,6 +1650,9 @@ class SupabaseRemoteApi {
     final payload = input.payload;
     final farmId = _requiredString(payload, 'farm_id');
     final batchId = _optionalString(payload, 'batch_id');
+    final logDate = _optionalString(payload, 'log_date').isEmpty
+        ? input.createdAt.toIso8601String()
+        : _optionalString(payload, 'log_date');
 
     await _verifiedUpsert('daily_feeding_logs', {
       'id': input.resolvedServerRecordId,
@@ -1621,8 +1661,10 @@ class SupabaseRemoteApi {
       'formulation_id': _nullIfEmpty(
         _optionalString(payload, 'formulation_id'),
       ),
-      'amount_consumed': _asDouble(payload['bags']),
-      'log_date': input.createdAt.toIso8601String(),
+      'amount_consumed': _asDouble(
+        payload['amount_consumed'] ?? payload['bags'],
+      ),
+      'log_date': logDate,
       'farmId': farmId,
       'user_id': input.userId,
     });
@@ -1632,6 +1674,11 @@ class SupabaseRemoteApi {
     final payload = input.payload;
     final farmId = _requiredString(payload, 'farm_id');
     final batchId = _requiredString(payload, 'batch_id');
+    final healthType = _optionalString(payload, 'health_type').toUpperCase();
+    final resolvedHealthType = healthType == 'SICK' ? 'SICK' : 'DEAD';
+    final logDate = _optionalString(payload, 'log_date').isEmpty
+        ? input.createdAt.toIso8601String()
+        : _optionalString(payload, 'log_date');
 
     await _verifiedUpsert('mortality', {
       'id': input.resolvedServerRecordId,
@@ -1639,12 +1686,64 @@ class SupabaseRemoteApi {
       'farmId': farmId,
       'userId': input.userId,
       'count': _asInt(payload['count']),
-      'type': 'DEAD',
+      'type': resolvedHealthType,
       'reason': _nullIfEmpty(_optionalString(payload, 'reason')),
       'category': _nullIfEmpty(_optionalString(payload, 'category')),
       'sub_category': _nullIfEmpty(_optionalString(payload, 'sub_category')),
-      'logDate': input.createdAt.toIso8601String(),
+      'isolation_room_id': _nullIfEmpty(
+        _optionalString(payload, 'isolation_room_id'),
+      ),
+      'logDate': logDate,
     });
+  }
+
+  Future<void> _pushInventoryItem(PendingSyncInput input) async {
+    final payload = input.payload;
+    final farmId = _requiredString(payload, 'farm_id');
+    final now = input.createdAt.toIso8601String();
+
+    await _verifiedUpsert('inventory', {
+      'id': input.resolvedServerRecordId,
+      'farmId': farmId,
+      'userId': input.userId,
+      'itemName': _requiredString(payload, 'item_name'),
+      'stockLevel': _asDouble(payload['stock_level']),
+      'unit': _optionalString(payload, 'unit').isEmpty
+          ? 'bags'
+          : _optionalString(payload, 'unit'),
+      'category': _optionalString(payload, 'category').isEmpty
+          ? 'other'
+          : _optionalString(payload, 'category'),
+      'createdAt': now,
+      'updatedAt': now,
+      'is_deleted': false,
+    });
+  }
+
+  Future<void> _pushRestoreRecord(PendingSyncInput input) async {
+    final payload = input.payload;
+    final table = _requiredString(payload, 'table');
+    final recordId = _requiredString(payload, 'record_id');
+    const allowedTables = {
+      'batches',
+      'inventory',
+      'egg_production',
+      'daily_feeding_logs',
+      'mortality',
+      'quarantine',
+      'expenses',
+      'financial_transactions',
+      'sales',
+      'orders',
+    };
+    if (!allowedTables.contains(table)) {
+      throw StateError('Unsupported restore table: $table');
+    }
+    final client = _requireClient();
+    await client
+        .from(table)
+        .update({'is_deleted': false, 'deleted_at': null})
+        .eq('id', recordId);
   }
 
   Future<void> _pushExpenseAllocation(PendingSyncInput input) async {

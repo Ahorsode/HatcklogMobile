@@ -1,0 +1,1108 @@
+diff --git a/.env.example b/.env.example
+index 5248c1c..c12f631 100644
+--- a/.env.example
++++ b/.env.example
+@@ -3,3 +3,4 @@ SUPABASE_PUBLISHABLE_KEY=your_supabase_publishable_key
+ SUPABASE_ANON_KEY=your_supabase_anon_key
+ GOOGLE_WEB_CLIENT_ID=your_web_client_id.apps.googleusercontent.com
+ GOOGLE_ANDROID_CLIENT_ID=your_android_client_id.apps.googleusercontent.com
++WEB_APP_URL=https://your-app-domain.com
+diff --git a/lib/app/app_services.dart b/lib/app/app_services.dart
+index 9b324d0..f30b26f 100644
+--- a/lib/app/app_services.dart
++++ b/lib/app/app_services.dart
+@@ -1,6 +1,7 @@
+ import 'dart:async';
+ 
+ import '../core/connectivity/connectivity_service.dart';
++import '../core/license/license_service.dart';
+ import '../core/storage/device_identity_store.dart';
+ import '../core/storage/local_database.dart';
+ import '../core/storage/secure_credential_store.dart';
+@@ -26,6 +27,7 @@ class AppServices {
+     required this.pdfInvoiceService,
+     required this.remoteApi,
+     required this.localDatabase,
++    required this.licenseService,
+     required this.authRefreshSubscription,
+   });
+ 
+@@ -39,6 +41,7 @@ class AppServices {
+   final PdfInvoiceService pdfInvoiceService;
+   final SupabaseRemoteApi remoteApi;
+   final LocalDatabase localDatabase;
++  final LicenseService licenseService;
+   final StreamSubscription<bool> authRefreshSubscription;
+ 
+   static Future<AppServices> bootstrap() async {
+@@ -86,6 +89,10 @@ class AppServices {
+       deviceId: deviceId,
+     );
+     final pdfService = PdfInvoiceService();
++    final licenseService = LicenseService(
++      localDatabase: localDatabase,
++      remoteApi: remoteApi,
++    );
+ 
+     return AppServices(
+       authRepository: authRepository,
+@@ -98,6 +105,7 @@ class AppServices {
+       pdfInvoiceService: pdfService,
+       remoteApi: remoteApi,
+       localDatabase: localDatabase,
++      licenseService: licenseService,
+       authRefreshSubscription: authRefreshSubscription,
+     );
+   }
+diff --git a/lib/app/hatchlog_app.dart b/lib/app/hatchlog_app.dart
+index c0fdf9b..4f0288e 100644
+--- a/lib/app/hatchlog_app.dart
++++ b/lib/app/hatchlog_app.dart
+@@ -1,8 +1,16 @@
++import 'dart:async';
++
+ import 'package:flutter/material.dart';
++import 'package:flutter_dotenv/flutter_dotenv.dart';
++import 'package:url_launcher/url_launcher.dart';
+ 
++import '../core/license/device_fingerprint.dart';
++import '../core/license/license_status.dart';
++import '../core/license/license_watcher.dart';
+ import '../core/models/app_user.dart';
+ import '../features/auth/presentation/login_screen.dart';
+ import '../features/role_gateway/presentation/role_gateway.dart';
++import '../presentation/license/lockout_screen.dart';
+ import 'app_services.dart';
+ import '../core/session_watcher.dart';
+ 
+@@ -18,20 +26,45 @@ class HatchLogApp extends StatefulWidget {
+ class _HatchLogAppState extends State<HatchLogApp> {
+   AppUser? _currentUser;
+   SessionWatcher? _sessionWatcher;
++  LicenseWatcher? _licenseWatcher;
++
++  // null while the very first check is still running.
++  LicenseStatus? _licenseStatus;
++  String? _hardwareId;
+ 
+   @override
+   void initState() {
+     super.initState();
+-    _restoreActiveSession();
++    _bootstrap();
+   }
+ 
+   @override
+   void dispose() {
+     _sessionWatcher?.dispose();
++    _licenseWatcher?.dispose();
+     widget.services.dispose();
+     super.dispose();
+   }
+ 
++  Future<void> _bootstrap() async {
++    final hardwareId = await getDeviceHardwareId();
++    final status = await widget.services.licenseService.checkLicense();
++    if (!mounted) return;
++
++    setState(() {
++      _hardwareId = hardwareId;
++      _licenseStatus = status;
++    });
++
++    if (status == LicenseStatus.hardLocked ||
++        status == LicenseStatus.clockTampered) {
++      // A locked-out farm never reaches the login screen.
++      return;
++    }
++
++    await _restoreActiveSession();
++  }
++
+   Future<void> _restoreActiveSession() async {
+     final restoredUser = await widget.services.authRepository
+         .restoreActiveSession();
+@@ -46,6 +79,7 @@ class _HatchLogAppState extends State<HatchLogApp> {
+     widget.services.syncRepository.setActiveUser(user);
+     widget.services.syncRunner.syncWhenOnline();
+     setState(() => _currentUser = user);
++
+     _sessionWatcher = SessionWatcher(
+       authRepository: widget.services.authRepository,
+       remoteApi: widget.services.remoteApi,
+@@ -53,8 +87,57 @@ class _HatchLogAppState extends State<HatchLogApp> {
+       currentUser: user,
+       connectivityService: widget.services.connectivityService,
+       onForcedSignOut: _handleForcedSignOut,
++      licenseService: widget.services.licenseService,
+     );
+     _sessionWatcher?.start();
++
++    // Fire-and-forget — idempotent. If this farm already has a trial or
++    // subscription running (desktop, web, or a previous mobile install),
++    // the server simply returns the existing expiry.
++    final hardwareId = _hardwareId;
++    if (hardwareId != null && user.activeFarmId.isNotEmpty) {
++      unawaited(
++        widget.services.licenseService.initTrialFromCloud(
++          userId: user.id,
++          farmId: user.activeFarmId,
++          hardwareId: hardwareId,
++        ),
++      );
++
++      _licenseWatcher?.dispose();
++      _licenseWatcher = LicenseWatcher(
++        licenseService: widget.services.licenseService,
++        hardwareId: hardwareId,
++        onStatusChanged: _handleLicenseStatusChanged,
++      );
++      _licenseWatcher?.start();
++    }
++  }
++
++  void _handleLicenseStatusChanged(LicenseStatus status) {
++    if (!mounted) return;
++    setState(() => _licenseStatus = status);
++  }
++
++  Future<bool> _retryLicenseCheck() async {
++    final hardwareId = _hardwareId;
++    if (hardwareId != null) {
++      await widget.services.licenseService.renewFromCloud(hardwareId);
++    }
++    final status = await widget.services.licenseService.checkLicense();
++    if (!mounted) return false;
++    setState(() => _licenseStatus = status);
++    return status == LicenseStatus.valid ||
++        status == LicenseStatus.softLocked;
++  }
++
++  Future<void> _openUpgradePage() async {
++    final webUrl = dotenv.env['WEB_APP_URL'] ?? '';
++    if (webUrl.isEmpty) return;
++    final uri = Uri.parse('$webUrl/dashboard/license-upgrade');
++    if (await canLaunchUrl(uri)) {
++      await launchUrl(uri, mode: LaunchMode.externalApplication);
++    }
+   }
+ 
+   void _handleForcedSignOut() {
+@@ -63,6 +146,8 @@ class _HatchLogAppState extends State<HatchLogApp> {
+     }
+     _sessionWatcher?.dispose();
+     _sessionWatcher = null;
++    _licenseWatcher?.dispose();
++    _licenseWatcher = null;
+     widget.services.syncRepository.setActiveUser(null);
+     setState(() => _currentUser = null);
+   }
+@@ -74,10 +159,61 @@ class _HatchLogAppState extends State<HatchLogApp> {
+     }
+     _sessionWatcher?.dispose();
+     _sessionWatcher = null;
++    _licenseWatcher?.dispose();
++    _licenseWatcher = null;
+     widget.services.syncRepository.setActiveUser(null);
+     setState(() => _currentUser = null);
+   }
+ 
++  Widget _buildHome() {
++    final status = _licenseStatus;
++
++    if (status == null) {
++      return const Scaffold(
++        backgroundColor: Color(0xfff8faf7),
++        body: Center(child: CircularProgressIndicator()),
++      );
++    }
++
++    if (status == LicenseStatus.hardLocked) {
++      return LockoutScreen(
++        reason: LockoutReason.trialExpired,
++        onRetry: _retryLicenseCheck,
++      );
++    }
++
++    if (status == LicenseStatus.clockTampered) {
++      return LockoutScreen(
++        reason: LockoutReason.clockTampered,
++        onRetry: _retryLicenseCheck,
++      );
++    }
++
++    if (_currentUser == null) {
++      return LoginScreen(
++        authRepository: widget.services.authRepository,
++        onAuthenticated: _activateUser,
++      );
++    }
++
++    final dashboard = RoleGateway(
++      currentUser: _currentUser!,
++      connectionChanges: widget.services.connectivityService.onOnlineChanged,
++      isOnline: () => widget.services.connectivityService.isOnline,
++      inputSink: widget.services.syncRepository,
++      managementRepository: widget.services.managementRepository,
++      onSignOut: _signOut,
++      localSalesQueue: widget.services.localSalesQueue,
++      pdfInvoiceService: widget.services.pdfInvoiceService,
++    );
++
++    if (status == LicenseStatus.softLocked) {
++      return _SoftLockBanner(onUpgrade: _openUpgradePage, child: dashboard);
++    }
++
++    return dashboard;
++  }
++
+   @override
+   Widget build(BuildContext context) {
+     return MaterialApp(
+@@ -96,22 +232,59 @@ class _HatchLogAppState extends State<HatchLogApp> {
+         ),
+         useMaterial3: true,
+       ),
+-      home: _currentUser == null
+-          ? LoginScreen(
+-              authRepository: widget.services.authRepository,
+-              onAuthenticated: _activateUser,
+-            )
+-          : RoleGateway(
+-              currentUser: _currentUser!,
+-              connectionChanges:
+-                  widget.services.connectivityService.onOnlineChanged,
+-              isOnline: () => widget.services.connectivityService.isOnline,
+-              inputSink: widget.services.syncRepository,
+-              managementRepository: widget.services.managementRepository,
+-              onSignOut: _signOut,
+-              localSalesQueue: widget.services.localSalesQueue,
+-              pdfInvoiceService: widget.services.pdfInvoiceService,
++      home: _buildHome(),
++    );
++  }
++}
++
++/// Persistent, non-dismissible banner shown above the dashboard while the
++/// farm's subscription is within the 5-day soft-lock grace window.
++class _SoftLockBanner extends StatelessWidget {
++  const _SoftLockBanner({required this.child, required this.onUpgrade});
++
++  final Widget child;
++  final VoidCallback onUpgrade;
++
++  @override
++  Widget build(BuildContext context) {
++    return Column(
++      children: [
++        Material(
++          color: const Color(0xFFFEF3C7),
++          child: SafeArea(
++            bottom: false,
++            child: Padding(
++              padding: const EdgeInsets.symmetric(
++                horizontal: 16,
++                vertical: 10,
++              ),
++              child: Row(
++                children: [
++                  const Icon(
++                    Icons.warning_amber_rounded,
++                    color: Color(0xFFB45309),
++                    size: 20,
++                  ),
++                  const SizedBox(width: 10),
++                  const Expanded(
++                    child: Text(
++                      "Your farm's subscription has expired. You have a few "
++                      'days of grace access remaining — ask your farm owner '
++                      'to renew.',
++                      style: TextStyle(
++                        fontSize: 12.5,
++                        color: Color(0xFF92400E),
++                      ),
++                    ),
++                  ),
++                  TextButton(onPressed: onUpgrade, child: const Text('Upgrade')),
++                ],
++              ),
+             ),
++          ),
++        ),
++        Expanded(child: child),
++      ],
+     );
+   }
+ }
+diff --git a/lib/core/license/device_fingerprint.dart b/lib/core/license/device_fingerprint.dart
+new file mode 100644
+index 0000000..e7a157e
+--- /dev/null
++++ b/lib/core/license/device_fingerprint.dart
+@@ -0,0 +1,29 @@
++import 'dart:io' show Platform;
++
++import 'package:device_info_plus/device_info_plus.dart';
++
++/// Mobile equivalent of pfm-desktop's `getDeviceHardwareId()`. This is
++/// deliberately a real OS-level identifier rather than an app-generated
++/// random ID (which is what `DeviceIdentityStore` provides for the sales
++/// queue) — a license trial must not be trivially resettable by simply
++/// uninstalling and reinstalling the app.
++Future<String> getDeviceHardwareId() async {
++  final deviceInfo = DeviceInfoPlugin();
++  try {
++    if (Platform.isAndroid) {
++      final info = await deviceInfo.androidInfo;
++      // info.id is the build fingerprint — stable per device/ROM install.
++      return 'android-${info.id}';
++    }
++    if (Platform.isIOS) {
++      final info = await deviceInfo.iosInfo;
++      final vendorId = info.identifierForVendor;
++      if (vendorId != null && vendorId.isNotEmpty) {
++        return 'ios-$vendorId';
++      }
++    }
++  } catch (_) {
++    // Fall through to the unknown placeholder below.
++  }
++  return 'unknown-hardware-id';
++}
+diff --git a/lib/core/license/license_config.dart b/lib/core/license/license_config.dart
+new file mode 100644
+index 0000000..a0e0357
+--- /dev/null
++++ b/lib/core/license/license_config.dart
+@@ -0,0 +1,36 @@
++class LicenseConfig {
++  const LicenseConfig({
++    required this.mode,
++    required this.farmId,
++    required this.userId,
++    required this.hardwareId,
++    required this.installedAt,
++    required this.expiresAt,
++    required this.lastUsed,
++    required this.lastCloudCheckAt,
++  });
++
++  final String mode;
++  final String? farmId;
++  final String? userId;
++  final String? hardwareId;
++  final DateTime installedAt;
++  final DateTime expiresAt;
++  final DateTime lastUsed;
++  final DateTime? lastCloudCheckAt;
++
++  factory LicenseConfig.fromMap(Map<String, Object?> map) {
++    return LicenseConfig(
++      mode: map['mode'] as String? ?? 'OFFLINE',
++      farmId: map['farm_id'] as String?,
++      userId: map['user_id'] as String?,
++      hardwareId: map['hardware_id'] as String?,
++      installedAt: DateTime.parse(map['installed_at'] as String),
++      expiresAt: DateTime.parse(map['expires_at'] as String),
++      lastUsed: DateTime.parse(map['last_used'] as String),
++      lastCloudCheckAt: map['last_cloud_check_at'] == null
++          ? null
++          : DateTime.parse(map['last_cloud_check_at'] as String),
++    );
++  }
++}
+diff --git a/lib/core/license/license_service.dart b/lib/core/license/license_service.dart
+new file mode 100644
+index 0000000..6eb3761
+--- /dev/null
++++ b/lib/core/license/license_service.dart
+@@ -0,0 +1,212 @@
++import '../storage/local_database.dart';
++import '../../features/auth/data/supabase_remote_api.dart';
++import 'license_config.dart';
++import 'license_status.dart';
++
++/// Mobile port of pfm-desktop's `LicenseService`. Both apps defer to the
++/// SAME `register_device_trial` / `get_device_subscription_status` RPCs,
++/// keyed by `farm_id` on the server side — so starting the trial on
++/// mobile and starting it on desktop draw from the exact same 30-day
++/// clock for a given farm. This class only ever EXTENDS the locally
++/// cached `expires_at`; the server result is the source of truth, never
++/// a client-side guess.
++///
++/// Grace logic mirrors desktop exactly:
++///   1. now < expiresAt                                -> valid
++///   2. now < lastUsed - 2min                           -> clockTampered
++///   3. daysSince(lastCloudCheckAt) < 10                -> valid (offline tolerance)
++///   4. daysPastExpiry <= 5                             -> softLocked
++///   5. else                                            -> hardLocked
++class LicenseService {
++  LicenseService({
++    required LocalDatabase localDatabase,
++    required SupabaseRemoteApi remoteApi,
++  }) : _localDatabase = localDatabase,
++       _remoteApi = remoteApi;
++
++  final LocalDatabase _localDatabase;
++  final SupabaseRemoteApi _remoteApi;
++
++  static const _clockTamperTolerance = Duration(minutes: 2);
++  static const _offlineToleranceDays = 10;
++  static const _softLockGraceDays = 5;
++
++  Future<LicenseStatus> checkLicense() async {
++    final config = await getConfig();
++    if (config == null) {
++      return LicenseStatus.firstLaunch;
++    }
++
++    final now = DateTime.now();
++
++    if (now.isBefore(config.lastUsed.subtract(_clockTamperTolerance))) {
++      return LicenseStatus.clockTampered;
++    }
++
++    if (now.isBefore(config.expiresAt)) {
++      return LicenseStatus.valid;
++    }
++
++    final lastCheck = config.lastCloudCheckAt;
++    if (lastCheck != null && now.difference(lastCheck).inDays < _offlineToleranceDays) {
++      return LicenseStatus.valid;
++    }
++
++    final daysPastExpiry = now.difference(config.expiresAt).inDays;
++    if (daysPastExpiry <= _softLockGraceDays) {
++      return LicenseStatus.softLocked;
++    }
++
++    await _localDatabase.updateLicenseConfigFields({'mode': 'HARD_LOCKED'});
++    return LicenseStatus.hardLocked;
++  }
++
++  /// Call once after every successful login/signup. Safe to call
++  /// repeatedly — if this farm already has a trial or subscription
++  /// running (from desktop, web, or a previous mobile install), the RPC
++  /// returns that existing expiry and nothing changes except the
++  /// device_registrations link for this hardware ID.
++  ///
++  /// Fails open: if the server call doesn't succeed (no network, RPC
++  /// missing, etc.), grants a local 30-day fallback so a worker with no
++  /// signal isn't blocked from ever starting the app. The next
++  /// successful [renewFromCloud] call will reconcile this with the
++  /// server's real value.
++  Future<String?> initTrialFromCloud({
++    required String userId,
++    required String farmId,
++    required String hardwareId,
++  }) async {
++    if (!_remoteApi.isConfigured) {
++      await _fallbackInit(userId: userId, farmId: farmId, hardwareId: hardwareId);
++      return null;
++    }
++
++    try {
++      final data = await _remoteApi.registerDeviceTrial(
++        userId: userId,
++        farmId: farmId,
++        hardwareId: hardwareId,
++      );
++
++      if (data['success'] != true) {
++        await _fallbackInit(userId: userId, farmId: farmId, hardwareId: hardwareId);
++        return data['error']?.toString();
++      }
++
++      final expiresAt = _parseExpiry(data['license_expires_at']);
++      await _localDatabase.upsertLicenseConfig(
++        mode: 'CLOUD_TRIAL',
++        farmId: farmId,
++        userId: userId,
++        hardwareId: hardwareId,
++        installedAt: DateTime.now(),
++        expiresAt: expiresAt,
++        lastCloudCheckAt: DateTime.now(),
++      );
++      return null;
++    } catch (_) {
++      await _fallbackInit(userId: userId, farmId: farmId, hardwareId: hardwareId);
++      return null;
++    }
++  }
++
++  Future<void> _fallbackInit({
++    required String userId,
++    required String farmId,
++    required String hardwareId,
++  }) async {
++    final existing = await getConfig();
++    if (existing != null) {
++      // Already has a local clock running (e.g. from a previous online
++      // registration) — don't clobber it just because this attempt was
++      // offline.
++      return;
++    }
++    await _localDatabase.upsertLicenseConfig(
++      mode: 'CLOUD_TRIAL',
++      farmId: farmId,
++      userId: userId,
++      hardwareId: hardwareId,
++      installedAt: DateTime.now(),
++      expiresAt: DateTime.now().add(const Duration(days: 30)),
++      lastCloudCheckAt: null,
++    );
++  }
++
++  /// Call on every boot (when online) and every 6 hours while running,
++  /// via [LicenseWatcher]. Only ever extends the locally cached
++  /// `expires_at` — never shortens it client-side based on a clock
++  /// reading alone.
++  Future<void> renewFromCloud(String hardwareId) async {
++    if (!_remoteApi.isConfigured) {
++      return;
++    }
++    try {
++      final data = await _remoteApi.getDeviceSubscriptionStatus(hardwareId);
++      if (data == null || data['success'] != true) {
++        return;
++      }
++
++      final config = await getConfig();
++      if (config == null) {
++        return;
++      }
++
++      final now = DateTime.now();
++      final updates = <String, Object?>{
++        'last_used': now.toIso8601String(),
++        'last_cloud_check_at': now.toIso8601String(),
++      };
++
++      final serverExpiry = data['license_expires_at'] != null
++          ? _parseExpiry(data['license_expires_at'])
++          : null;
++      if (serverExpiry != null && serverExpiry.isAfter(config.expiresAt)) {
++        updates['expires_at'] = serverExpiry.toIso8601String();
++      }
++
++      final serverStatus = data['license_status']?.toString();
++      if (serverStatus != null) {
++        updates['mode'] = _serverStatusToLocalMode(serverStatus);
++      }
++
++      await _localDatabase.updateLicenseConfigFields(updates);
++    } catch (_) {
++      // Offline or RPC failure — silently skip, identical to desktop.
++    }
++  }
++
++  /// Call on every local database write. Cheap, fire-and-forget,
++  /// swallows its own errors — used as the anti-clock-tamper heartbeat.
++  Future<void> touchLastUsed() => _localDatabase.touchLicenseLastUsed();
++
++  Future<LicenseConfig?> getConfig() async {
++    final row = await _localDatabase.readLicenseConfig();
++    if (row == null) {
++      return null;
++    }
++    return LicenseConfig.fromMap(row);
++  }
++
++  String _serverStatusToLocalMode(String serverStatus) {
++    switch (serverStatus) {
++      case 'ACTIVE':
++        return 'CLOUD_ACTIVE';
++      case 'EXPIRED':
++        return 'EXPIRED';
++      case 'CLOUD_TRIAL':
++        return 'CLOUD_TRIAL';
++      default:
++        return 'CLOUD_TRIAL';
++    }
++  }
++
++  DateTime _parseExpiry(Object? raw) {
++    if (raw == null) {
++      return DateTime.now().add(const Duration(days: 30));
++    }
++    return DateTime.tryParse(raw.toString()) ??
++        DateTime.now().add(const Duration(days: 30));
++  }
++}
+diff --git a/lib/core/license/license_status.dart b/lib/core/license/license_status.dart
+new file mode 100644
+index 0000000..2e28130
+--- /dev/null
++++ b/lib/core/license/license_status.dart
+@@ -0,0 +1,27 @@
++/// Resolved license state for the current device, computed locally from
++/// the cached `license_configs` row. This mirrors pfm-desktop's
++/// `LicenseStatus` enum exactly so both apps reason about a farm's
++/// subscription the same way.
++enum LicenseStatus {
++  /// No `license_configs` row exists yet — a brand-new install that
++  /// hasn't completed its first login. Not blocked; the trial is
++  /// registered right after the first successful sign-in.
++  firstLaunch,
++
++  /// Within the trial/subscription window, or within the 10-day offline
++  /// tolerance window past expiry. Full access.
++  valid,
++
++  /// Past expiry by 1-5 days. Full access, but a persistent banner nags
++  /// the farm owner to renew.
++  softLocked,
++
++  /// Past expiry by more than 5 days. The app is fully locked out of
++  /// farm data until the subscription is renewed.
++  hardLocked,
++
++  /// The device clock appears to have been rolled backwards relative to
++  /// the last recorded usage timestamp, beyond a small tolerance. Locked
++  /// out as an anti-tamper measure, independent of trial expiry.
++  clockTampered,
++}
+diff --git a/lib/core/license/license_watcher.dart b/lib/core/license/license_watcher.dart
+new file mode 100644
+index 0000000..052468b
+--- /dev/null
++++ b/lib/core/license/license_watcher.dart
+@@ -0,0 +1,47 @@
++import 'dart:async';
++
++import 'license_service.dart';
++import 'license_status.dart';
++
++/// Polls the farm's subscription status every 6 hours while the app is
++/// running, mirroring pfm-desktop's `main_scaffold.dart` Timer.periodic
++/// cadence. [onStatusChanged] fires whenever the resolved status is
++/// anything other than [LicenseStatus.valid] — hard-locked,
++/// clock-tampered, or soft-locked — so the host widget can react
++/// (force-navigate to lockout, or show a renewal banner) without this
++/// class knowing anything about navigation or UI.
++class LicenseWatcher {
++  LicenseWatcher({
++    required this.licenseService,
++    required this.hardwareId,
++    required this.onStatusChanged,
++    this.pollInterval = const Duration(hours: 6),
++  });
++
++  final LicenseService licenseService;
++  final String hardwareId;
++  final void Function(LicenseStatus status) onStatusChanged;
++  final Duration pollInterval;
++
++  Timer? _timer;
++
++  void start() {
++    _timer = Timer.periodic(pollInterval, (_) => _check());
++  }
++
++  void dispose() {
++    _timer?.cancel();
++  }
++
++  Future<void> _check() async {
++    try {
++      await licenseService.renewFromCloud(hardwareId);
++      final status = await licenseService.checkLicense();
++      if (status != LicenseStatus.valid) {
++        onStatusChanged(status);
++      }
++    } catch (_) {
++      // ignore network errors, identical to SessionWatcher
++    }
++  }
++}
+diff --git a/lib/core/session_watcher.dart b/lib/core/session_watcher.dart
+index f3e1700..756121f 100644
+--- a/lib/core/session_watcher.dart
++++ b/lib/core/session_watcher.dart
+@@ -7,6 +7,7 @@ import '../features/auth/data/supabase_remote_api.dart';
+ import '../core/storage/local_database.dart';
+ import '../core/models/app_user.dart';
+ import 'connectivity/connectivity_service.dart';
++import 'license/license_service.dart';
+ 
+ class SessionWatcher {
+   SessionWatcher({
+@@ -16,6 +17,7 @@ class SessionWatcher {
+     required this.currentUser,
+     required this.connectivityService,
+     required this.onForcedSignOut,
++    this.licenseService,
+     this.pollInterval = const Duration(seconds: 12),
+   });
+ 
+@@ -25,11 +27,27 @@ class SessionWatcher {
+   final AppUser currentUser;
+   final ConnectivityService connectivityService;
+   final VoidCallback onForcedSignOut;
++  // Optional — when set, every poll tick also refreshes the license
++  // anti-tamper heartbeat (`license_configs.last_used`), since this
++  // watcher already runs on a frequent, reliable cadence while a user
++  // is logged in.
++  final LicenseService? licenseService;
+   final Duration pollInterval;
+ 
+   Timer? _timer;
++  Timer? _heartbeatTimer;
+ 
+   void start() {
++    // Heartbeat runs regardless of role/offline-auth status — every
++    // logged-in session should keep the license anti-tamper timestamp
++    // fresh, even for owner/admin accounts that skip role-polling below.
++    if (licenseService != null) {
++      _heartbeatTimer = Timer.periodic(
++        pollInterval,
++        (_) => unawaited(licenseService!.touchLastUsed()),
++      );
++    }
++
+     if (!remoteApi.isConfigured) return;
+     if (currentUser.authenticatedOffline) return;
+     if (currentUser.role.hasUniversalAccess) return;
+@@ -38,6 +56,7 @@ class SessionWatcher {
+ 
+   void dispose() {
+     _timer?.cancel();
++    _heartbeatTimer?.cancel();
+   }
+ 
+   Future<void> _check() async {
+diff --git a/lib/core/storage/local_database.dart b/lib/core/storage/local_database.dart
+index 84d733e..b3338d9 100644
+--- a/lib/core/storage/local_database.dart
++++ b/lib/core/storage/local_database.dart
+@@ -128,7 +128,7 @@ class LocalDatabase {
+     final fullPath = path.join(databasePath, 'hatchlog_mobile.db');
+     _database = await openDatabase(
+       fullPath,
+-      version: 6,
++      version: 7,
+       onCreate: _createSchema,
+       onUpgrade: _upgradeSchema,
+     );
+@@ -212,6 +212,65 @@ class LocalDatabase {
+     return AppUser.fromMap(rows.first);
+   }
+ 
++  Future<Map<String, Object?>?> readLicenseConfig() async {
++    final rows = await _db.query(
++      'license_configs',
++      where: "id = 'singleton'",
++      limit: 1,
++    );
++    if (rows.isEmpty) {
++      return null;
++    }
++    return rows.first;
++  }
++
++  Future<void> upsertLicenseConfig({
++    required String mode,
++    required String? farmId,
++    required String? userId,
++    required String? hardwareId,
++    required DateTime installedAt,
++    required DateTime expiresAt,
++    DateTime? lastCloudCheckAt,
++  }) async {
++    await _db.insert('license_configs', {
++      'id': 'singleton',
++      'mode': mode,
++      'farm_id': farmId,
++      'user_id': userId,
++      'hardware_id': hardwareId,
++      'installed_at': installedAt.toIso8601String(),
++      'expires_at': expiresAt.toIso8601String(),
++      'last_used': DateTime.now().toIso8601String(),
++      'last_cloud_check_at': lastCloudCheckAt?.toIso8601String(),
++    }, conflictAlgorithm: ConflictAlgorithm.replace);
++    _notifyTablesChanged(const ['license_configs']);
++  }
++
++  Future<void> updateLicenseConfigFields(Map<String, Object?> values) async {
++    if (values.isEmpty) {
++      return;
++    }
++    await _db.update(
++      'license_configs',
++      values,
++      where: "id = 'singleton'",
++    );
++    _notifyTablesChanged(const ['license_configs']);
++  }
++
++  Future<void> touchLicenseLastUsed() async {
++    try {
++      await _db.update(
++        'license_configs',
++        {'last_used': DateTime.now().toIso8601String()},
++        where: "id = 'singleton'",
++      );
++    } catch (_) {
++      // license_configs row may not exist yet on a brand-new install.
++    }
++  }
++
+   Future<int> insertPendingInput(PendingSyncInput input) async {
+     final id = await _db.insert('pending_sync_inputs', input.toMap());
+     _notifyTablesChanged(const ['pending_sync_inputs']);
+@@ -446,6 +505,7 @@ class LocalDatabase {
+     );
+ 
+     await _createSyncStateTable(db);
++    await _createLicenseConfigTable(db);
+   }
+ 
+   Future<void> _upgradeSchema(
+@@ -479,6 +539,25 @@ class LocalDatabase {
+       await _ensureCoreHubColumns(db);
+       await _createSyncStateTable(db);
+     }
++    if (oldVersion < 7) {
++      await _createLicenseConfigTable(db);
++    }
++  }
++
++  Future<void> _createLicenseConfigTable(Database db) async {
++    await db.execute('''
++      create table if not exists license_configs (
++        id text primary key,
++        mode text not null default 'OFFLINE',
++        farm_id text,
++        user_id text,
++        hardware_id text,
++        installed_at text not null,
++        expires_at text not null,
++        last_used text not null,
++        last_cloud_check_at text
++      )
++    ''');
+   }
+ 
+   Future<void> _createSyncStateTable(Database db) async {
+diff --git a/lib/features/auth/data/supabase_remote_api.dart b/lib/features/auth/data/supabase_remote_api.dart
+index 59826fb..805764b 100644
+--- a/lib/features/auth/data/supabase_remote_api.dart
++++ b/lib/features/auth/data/supabase_remote_api.dart
+@@ -273,6 +273,50 @@ class SupabaseRemoteApi {
+     );
+   }
+ 
++  /// Registers this device's trial against the farm's shared 30-day clock.
++  /// Idempotent — if the farm already has a trial or subscription running
++  /// (started on desktop, web, or another mobile install), the server
++  /// returns that existing expiry rather than starting a fresh one.
++  Future<Map<String, dynamic>> registerDeviceTrial({
++    required String userId,
++    required String farmId,
++    required String hardwareId,
++    String deviceName = 'Mobile App',
++    String deviceType = 'Mobile',
++  }) async {
++    final client = _requireClient();
++    final result = await client.rpc(
++      'register_device_trial',
++      params: {
++        'p_user_id': userId,
++        'p_farm_id': farmId,
++        'p_hardware_id': hardwareId,
++        'p_device_name': deviceName,
++        'p_device_type': deviceType,
++      },
++    );
++    if (result == null) {
++      return const {'success': false, 'error': 'No response from server.'};
++    }
++    return Map<String, dynamic>.from(result as Map);
++  }
++
++  /// Fetches the farm's current subscription/trial status for this device.
++  /// Returns the farm-level state, not a per-device value.
++  Future<Map<String, dynamic>?> getDeviceSubscriptionStatus(
++    String hardwareId,
++  ) async {
++    final client = _requireClient();
++    final result = await client.rpc(
++      'get_device_subscription_status',
++      params: {'p_hardware_id': hardwareId},
++    );
++    if (result == null) {
++      return null;
++    }
++    return Map<String, dynamic>.from(result as Map);
++  }
++
+   Future<void> signOut() async {
+     final client = _client;
+     if (client != null) {
+diff --git a/lib/presentation/license/lockout_screen.dart b/lib/presentation/license/lockout_screen.dart
+new file mode 100644
+index 0000000..c48d796
+--- /dev/null
++++ b/lib/presentation/license/lockout_screen.dart
+@@ -0,0 +1,148 @@
++import 'package:flutter/material.dart';
++import 'package:flutter_dotenv/flutter_dotenv.dart';
++import 'package:url_launcher/url_launcher.dart';
++
++enum LockoutReason { trialExpired, clockTampered }
++
++/// Mobile port of pfm-desktop's `LockoutScreen`. Copy and color scheme
++/// intentionally match desktop so a farm owner switching between devices
++/// sees the same message rather than two different stories about why
++/// they're locked out.
++class LockoutScreen extends StatefulWidget {
++  const LockoutScreen({
++    super.key,
++    required this.reason,
++    required this.onRetry,
++  });
++
++  final LockoutReason reason;
++
++  /// Re-runs the license check (after a cloud renew attempt). Returns
++  /// true if the lockout should be cleared.
++  final Future<bool> Function() onRetry;
++
++  @override
++  State<LockoutScreen> createState() => _LockoutScreenState();
++}
++
++class _LockoutScreenState extends State<LockoutScreen> {
++  bool _isRetrying = false;
++
++  bool get _isClockTampered => widget.reason == LockoutReason.clockTampered;
++
++  Future<void> _handleRetry() async {
++    setState(() => _isRetrying = true);
++    try {
++      await widget.onRetry();
++    } finally {
++      if (mounted) setState(() => _isRetrying = false);
++    }
++  }
++
++  Future<void> _openUpgradePage() async {
++    final webUrl = dotenv.env['WEB_APP_URL'] ?? '';
++    if (webUrl.isEmpty) return;
++    final uri = Uri.parse('$webUrl/dashboard/license-upgrade');
++    if (await canLaunchUrl(uri)) {
++      await launchUrl(uri, mode: LaunchMode.externalApplication);
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final accentColor = _isClockTampered
++        ? const Color(0xFFD97706)
++        : const Color(0xFFDC2626);
++
++    return Scaffold(
++      backgroundColor: const Color(0xFFF8FAF7),
++      body: SafeArea(
++        child: Center(
++          child: SingleChildScrollView(
++            padding: const EdgeInsets.all(24),
++            child: Column(
++              mainAxisSize: MainAxisSize.min,
++              children: [
++                CircleAvatar(
++                  radius: 40,
++                  backgroundColor: accentColor.withOpacity(0.12),
++                  child: Icon(
++                    _isClockTampered
++                        ? Icons.access_time_filled
++                        : Icons.vpn_key,
++                    size: 40,
++                    color: accentColor,
++                  ),
++                ),
++                const SizedBox(height: 24),
++                Text(
++                  _isClockTampered
++                      ? 'System Clock Anomaly Detected'
++                      : 'Subscription Required',
++                  textAlign: TextAlign.center,
++                  style: const TextStyle(
++                    fontSize: 22,
++                    fontWeight: FontWeight.bold,
++                  ),
++                ),
++                const SizedBox(height: 16),
++                Text(
++                  _isClockTampered
++                      ? 'Your device clock appears to have been set to a time '
++                            'in the past. This security measure prevents license '
++                            'tampering.\n\nPlease correct your device\'s date & '
++                            'time settings, then tap Retry below.'
++                      : 'Your free trial or subscription has expired. Upgrade '
++                            'your plan to continue accessing your farm data.',
++                  textAlign: TextAlign.center,
++                  style: const TextStyle(fontSize: 15, color: Colors.black87),
++                ),
++                const SizedBox(height: 32),
++                if (!_isClockTampered)
++                  FilledButton.icon(
++                    onPressed: _openUpgradePage,
++                    icon: const Icon(Icons.open_in_new),
++                    label: const Text('Upgrade Now'),
++                    style: FilledButton.styleFrom(
++                      backgroundColor: accentColor,
++                      minimumSize: const Size(double.infinity, 48),
++                    ),
++                  ),
++                if (!_isClockTampered) const SizedBox(height: 12),
++                OutlinedButton.icon(
++                  onPressed: _isRetrying ? null : _handleRetry,
++                  icon: _isRetrying
++                      ? const SizedBox(
++                          width: 16,
++                          height: 16,
++                          child: CircularProgressIndicator(strokeWidth: 2),
++                        )
++                      : const Icon(Icons.refresh),
++                  label: Text(
++                    _isClockTampered
++                        ? 'Retry Clock Check'
++                        : 'I Just Paid - Check Again',
++                  ),
++                  style: OutlinedButton.styleFrom(
++                    minimumSize: const Size(double.infinity, 48),
++                    foregroundColor: accentColor,
++                    side: BorderSide(color: accentColor),
++                  ),
++                ),
++                if (!_isClockTampered) ...[
++                  const SizedBox(height: 24),
++                  Text(
++                    'Pay on the web or contact your administrator for '
++                    'in-person payment assistance.',
++                    textAlign: TextAlign.center,
++                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
++                  ),
++                ],
++              ],
++            ),
++          ),
++        ),
++      ),
++    );
++  }
++}
+diff --git a/pubspec.yaml b/pubspec.yaml
+index ecb218f..5e8c6a2 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -49,6 +49,8 @@ dependencies:
+   share_plus: ^13.1.0
+   path_provider: ^2.0.15
+   google_sign_in: ^7.2.0
++  device_info_plus: ^12.4.0
++  url_launcher: ^6.3.2
+ 
+ dev_dependencies:
+   flutter_test:

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hatchlog_m/core/models/app_user.dart';
 import 'package:hatchlog_m/core/models/worker_input_type.dart';
+import 'package:hatchlog_m/core/permissions/farm_permissions.dart';
 import 'package:hatchlog_m/features/auth/data/auth_repository.dart';
 import 'package:hatchlog_m/features/auth/data/supabase_remote_api.dart';
 import 'package:hatchlog_m/features/management/data/management_models.dart';
@@ -76,10 +77,12 @@ void main() {
         MaterialApp(
           home: RoleGateway(
             currentUser: _user(role: role),
+            permissions: FarmPermissions.fullAccess(),
             connectionChanges: Stream<bool>.value(true),
             isOnline: () async => true,
             inputSink: _NoopInputSink(),
             managementRepository: _FakeManagementDataSource(),
+            localDatabase: LocalDatabase(),
             onSignOut: () async {},
           ),
         ),
@@ -117,26 +120,22 @@ void main() {
         expect(find.text(label), findsWidgets);
       }
 
-      if (find.text('Quarantine').evaluate().isEmpty) {
-        await tester.scrollUntilVisible(
-          find.text('Quarantine'),
-          160,
-          scrollable: find.byType(Scrollable).last,
-        );
+      for (final label in const [
+        'Quarantine',
+        'Sales',
+        'Inventory',
+        'Customers',
+        'Finance Control',
+      ]) {
+        if (find.text(label).evaluate().isEmpty) {
+          await tester.scrollUntilVisible(
+            find.text(label),
+            160,
+            scrollable: find.byType(Scrollable).last,
+          );
+        }
+        expect(find.text(label), findsWidgets);
       }
-      expect(find.text('Quarantine'), findsWidgets);
-      expect(find.text('Sales'), findsWidgets);
-
-      if (find.text('Finance Control').evaluate().isEmpty) {
-        await tester.scrollUntilVisible(
-          find.text('Finance Control'),
-          160,
-          scrollable: find.byType(Scrollable).last,
-        );
-      }
-      expect(find.text('Inventory'), findsWidgets);
-      expect(find.text('Customers'), findsWidgets);
-      expect(find.text('Finance Control'), findsWidgets);
     });
   }
 
@@ -147,10 +146,19 @@ void main() {
       MaterialApp(
         home: RoleGateway(
           currentUser: _user(role: UserRole.worker),
+          permissions: const FarmPermissions(
+            canViewEggs: true,
+            canEditEggs: true,
+            canViewFeeding: true,
+            canEditFeeding: true,
+            canViewMortality: true,
+            canEditMortality: true,
+          ),
           connectionChanges: Stream<bool>.value(true),
           isOnline: () async => true,
           inputSink: _NoopInputSink(),
           managementRepository: _FakeManagementDataSource(),
+          localDatabase: LocalDatabase(),
           onSignOut: () async {},
         ),
       ),
@@ -158,10 +166,11 @@ void main() {
 
     await tester.pump();
 
-    expect(find.text('Daily Operations'), findsOneWidget);
-    expect(find.text('Financial Overview'), findsNothing);
-    expect(find.text('Add Livestock'), findsNothing);
-    expect(find.text('Access Denied'), findsNothing);
+    expect(find.text('Eggs'), findsOneWidget);
+    expect(find.text('Feeding'), findsOneWidget);
+    expect(find.text('Mortality'), findsOneWidget);
+    expect(find.text('Quick Log'), findsOneWidget);
+    expect(find.text('Finance'), findsNothing);
   });
 
   testWidgets('accountant receives finance dashboard without default tabs', (
@@ -171,10 +180,19 @@ void main() {
       MaterialApp(
         home: RoleGateway(
           currentUser: _user(role: UserRole.accountant),
+          permissions: const FarmPermissions(
+            canViewFinance: true,
+            canEditFinance: true,
+            canViewSales: true,
+            canEditSales: true,
+            canViewCustomers: true,
+            canEditCustomers: true,
+          ),
           connectionChanges: Stream<bool>.value(true),
           isOnline: () async => true,
           inputSink: _NoopInputSink(),
           managementRepository: _FakeManagementDataSource(),
+          localDatabase: LocalDatabase(),
           onSignOut: () async {},
         ),
       ),

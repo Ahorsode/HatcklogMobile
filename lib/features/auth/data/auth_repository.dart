@@ -4,6 +4,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/connectivity/connectivity_service.dart';
 import '../../../core/config/google_auth_config.dart';
+import '../../../core/license/device_fingerprint.dart';
+import '../../../core/license/license_service.dart';
 import '../../../core/models/app_user.dart';
 import '../../../core/storage/local_database.dart';
 import '../../../core/storage/secure_credential_store.dart';
@@ -45,10 +47,12 @@ class AuthRepository {
   AuthRepository({
     required ConnectivityService connectivityService,
     required CredentialStore credentialStore,
+    required LicenseService licenseService,
     required LocalDatabase localDatabase,
     required SupabaseRemoteApi remoteApi,
   }) : _connectivityService = connectivityService,
        _credentialStore = credentialStore,
+       _licenseService = licenseService,
        _localDatabase = localDatabase,
        _remoteApi = remoteApi;
 
@@ -56,6 +60,7 @@ class AuthRepository {
 
   final ConnectivityService _connectivityService;
   final CredentialStore _credentialStore;
+  final LicenseService _licenseService;
   final LocalDatabase _localDatabase;
   final SupabaseRemoteApi _remoteApi;
   final GoogleSignIn _googleSignIn = GoogleSignIn.instance;
@@ -78,6 +83,7 @@ class AuthRepository {
         return null;
       }
       await _localDatabase.upsertUser(cloudUser);
+      await _initTrialForUser(cloudUser);
       return cloudUser.copyWith(
         authenticatedOffline: false,
         requiresInitialSetup: false,
@@ -389,6 +395,25 @@ class AuthRepository {
     );
     await _localDatabase.upsertUser(cacheableUser);
     await _credentialStore.save(user: cacheableUser, password: password);
+    await _initTrialForUser(cacheableUser);
+  }
+
+  Future<void> _initTrialForUser(AppUser user) async {
+    final userId = user.id.trim();
+    final farmId = user.activeFarmId.trim();
+    if (userId.isEmpty || farmId.isEmpty) {
+      return;
+    }
+
+    final hardwareId = await getDeviceHardwareId();
+    final error = await _licenseService.initTrialFromCloud(
+      userId: userId,
+      farmId: farmId,
+      hardwareId: hardwareId,
+    );
+    if (error != null) {
+      debugPrint('[License] Trial init warning: $error');
+    }
   }
 
   Future<bool> _hasCachedOfflineKey(AppUser user) async {

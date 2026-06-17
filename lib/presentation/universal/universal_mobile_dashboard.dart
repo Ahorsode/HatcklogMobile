@@ -7,11 +7,17 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/models/app_user.dart';
 import '../../core/models/worker_input_type.dart';
+import '../../core/permissions/farm_permissions.dart';
+import '../../core/storage/local_database.dart';
 import '../../features/management/data/management_repository.dart';
 import '../../features/sync/data/worker_input_sink.dart';
 import '../../services/local_sales_queue.dart';
 import '../../services/pdf_invoice_service.dart';
 import '../analytics/farm_analytics_screen.dart';
+import '../houses/climate_control_screen.dart';
+import '../license/soft_lock_banner.dart';
+import '../reports/farm_report_screen.dart';
+import '../settings/trash_screen.dart';
 import '../shared/hatchlog_details_popup.dart';
 import '../shared/session_mode_badge.dart';
 
@@ -19,21 +25,27 @@ class UniversalMobileDashboard extends StatefulWidget {
   const UniversalMobileDashboard({
     super.key,
     required this.currentUser,
+    required this.permissions,
     required this.connectionChanges,
     required this.isOnline,
     required this.onSignOut,
     required this.inputSink,
     required this.managementRepository,
+    required this.localDatabase,
+    this.showSoftLockBanner = false,
     this.localSalesQueue,
     this.pdfInvoiceService,
   });
 
   final AppUser currentUser;
+  final FarmPermissions permissions;
   final Stream<bool> connectionChanges;
   final Future<bool> Function() isOnline;
   final Future<void> Function() onSignOut;
   final WorkerInputSink inputSink;
   final ManagementDataSource managementRepository;
+  final LocalDatabase localDatabase;
+  final bool showSoftLockBanner;
   final LocalSalesQueue? localSalesQueue;
   final PdfInvoiceService? pdfInvoiceService;
 
@@ -49,7 +61,7 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
   late Map<String, Stream<List<Map<String, dynamic>>>> _streams;
   StreamSubscription<bool>? _connectionSubscription;
   Map<String, dynamic> _permissions = const <String, dynamic>{};
-  bool _permissionsLoading = true;
+  final bool _permissionsLoading = false;
   Object? _permissionError;
   bool _isOnline = true;
   int _selectedIndex = 0;
@@ -63,12 +75,12 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       debugPrint('WARN: Supabase unavailable for dashboard streams: $error');
     }
     _modules = _buildModules();
+    _permissions = widget.permissions.toMap();
     _visibleModules = _buildFencedModules(_modules, _permissions);
     _streams = {
       for (final module in _visibleModules)
         if (!module.isDashboard) module.table: _streamFor(module),
     };
-    _loadPermissions();
     widget.isOnline().then((online) {
       if (mounted) {
         setState(() => _isOnline = online);
@@ -79,85 +91,6 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         setState(() => _isOnline = online);
       }
     });
-  }
-
-  Future<void> _loadPermissions() async {
-    if (_isPrivilegedRole(widget.currentUser.role)) {
-      if (mounted) {
-        setState(() {
-          _permissionsLoading = false;
-          _permissionError = null;
-          _permissions = const <String, dynamic>{};
-          _visibleModules = _buildFencedModules(_modules, _permissions);
-          _streams = _buildStreams(_visibleModules);
-          _selectedIndex = _clampedIndex(_selectedIndex, _visibleModules);
-        });
-      }
-      return;
-    }
-
-    final supabase = _supabase;
-    if (supabase == null) {
-      if (mounted) {
-        setState(() {
-          _permissionsLoading = false;
-          _permissionError = 'Supabase is not initialized for this session.';
-          _visibleModules = _buildFencedModules(_modules, _permissions);
-          _streams = _buildStreams(_visibleModules);
-        });
-      }
-      return;
-    }
-
-    final activeFarmId = _activeFarmId(supabase);
-    final userId = supabase.auth.currentUser?.id ?? widget.currentUser.id;
-    if (activeFarmId.isEmpty || userId.isEmpty) {
-      if (mounted) {
-        setState(() {
-          _permissionsLoading = false;
-          _permissionError = 'No active farm or user reference was found.';
-          _visibleModules = _buildFencedModules(_modules, _permissions);
-          _streams = _buildStreams(_visibleModules);
-        });
-      }
-      return;
-    }
-
-    try {
-      final rows = await supabase
-          .from('user_permissions')
-          .select()
-          .eq('user_id', userId)
-          .eq('farm_id', activeFarmId)
-          .limit(1);
-      final permissions = rows.isEmpty
-          ? const <String, dynamic>{}
-          : Map<String, dynamic>.from(rows.first);
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _permissions = permissions;
-        _permissionsLoading = false;
-        _permissionError = null;
-        _visibleModules = _buildFencedModules(_modules, _permissions);
-        _streams = _buildStreams(_visibleModules);
-        _selectedIndex = _clampedIndex(_selectedIndex, _visibleModules);
-      });
-    } on Object catch (error) {
-      debugPrint(
-        'HatchLog Security Failure: Could not load RBAC permissions -> $error',
-      );
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _permissionsLoading = false;
-        _permissionError = error;
-        _visibleModules = _buildFencedModules(_modules, _permissions);
-        _streams = _buildStreams(_visibleModules);
-      });
-    }
   }
 
   Map<String, Stream<List<Map<String, dynamic>>>> _buildStreams(
@@ -193,6 +126,17 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
           );
         })
         .toList(growable: false);
+  }
+
+  @override
+  void didUpdateWidget(covariant UniversalMobileDashboard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.permissions != widget.permissions) {
+      _permissions = widget.permissions.toMap();
+      _visibleModules = _buildFencedModules(_modules, _permissions);
+      _streams = _buildStreams(_visibleModules);
+      _selectedIndex = _clampedIndex(_selectedIndex, _visibleModules);
+    }
   }
 
   @override
@@ -380,6 +324,54 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
     );
   }
 
+  Future<void> _openClimate() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => ClimateControlScreen(
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openFarmReport() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => FarmReportScreen(
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openTrash() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => TrashScreen(
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final module = _visibleModules[_selectedIndex];
@@ -399,6 +391,15 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         onOpenAnalytics: () {
           _openAnalytics();
         },
+        onOpenClimate: widget.permissions.canViewHouses ? _openClimate : null,
+        onOpenFarmReport: widget.permissions.canViewFinance
+            ? _openFarmReport
+            : null,
+        onOpenTrash:
+            widget.currentUser.role == UserRole.owner ||
+                widget.currentUser.role == UserRole.manager
+            ? _openTrash
+            : null,
         onSignOut: _signOut,
       ),
       appBar: AppBar(
@@ -411,9 +412,11 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
             onPressed: () {
               HapticFeedback.lightImpact();
               setState(() {
+                _permissions = widget.permissions.toMap();
+                _visibleModules = _buildFencedModules(_modules, _permissions);
                 _streams = _buildStreams(_visibleModules);
+                _selectedIndex = _clampedIndex(_selectedIndex, _visibleModules);
               });
-              _loadPermissions();
             },
             icon: const Icon(Icons.sync),
           ),
@@ -461,30 +464,37 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
               label: Text('Add ${module.shortLabel}'),
             ),
       body: SafeArea(
-        child: module.isDashboard
-            ? FarmDashboardHomeView(
-                supabase: _supabase,
-                activeFarmId: _supabase == null
-                    ? widget.currentUser.activeFarmId
-                    : _activeFarmId(_supabase!),
-                displayName: widget.currentUser.displayName,
-                role: widget.currentUser.role,
-                permissionError: _permissionError,
-                permissionsLoading: _permissionsLoading,
-              )
-            : module.isPermissionAdmin
-            ? _OwnerPermissionsControlPanel(
-                supabase: _supabase,
-                activeFarmId: _supabase == null
-                    ? widget.currentUser.activeFarmId
-                    : _activeFarmId(_supabase!),
-                currentUser: widget.currentUser,
-              )
-            : _ModuleDataView(
-                key: ValueKey(module.table),
-                module: module,
-                stream: _streams[module.table]!,
-              ),
+        child: Column(
+          children: [
+            if (widget.showSoftLockBanner) const SoftLockBanner(),
+            Expanded(
+              child: module.isDashboard
+                  ? FarmDashboardHomeView(
+                      supabase: _supabase,
+                      activeFarmId: _supabase == null
+                          ? widget.currentUser.activeFarmId
+                          : _activeFarmId(_supabase!),
+                      displayName: widget.currentUser.displayName,
+                      role: widget.currentUser.role,
+                      permissionError: _permissionError,
+                      permissionsLoading: _permissionsLoading,
+                    )
+                  : module.isPermissionAdmin
+                  ? _OwnerPermissionsControlPanel(
+                      supabase: _supabase,
+                      activeFarmId: _supabase == null
+                          ? widget.currentUser.activeFarmId
+                          : _activeFarmId(_supabase!),
+                      currentUser: widget.currentUser,
+                    )
+                  : _ModuleDataView(
+                      key: ValueKey(module.table),
+                      module: module,
+                      stream: _streams[module.table]!,
+                    ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -518,9 +528,7 @@ bool _hasModulePermission(
 }
 
 bool _isPrivilegedRole(UserRole role) {
-  return role == UserRole.owner ||
-      role == UserRole.manager ||
-      role == UserRole.admin;
+  return role == UserRole.owner || role == UserRole.admin;
 }
 
 bool _permissionEnabled(Object? value) {
@@ -2089,6 +2097,9 @@ class _UniversalDrawer extends StatelessWidget {
     required this.selectedIndex,
     required this.onSelected,
     required this.onOpenAnalytics,
+    this.onOpenClimate,
+    this.onOpenFarmReport,
+    this.onOpenTrash,
     required this.onSignOut,
   });
 
@@ -2097,6 +2108,9 @@ class _UniversalDrawer extends StatelessWidget {
   final int selectedIndex;
   final ValueChanged<int> onSelected;
   final VoidCallback onOpenAnalytics;
+  final VoidCallback? onOpenClimate;
+  final VoidCallback? onOpenFarmReport;
+  final VoidCallback? onOpenTrash;
   final VoidCallback onSignOut;
 
   @override
@@ -2140,33 +2154,57 @@ class _UniversalDrawer extends StatelessWidget {
               ),
             ),
             Expanded(
-              child: ListView.builder(
+              child: ListView(
                 padding: const EdgeInsets.symmetric(vertical: 10),
-                itemCount: modules.length,
-                itemBuilder: (context, index) {
-                  final module = modules[index];
-                  return ListTile(
-                    selected: index == selectedIndex,
-                    leading: Icon(module.icon),
-                    title: Text(module.title),
-                    subtitle: Text(module.subtitle),
-                    onTap: () => onSelected(index),
-                  );
-                },
+                children: [
+                  for (var index = 0; index < modules.length; index += 1)
+                    ListTile(
+                      selected: index == selectedIndex,
+                      leading: Icon(modules[index].icon),
+                      title: Text(modules[index].title),
+                      subtitle: Text(modules[index].subtitle),
+                      onTap: () => onSelected(index),
+                    ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(Icons.bar_chart),
+                    title: const Text('Farm Analytics'),
+                    subtitle: const Text(
+                      'Charts for eggs, losses, feed, and cash',
+                    ),
+                    onTap: onOpenAnalytics,
+                  ),
+                  if (onOpenClimate != null)
+                    ListTile(
+                      leading: const Icon(Icons.thermostat_outlined),
+                      title: const Text('Climate Control'),
+                      subtitle: const Text('House temperature and humidity'),
+                      onTap: onOpenClimate,
+                    ),
+                  if (onOpenFarmReport != null)
+                    ListTile(
+                      leading: const Icon(Icons.picture_as_pdf_outlined),
+                      title: const Text('Farm Report'),
+                      subtitle: const Text(
+                        'Revenue, expenses, batches, inventory',
+                      ),
+                      onTap: onOpenFarmReport,
+                    ),
+                  if (onOpenTrash != null)
+                    ListTile(
+                      leading: const Icon(Icons.restore_from_trash_outlined),
+                      title: const Text('Data Recovery'),
+                      subtitle: const Text('Restore locally deleted records'),
+                      onTap: onOpenTrash,
+                    ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(Icons.logout),
+                    title: const Text('Sign out'),
+                    onTap: onSignOut,
+                  ),
+                ],
               ),
-            ),
-            const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.bar_chart),
-              title: const Text('Farm Analytics'),
-              subtitle: const Text('Charts for eggs, losses, feed, and cash'),
-              onTap: onOpenAnalytics,
-            ),
-            const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.logout),
-              title: const Text('Sign out'),
-              onTap: onSignOut,
             ),
           ],
         ),
