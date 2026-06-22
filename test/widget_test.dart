@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:hatchlog_m/core/license/license_service.dart';
+import 'package:hatchlog_m/core/license/license_status.dart';
 import 'package:hatchlog_m/core/models/app_user.dart';
 import 'package:hatchlog_m/core/models/worker_input_type.dart';
 import 'package:hatchlog_m/core/permissions/farm_permissions.dart';
@@ -33,6 +35,32 @@ void main() {
       '+233554101675',
     );
   });
+
+  test(
+    'hard locked license mode blocks even after a fresh cloud check',
+    () async {
+      final now = DateTime.now();
+      final licenseService = LicenseService(
+        _FakeLicenseDatabase({
+          'id': 'singleton',
+          'mode': 'HARD_LOCKED',
+          'farm_id': 'farm-1',
+          'user_id': 'user-1',
+          'hardware_id': 'device-1',
+          'installed_at': now
+              .subtract(const Duration(days: 40))
+              .toIso8601String(),
+          'expires_at': now
+              .subtract(const Duration(days: 36))
+              .toIso8601String(),
+          'last_used': now.toIso8601String(),
+          'last_cloud_check_at': now.toIso8601String(),
+        }),
+      );
+
+      expect(await licenseService.checkLicense(), LicenseStatus.hardLocked);
+    },
+  );
 
   test(
     'local sales queue rejects invalid quantities before storage writes',
@@ -239,6 +267,20 @@ class _NoopInputSink implements WorkerInputSink {
   @override
   Stream<WorkerDashboardSnapshot> watchDashboardState({required AppUser user}) {
     return const Stream.empty();
+  }
+}
+
+class _FakeLicenseDatabase extends LocalDatabase {
+  _FakeLicenseDatabase(this.row);
+
+  final Map<String, Object?> row;
+
+  @override
+  Future<List<Map<String, Object?>>> rawLocalQuery(
+    String sql, [
+    List<Object?>? arguments,
+  ]) async {
+    return [row];
   }
 }
 

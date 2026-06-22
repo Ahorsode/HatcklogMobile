@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../core/license/device_fingerprint.dart';
+import '../core/license/license_service.dart';
 import '../core/license/license_status.dart';
 import '../core/license/license_upgrade_launcher.dart';
 import '../core/models/app_user.dart';
@@ -102,6 +104,30 @@ class _HatchLogAppState extends State<HatchLogApp> {
     if (!mounted || _isBlockingLicenseStatus(licenseStatus)) {
       _clearActiveUser();
       return;
+    }
+
+    final userId = user.id.trim();
+    final farmId = user.activeFarmId.trim();
+    if (userId.isNotEmpty && farmId.isNotEmpty) {
+      final hardwareId = await getDeviceHardwareId();
+      final trialError = await widget.services.licenseService
+          .initTrialFromCloud(
+            userId: userId,
+            farmId: farmId,
+            hardwareId: hardwareId,
+          );
+
+      if (!mounted) {
+        return;
+      }
+
+      if (trialError == LicenseService.trialExhaustedErrorCode) {
+        final status = await widget.services.licenseService.checkLicense();
+        if (mounted) {
+          setState(() => _licenseStatus = status);
+        }
+        return;
+      }
     }
 
     _sessionWatcher?.dispose();

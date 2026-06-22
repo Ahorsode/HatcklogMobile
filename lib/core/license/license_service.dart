@@ -43,6 +43,8 @@ class LicenseConfig {
 class LicenseService {
   LicenseService(this._db);
 
+  static const trialExhaustedErrorCode = 'TRIAL_EXHAUSTED';
+
   final LocalDatabase _db;
 
   Future<LicenseStatus> checkLicense() async {
@@ -52,6 +54,10 @@ class LicenseService {
     }
 
     final now = DateTime.now();
+
+    if (config.mode == 'HARD_LOCKED') {
+      return LicenseStatus.hardLocked;
+    }
 
     if (now.isBefore(config.lastUsed.subtract(const Duration(minutes: 2)))) {
       return LicenseStatus.clockTampered;
@@ -99,6 +105,26 @@ class LicenseService {
         return 'Trial registration returned no data.';
       }
       if (data['success'] != true) {
+        final errorCode = data['error_code']?.toString() ?? '';
+        if (errorCode == trialExhaustedErrorCode) {
+          final now = DateTime.now();
+          await _upsertConfig(
+            mode: 'HARD_LOCKED',
+            farmId: farmId,
+            userId: userId,
+            hardwareId: hardwareId,
+            installedAt: now,
+            expiresAt: now.subtract(const Duration(days: 36)),
+            lastCloudCheckAt: now,
+          );
+          return trialExhaustedErrorCode;
+        }
+
+        await _initLocalFallbackTrial(
+          userId: userId,
+          farmId: farmId,
+          hardwareId: hardwareId,
+        );
         return data['error']?.toString() ?? 'Trial registration failed.';
       }
 

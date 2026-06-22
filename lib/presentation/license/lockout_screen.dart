@@ -92,7 +92,8 @@ class _LockoutScreenState extends State<LockoutScreen> {
         : 'Subscription Required';
     final body = _isClockTampered
         ? "Your device clock appears to have been set to a time in the past. This security measure prevents license tampering.\n\nPlease correct your device's date & time settings, then tap Retry below."
-        : 'Your free trial or subscription has expired. Upgrade your plan to continue accessing your farm data.';
+        : 'Your farm\'s free trial has ended or your subscription has expired. '
+              'Upgrade to Standard or Premium to restore access for all devices on your farm.';
 
     return Scaffold(
       backgroundColor: const Color(0xfff8faf7),
