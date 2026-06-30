@@ -451,8 +451,12 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
         builder: (context) => SaleEntryScreen(
           queue: queue,
           pdfService: pdfService,
-          currentUserId: widget.currentUser.id,
-          currentFarmId: widget.currentUser.activeFarmId,
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+          canOverridePrices:
+              widget.currentUser.role == UserRole.owner ||
+              widget.currentUser.role == UserRole.admin ||
+              widget.currentUser.role == UserRole.manager,
         ),
       ),
     );

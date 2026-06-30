@@ -1,6 +1,7 @@
 import '../../../core/models/app_user.dart';
 import '../../../core/storage/local_database.dart';
 import '../../../presentation/analytics/analytics_models.dart';
+import '../../../services/batch_finance_service.dart';
 import '../../auth/data/supabase_remote_api.dart';
 import 'management_models.dart';
 
@@ -74,9 +75,19 @@ class ManagementRepository implements ManagementDataSource {
     final analytics = await Future.wait(
       batches.map((batch) => _loadBatchAnalytics(batch, farmId)),
     );
-    final profitability = await Future.wait(
-      batches.map((batch) => _loadProfitability(batch, farmId)),
-    );
+    final breakdowns = await BatchFinanceService(
+      _localDatabase,
+    ).computeFarmBreakdown(farmId);
+    final profitability = breakdowns
+        .map(
+          (item) => BatchProfitability(
+            batchId: item.batchId,
+            batchLabel: item.batchLabel,
+            revenue: item.revenue,
+            expense: item.totalExpense,
+          ),
+        )
+        .toList();
     final team = await _loadTeamMembers(farmId);
     final pendingCount = await _localDatabase.countPendingInputs();
 
@@ -669,30 +680,6 @@ class ManagementRepository implements ManagementDataSource {
       currentCount: batch.currentCount,
       initialCount: initialCount,
       mortalityCount: _int(mortality.first['total']),
-    );
-  }
-
-  Future<BatchProfitability> _loadProfitability(
-    BatchOption batch,
-    String farmId,
-  ) async {
-    final revenue = await _localDatabase.rawLocalQuery(
-      "select coalesce(sum(amount), 0) as total from financial_transactions where farm_id = ? and is_deleted = 0 and type = 'REVENUE'",
-      [farmId],
-    );
-    final expense = await _localDatabase.rawLocalQuery(
-      'select coalesce(sum(amount), 0) as total from expenses where farm_id = ? and is_deleted = 0 and batch_id = ?',
-      [farmId, batch.id],
-    );
-
-    final batchShare = await _loadBatches(farmId);
-    final divisor = batchShare.isEmpty ? 1 : batchShare.length;
-
-    return BatchProfitability(
-      batchId: batch.id,
-      batchLabel: batch.label,
-      revenue: _double(revenue.first['total']) / divisor,
-      expense: _double(expense.first['total']),
     );
   }
 

@@ -462,6 +462,7 @@ class SupabaseRemoteApi {
         updatedColumn: 'updatedAt',
         modifiedAfter: modifiedAfter,
       ),
+      _selectFarmRows('expense_allocations', farmId, farmColumn: 'farmId'),
     ]);
 
     final userPermissions = farmScopedQueries[0];
@@ -488,6 +489,7 @@ class SupabaseRemoteApi {
     final eggCategories = farmScopedQueries[19];
     final feedFormulations = farmScopedQueries[20];
     final isolationRooms = farmScopedQueries[21];
+    final expenseAllocations = farmScopedQueries[22];
 
     addRows('user_permissions', userPermissions.map(_mapUserPermission));
     addRows('farm_settings', farmSettings.map(_mapFarmSettings));
@@ -503,6 +505,10 @@ class SupabaseRemoteApi {
     addRows('mortality', mortalityDeaths.map(_mapMortality));
     addRows('quarantine', quarantineCases.map(_mapQuarantine));
     addRows('expenses', expenses.map(_mapExpense));
+    addRows(
+      'expense_allocations',
+      expenseAllocations.map(_mapExpenseAllocation),
+    );
     addRows('financial_transactions', transactions.map(_mapTransaction));
     addRows('sales', sales.map(_mapSale));
     addRows('sale_items', saleItems.map(_mapSaleItem));
@@ -730,6 +736,9 @@ class SupabaseRemoteApi {
       'current_count': _asInt(row['currentCount']),
       'initial_count': _asInt(row['initialCount']),
       'isolation_count': _asInt(row['isolationCount']),
+      'initial_cost_actual': _asDouble(row['initialCostActual']),
+      'initial_cost_carriage': _asDouble(row['initialCostCarriage']),
+      'initial_cost_other': _asDouble(row['initialCostOther']),
       'arrival_date': _timestamp(arrivalDate),
       'local_batch_id': row['local_batch_id'],
       'is_deleted': _boolInt(row['is_deleted']),
@@ -756,6 +765,7 @@ class SupabaseRemoteApi {
       'cost_per_unit': _asDouble(row['costPerUnit']),
       'egg_category_id': _asString(row['eggCategoryId']),
       'supplier_id': _asString(row['supplierId']),
+      'usage_type': _asString(row['usageType']),
       'is_deleted': _boolInt(row['is_deleted']),
       'is_synced': 1,
       'created_at': _timestamp(row['createdAt']),
@@ -1034,6 +1044,8 @@ class SupabaseRemoteApi {
       'scheduled_date': _timestamp(row['scheduledDate']),
       'status': _asString(row['status']),
       'notes': _asString(row['notes']),
+      'inventory_id': _asString(row['inventoryId']),
+      'quantity': _asDouble(row['quantity'], fallback: 1),
       'farm_id': _asString(row['farmId']),
     };
   }
@@ -1046,7 +1058,22 @@ class SupabaseRemoteApi {
       'scheduled_date': _timestamp(row['scheduledDate']),
       'status': _asString(row['status']),
       'notes': _asString(row['notes']),
+      'inventory_id': _asString(row['inventoryId']),
+      'quantity': _asDouble(row['quantity'], fallback: 1),
       'farm_id': _asString(row['farmId']),
+    };
+  }
+
+  Map<String, Object?> _mapExpenseAllocation(Map<String, dynamic> row) {
+    return {
+      'id': _asString(row['id']),
+      'expense_id': _asString(row['expenseId']),
+      'batch_id': _asString(row['batchId']),
+      'farm_id': _asString(row['farmId']),
+      'allocated_amount': _asDouble(row['allocatedAmount']),
+      'allocation_percentage': _asDouble(row['allocationPercentage']),
+      'created_at': _timestamp(row['createdAt']),
+      'is_synced': 1,
     };
   }
 
@@ -1829,6 +1856,12 @@ class SupabaseRemoteApi {
 
   Future<void> _pushFarmGateSale(PendingSyncInput input) async {
     final payload = input.payload;
+    final items = payload['items'];
+    if (items is List && items.isNotEmpty) {
+      await _pushMultiLineSale(input, items);
+      return;
+    }
+
     final farmId = _requiredString(payload, 'farm_id');
     final quantity = _asInt(
       payload['quantity_crates'] ?? payload['quantity'],
@@ -1874,6 +1907,79 @@ class SupabaseRemoteApi {
       'reference_num': _optionalString(payload, 'transaction_hash'),
       'transaction_date': timestamp,
       'description': '$quantity ${unit.isEmpty ? 'unit' : unit} farm-gate sale',
+    });
+  }
+
+  Future<void> _pushMultiLineSale(
+    PendingSyncInput input,
+    List<dynamic> items,
+  ) async {
+    final payload = input.payload;
+    final farmId = _requiredString(payload, 'farm_id');
+    final saleId = input.resolvedServerRecordId;
+    final total = _asDouble(payload['total_cash_received']);
+    final customerId = _optionalString(payload, 'customer_id');
+    final customerName = _optionalString(payload, 'customer_name');
+    final paymentMethod = _optionalString(payload, 'payment_method');
+    final timestamp = _optionalString(payload, 'order_date').isEmpty
+        ? _optionalString(payload, 'device_timestamp').isEmpty
+              ? input.createdAt.toIso8601String()
+              : _optionalString(payload, 'device_timestamp')
+        : _optionalString(payload, 'order_date');
+
+    await _verifiedUpsert('sales', {
+      'id': saleId,
+      'farmId': farmId,
+      'userId': input.userId,
+      'customerId': customerId.isEmpty ? null : customerId,
+      'customerName': customerName.isEmpty ? 'Walk-in Customer' : customerName,
+      'totalAmount': total,
+      'saleDate': timestamp,
+      'status': 'completed',
+    });
+
+    final descriptions = <String>[];
+    for (var index = 0; index < items.length; index += 1) {
+      final item = items[index];
+      if (item is! Map) {
+        continue;
+      }
+      final itemMap = Map<String, dynamic>.from(item);
+      final quantity = _asInt(itemMap['quantity'], fallback: 1);
+      final unitPrice = _asDouble(itemMap['unit_price']);
+      final lineTotal = _asDouble(itemMap['total_price']);
+      final description = _optionalString(itemMap, 'description');
+      descriptions.add('$quantity x $description');
+      await _verifiedUpsert('sale_items', {
+        'id': '${saleId}_item_$index',
+        'saleId': saleId,
+        'farmId': farmId,
+        'description': description.isEmpty ? 'Sale item' : description,
+        'quantity': quantity,
+        'unitPrice': unitPrice,
+        'totalPrice': lineTotal <= 0 ? quantity * unitPrice : lineTotal,
+        'inventoryId': _optionalString(itemMap, 'inventory_id').isEmpty
+            ? null
+            : _optionalString(itemMap, 'inventory_id'),
+        'livestockId': _optionalString(itemMap, 'livestock_id').isEmpty
+            ? null
+            : _optionalString(itemMap, 'livestock_id'),
+      });
+    }
+
+    await _verifiedUpsert('financial_transactions', {
+      'id': '${saleId}_transaction',
+      'farm_id': farmId,
+      'user_id': input.userId,
+      'type': 'REVENUE',
+      'category': 'SALES',
+      'amount': total,
+      'payment_status': 'PAID',
+      'payment_method': paymentMethod.isEmpty ? 'CASH' : paymentMethod,
+      'reference_num': _optionalString(payload, 'transaction_hash'),
+      'transaction_date': timestamp,
+      'description':
+          '${descriptions.join(', ')} to ${customerName.isEmpty ? 'Walk-in Customer' : customerName}',
     });
   }
 

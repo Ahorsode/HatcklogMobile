@@ -14,6 +14,10 @@ import '../../features/sync/data/worker_input_sink.dart';
 import '../../services/local_sales_queue.dart';
 import '../../services/pdf_invoice_service.dart';
 import '../analytics/farm_analytics_screen.dart';
+import '../../features/inventory/data/inventory_repository.dart';
+import '../../services/executive_metrics_service.dart';
+import '../executive/executive_dashboard_screen.dart';
+import '../inventory/inventory_list_screen.dart';
 import '../houses/climate_control_screen.dart';
 import '../license/soft_lock_banner.dart';
 import '../reports/farm_report_screen.dart';
@@ -65,6 +69,9 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
   Object? _permissionError;
   bool _isOnline = true;
   int _selectedIndex = 0;
+  bool _showExecutiveDashboard = false;
+  late final ExecutiveMetricsService _executiveMetricsService;
+  late final InventoryRepository _inventoryRepository;
 
   @override
   void initState() {
@@ -75,6 +82,8 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       debugPrint('WARN: Supabase unavailable for dashboard streams: $error');
     }
     _modules = _buildModules();
+    _executiveMetricsService = ExecutiveMetricsService(widget.localDatabase);
+    _inventoryRepository = InventoryRepository(widget.localDatabase);
     _permissions = widget.permissions.toMap();
     _visibleModules = _buildFencedModules(_modules, _permissions);
     _streams = {
@@ -91,6 +100,21 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         setState(() => _isOnline = online);
       }
     });
+    _loadExecutiveAccess();
+  }
+
+  Future<void> _loadExecutiveAccess() async {
+    try {
+      final allowed = await _executiveMetricsService.isPremiumOwner(
+        widget.currentUser.activeFarmId,
+        widget.currentUser.role.name,
+      );
+      if (mounted) {
+        setState(() => _showExecutiveDashboard = allowed);
+      }
+    } on Object {
+      // Local cache may be unavailable during tests or early boot.
+    }
   }
 
   Map<String, Stream<List<Map<String, dynamic>>>> _buildStreams(
@@ -308,6 +332,39 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
     await widget.onSignOut();
   }
 
+  Future<void> _openExecutive() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => ExecutiveDashboardScreen(
+          currentUser: widget.currentUser,
+          permissions: widget.permissions,
+          executiveMetricsService: _executiveMetricsService,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openInventoryHub() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => InventoryListScreen(
+          currentUser: widget.currentUser,
+          inventoryRepository: _inventoryRepository,
+        ),
+      ),
+    );
+  }
+
   Future<void> _openAnalytics() async {
     HapticFeedback.lightImpact();
     await Navigator.of(context).maybePop();
@@ -391,6 +448,10 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         onOpenAnalytics: () {
           _openAnalytics();
         },
+        onOpenExecutive: _showExecutiveDashboard ? _openExecutive : null,
+        onOpenInventoryHub: widget.permissions.canViewInventory
+            ? _openInventoryHub
+            : null,
         onOpenClimate: widget.permissions.canViewHouses ? _openClimate : null,
         onOpenFarmReport: widget.permissions.canViewFinance
             ? _openFarmReport
@@ -2097,6 +2158,8 @@ class _UniversalDrawer extends StatelessWidget {
     required this.selectedIndex,
     required this.onSelected,
     required this.onOpenAnalytics,
+    this.onOpenExecutive,
+    this.onOpenInventoryHub,
     this.onOpenClimate,
     this.onOpenFarmReport,
     this.onOpenTrash,
@@ -2108,6 +2171,8 @@ class _UniversalDrawer extends StatelessWidget {
   final int selectedIndex;
   final ValueChanged<int> onSelected;
   final VoidCallback onOpenAnalytics;
+  final VoidCallback? onOpenExecutive;
+  final VoidCallback? onOpenInventoryHub;
   final VoidCallback? onOpenClimate;
   final VoidCallback? onOpenFarmReport;
   final VoidCallback? onOpenTrash;
@@ -2174,6 +2239,24 @@ class _UniversalDrawer extends StatelessWidget {
                     ),
                     onTap: onOpenAnalytics,
                   ),
+                  if (onOpenExecutive != null)
+                    ListTile(
+                      leading: const Icon(Icons.insights_outlined),
+                      title: const Text('Executive Summary'),
+                      subtitle: const Text(
+                        'Premium owner KPIs, priorities, and revenue velocity',
+                      ),
+                      onTap: onOpenExecutive,
+                    ),
+                  if (onOpenInventoryHub != null)
+                    ListTile(
+                      leading: const Icon(Icons.inventory_2_outlined),
+                      title: const Text('Inventory Hub'),
+                      subtitle: const Text(
+                        'In stock, used up, and usage history',
+                      ),
+                      onTap: onOpenInventoryHub,
+                    ),
                   if (onOpenClimate != null)
                     ListTile(
                       leading: const Icon(Icons.thermostat_outlined),
@@ -4234,7 +4317,7 @@ List<_HatchModuleConfig> _buildModules() {
           label: 'Status',
           icon: Icons.fact_check_outlined,
           type: _FieldType.dropdown,
-          options: ['PENDING', 'DONE', 'MISSED'],
+          options: ['PENDING', 'COMPLETED', 'DONE', 'MISSED'],
         ),
         _FieldSpec(
           key: 'notes',
@@ -4296,7 +4379,7 @@ List<_HatchModuleConfig> _buildModules() {
           label: 'Status',
           icon: Icons.fact_check_outlined,
           type: _FieldType.dropdown,
-          options: ['PENDING', 'DONE', 'MISSED'],
+          options: ['PENDING', 'COMPLETED', 'DONE', 'MISSED'],
         ),
         _FieldSpec(
           key: 'notes',

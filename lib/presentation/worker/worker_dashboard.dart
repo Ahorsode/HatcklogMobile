@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../../core/models/app_user.dart';
 import '../../core/models/worker_input_type.dart';
+import '../../core/storage/local_database.dart';
 import '../../features/sync/data/worker_input_sink.dart';
 import '../../features/sales/sale_entry_screen.dart';
 import '../shared/session_mode_badge.dart';
@@ -174,8 +175,12 @@ class _WorkerDashboardState extends State<WorkerDashboard> {
         builder: (context) => SaleEntryScreen(
           queue: widget.localSalesQueue,
           pdfService: widget.pdfInvoiceService,
-          currentUserId: widget.currentUser.id,
-          currentFarmId: widget.currentUser.activeFarmId,
+          currentUser: widget.currentUser,
+          localDatabase: LocalDatabase(),
+          canOverridePrices:
+              widget.currentUser.role == UserRole.owner ||
+              widget.currentUser.role == UserRole.admin ||
+              widget.currentUser.role == UserRole.manager,
         ),
       ),
     );

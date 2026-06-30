@@ -14,6 +14,7 @@ import 'package:hatchlog_m/features/sync/data/worker_input_sink.dart';
 import 'package:hatchlog_m/presentation/analytics/analytics_models.dart';
 import 'package:hatchlog_m/core/storage/local_database.dart';
 import 'package:hatchlog_m/services/encryption_service.dart';
+import 'package:hatchlog_m/features/sales/sale_line_draft.dart';
 import 'package:hatchlog_m/services/local_sales_queue.dart';
 
 void main() {
@@ -78,6 +79,37 @@ void main() {
           quantityCrates: 0,
           amountReceived: 20,
           unit: 'CRATE',
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    },
+  );
+
+  test(
+    'multi-line sales queue rejects mismatched locked totals',
+    () {
+      final queue = LocalSalesQueue(
+        localDatabase: LocalDatabase(),
+        encryptionService: EncryptionService(),
+        deviceId: 'device-test',
+      );
+
+      expect(
+        () => queue.enqueueMultiLineSale(
+          userId: 'user-1',
+          farmId: 'farm-1',
+          orderDate: DateTime.utc(2026, 6, 27),
+          totalCashReceived: 50,
+          requireExactCashTotal: true,
+          items: const [
+            SaleLineDraft(
+              productType: SaleProductType.inventory,
+              description: 'Layer Mash',
+              quantity: 2,
+              unitPrice: 30,
+              inventoryId: 'inv-1',
+            ),
+          ],
         ),
         throwsA(isA<ArgumentError>()),
       );

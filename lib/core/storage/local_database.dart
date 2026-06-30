@@ -130,7 +130,7 @@ class LocalDatabase {
     final fullPath = path.join(databasePath, 'hatchlog_mobile.db');
     _database = await openDatabase(
       fullPath,
-      version: 8,
+      version: 9,
       onCreate: _createSchema,
       onUpgrade: _upgradeSchema,
     );
@@ -534,6 +534,40 @@ class LocalDatabase {
     }
     if (oldVersion < 8) {
       await _createLicenseConfigsTable(db);
+    }
+    if (oldVersion < 9) {
+      await _ensureMobileParityColumns(db);
+    }
+  }
+
+  Future<void> _ensureMobileParityColumns(Database db) async {
+    for (final column in const [
+      'initial_cost_actual',
+      'initial_cost_carriage',
+      'initial_cost_other',
+    ]) {
+      await _addColumnIfMissing(
+        db,
+        'batches',
+        column,
+        'real not null default 0',
+      );
+    }
+
+    await _addColumnIfMissing(db, 'inventory', 'usage_type', 'text');
+
+    for (final table in const ['vaccination_schedules', 'medication_schedules']) {
+      await _addColumnIfMissing(db, table, 'inventory_id', 'text');
+      await _addColumnIfMissing(
+        db,
+        table,
+        'quantity',
+        'real not null default 1',
+      );
+    }
+
+    for (final column in const ['inventory_id', 'livestock_id']) {
+      await _addColumnIfMissing(db, 'sale_items', column, 'text');
     }
   }
 

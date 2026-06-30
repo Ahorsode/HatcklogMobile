@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 
+import '../../../services/health_inventory_service.dart';
 import '../../core/models/app_user.dart';
 import '../../core/storage/local_database.dart';
 import '../auth/data/supabase_remote_api.dart';
@@ -32,6 +33,9 @@ class SyncEngineService {
         modifiedAfter: cursor,
       );
       await _localDatabase.upsertCloudRecords(snapshot.recordsByLocalTable);
+      await HealthInventoryService(_localDatabase).reconcileFarmDepletion(
+        user.activeFarmId,
+      );
       await _localDatabase.writeSyncCursor(scope, snapshot.pulledAt);
       debugPrint(
         'HatchLog Sync Engine: Cloud data hydration sequence complete.',
