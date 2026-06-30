@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../storage/local_database.dart';
@@ -183,8 +184,22 @@ class LicenseService {
       if (serverExpiry != null && serverExpiry.isAfter(config.expiresAt)) {
         updates['expires_at'] = serverExpiry.toIso8601String();
       }
-      if (statusStr != null) {
-        updates['mode'] = _serverStatusToLocalMode(statusStr);
+      // Check the trial_exhausted flag BEFORE writing any updates.
+      // If the server says the trial is exhausted and we're not in an active paid state,
+      // hard-lock immediately — identical to how desktop handles this.
+      final trialExhausted = data['trial_exhausted'] == true;
+      final resolvedMode =
+          statusStr != null ? _serverStatusToLocalMode(statusStr) : null;
+      final isActive = resolvedMode == 'CLOUD_ACTIVE';
+
+      if (trialExhausted && !isActive) {
+        await _setMode('HARD_LOCKED');
+        debugPrint('[License] Server reports trial exhausted — forcing hard lock.');
+        return; // skip the normal update to avoid accidentally unlocking
+      }
+
+      if (resolvedMode != null) {
+        updates['mode'] = resolvedMode;
       }
 
       await _db.rawLocalUpdate('license_configs', updates, "id = 'singleton'");
@@ -267,11 +282,28 @@ class LicenseService {
 
   String _serverStatusToLocalMode(String status) {
     return switch (status) {
+      // All paid/active variants — web writes any of these depending on path
       'ACTIVE' => 'CLOUD_ACTIVE',
+      'PAID_AND_ACTIVE' => 'CLOUD_ACTIVE', // written by adminUpgradeFarmTier (web)
+      'PAID_STANDARD' => 'CLOUD_ACTIVE', // written by RPC after standard upgrade
+      'PAID_PREMIUM' => 'CLOUD_ACTIVE', // written by RPC after premium upgrade
+
+      // Trial
       'CLOUD_TRIAL' => 'CLOUD_TRIAL',
-      'GRACE_PERIOD' => 'EXPIRED',
+
+      // Expired / exhausted
       'EXPIRED' => 'EXPIRED',
-      _ => 'CLOUD_TRIAL',
+      'TRIAL_EXPIRED' => 'EXPIRED',
+      'GRACE_PERIOD' => 'EXPIRED',
+
+      // Revoked by admin — treat as hard locked immediately
+      'REVOKED' => 'HARD_LOCKED',
+
+      // Unknown future status — log it, keep local state rather than downgrading to trial
+      _ => () {
+        debugPrint('[License] Unrecognised server status: $status');
+        return 'CLOUD_TRIAL';
+      }(),
     };
   }
 
