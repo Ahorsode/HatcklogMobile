@@ -6,6 +6,7 @@ import '../../core/storage/local_database.dart';
 import '../../services/local_sales_queue.dart';
 import '../../services/pdf_invoice_service.dart';
 import '../../utils/inventory_sale_utils.dart';
+import 'sale_line_draft.dart';
 
 enum _DiscountMode { flat, percentage }
 
