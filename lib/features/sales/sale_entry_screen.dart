@@ -168,6 +168,9 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
             .where((option) => option.id.isNotEmpty)
             .toList(growable: false);
         _loading = false;
+        for (final line in _lines) {
+          _autoSelectProduct(line);
+        }
       });
       _syncLockedCashTotal();
     } on StateError {
@@ -183,6 +186,46 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       SaleProductType.livestock => _livestockOptions,
       SaleProductType.custom => const [],
     };
+  }
+
+  bool _shouldHideProductPicker(_SaleLineState line) {
+    if (line.productType == SaleProductType.custom) {
+      return false;
+    }
+    final options = _optionsFor(line.productType);
+    if (options.isEmpty) {
+      return false;
+    }
+    if (options.length == 1) {
+      return true;
+    }
+    if (line.productType == SaleProductType.inventory && _inventoryIsEggCatalog) {
+      return true;
+    }
+    return false;
+  }
+
+  void _autoSelectProduct(_SaleLineState line) {
+    if (line.productType == SaleProductType.custom) {
+      return;
+    }
+    final options = _optionsFor(line.productType);
+    if (options.isEmpty) {
+      line.productId = null;
+      line.description = '';
+      line.unitPriceController.clear();
+      return;
+    }
+    final shouldAutoSelect = options.length == 1 ||
+        (line.productType == SaleProductType.inventory && _inventoryIsEggCatalog);
+    if (!shouldAutoSelect) {
+      return;
+    }
+    final selected = options.first;
+    line.productId = selected.id;
+    line.description = selected.description;
+    line.unitPriceController.text = selected.unitPrice.toStringAsFixed(2);
+    line.stockError = null;
   }
 
   _ProductOption? _selectedProduct(_SaleLineState line) {
@@ -506,6 +549,20 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                     inventoryTypeLabel:
                         _inventoryIsEggCatalog ? 'Eggs' : 'Inventory',
                     options: _optionsFor(_lines[index].productType),
+                    hideProductPicker: _shouldHideProductPicker(_lines[index]),
+                    onProductTypeChanged: (type) {
+                      setState(() {
+                        final line = _lines[index];
+                        line.productType = type;
+                        line.productId = null;
+                        line.customDescriptionController.clear();
+                        line.unitPriceController.clear();
+                        line.description = '';
+                        line.stockError = null;
+                        _autoSelectProduct(line);
+                        _syncLockedCashTotal();
+                      });
+                    },
                     onChanged: _onFieldChanged,
                     onRemove: _lines.length == 1
                         ? null
@@ -521,7 +578,9 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                 OutlinedButton.icon(
                   onPressed: () {
                     setState(() {
-                      _lines.add(_SaleLineState());
+                      final line = _SaleLineState();
+                      _lines.add(line);
+                      _autoSelectProduct(line);
                       _syncLockedCashTotal();
                     });
                   },
@@ -653,6 +712,8 @@ class _LineCard extends StatelessWidget {
     required this.canOverridePrices,
     required this.inventoryTypeLabel,
     required this.options,
+    required this.hideProductPicker,
+    required this.onProductTypeChanged,
     required this.onChanged,
     this.onRemove,
   });
@@ -662,11 +723,23 @@ class _LineCard extends StatelessWidget {
   final bool canOverridePrices;
   final String inventoryTypeLabel;
   final List<_ProductOption> options;
+  final bool hideProductPicker;
+  final ValueChanged<SaleProductType> onProductTypeChanged;
   final ValueChanged<VoidCallback?> onChanged;
   final VoidCallback? onRemove;
 
+  _ProductOption? get _selectedOption {
+    for (final option in options) {
+      if (option.id == line.productId) {
+        return option;
+      }
+    }
+    return options.isNotEmpty ? options.first : null;
+  }
+
   @override
   Widget build(BuildContext context) {
+    final selected = _selectedOption;
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       child: Padding(
@@ -706,14 +779,7 @@ class _LineCard extends StatelessWidget {
               ],
               selected: {line.productType},
               onSelectionChanged: (selection) {
-                onChanged(() {
-                  line.productType = selection.first;
-                  line.productId = null;
-                  line.customDescriptionController.clear();
-                  line.unitPriceController.clear();
-                  line.description = '';
-                  line.stockError = null;
-                });
+                onProductTypeChanged(selection.first);
               },
             ),
             const SizedBox(height: 12),
@@ -726,12 +792,24 @@ class _LineCard extends StatelessWidget {
                 ),
                 onChanged: (_) => onChanged(null),
               ),
-            ] else
+            ] else if (hideProductPicker && selected != null)
+              InputDecorator(
+                decoration: InputDecoration(
+                  labelText: line.productType == SaleProductType.inventory
+                      ? inventoryTypeLabel
+                      : 'Livestock Batch',
+                ),
+                child: Text(
+                  selected.label,
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+              )
+            else
               DropdownButtonFormField<String?>(
                 initialValue: line.productId,
                 decoration: InputDecoration(
                   labelText: line.productType == SaleProductType.inventory
-                      ? 'Inventory Product'
+                      ? '$inventoryTypeLabel Product'
                       : 'Livestock Batch',
                 ),
                 items: [
