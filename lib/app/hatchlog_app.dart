@@ -30,6 +30,7 @@ class _HatchLogAppState extends State<HatchLogApp> {
   SessionWatcher? _sessionWatcher;
   Timer? _subscriptionCheckTimer;
   final _scaffoldMessengerKey = GlobalKey<ScaffoldMessengerState>();
+  bool _isBootstrapping = true;
 
   @override
   void initState() {
@@ -46,11 +47,17 @@ class _HatchLogAppState extends State<HatchLogApp> {
   }
 
   Future<void> _bootstrap() async {
-    final status = await _refreshLicenseStatus(renewFromCloud: true);
-    if (!mounted || _isBlockingLicenseStatus(status)) {
-      return;
+    try {
+      final status = await _refreshLicenseStatus(renewFromCloud: true);
+      if (!mounted || _isBlockingLicenseStatus(status)) {
+        return;
+      }
+      await _restoreActiveSession();
+    } finally {
+      if (mounted) {
+        setState(() => _isBootstrapping = false);
+      }
     }
-    await _restoreActiveSession();
   }
 
   Future<LicenseStatus> _refreshLicenseStatus({
@@ -108,7 +115,21 @@ class _HatchLogAppState extends State<HatchLogApp> {
 
     final userId = user.id.trim();
     final farmId = user.activeFarmId.trim();
+    final online = await widget.services.connectivityService.isOnline;
+
     if (userId.isNotEmpty && farmId.isNotEmpty) {
+      await widget.services.localDatabase.prepareSessionForUser(
+        userId: userId,
+        farmId: farmId,
+      );
+      await widget.services.localDatabase.upsertUser(user);
+      await widget.services.localDatabase.writeSessionContext(
+        userId: userId,
+        farmId: farmId,
+      );
+    }
+
+    if (online && !user.authenticatedOffline && userId.isNotEmpty && farmId.isNotEmpty) {
       final hardwareId = await getDeviceHardwareId();
       final trialError = await widget.services.licenseService
           .initTrialFromCloud(
@@ -136,7 +157,10 @@ class _HatchLogAppState extends State<HatchLogApp> {
       _currentUser = user;
       _currentPermissions = null;
     });
-    await widget.services.syncRepository.hydrateFromCloud(user);
+
+    if (online && !user.authenticatedOffline) {
+      await widget.services.syncRepository.syncWithCloud(user);
+    }
     final permissions = await widget.services.permissionsRepository.loadForUser(
       user,
     );
@@ -258,8 +282,10 @@ class _HatchLogAppState extends State<HatchLogApp> {
         ),
         useMaterial3: true,
       ),
-      home: licenseStatus == null
-          ? const _BootstrappingSessionScreen()
+      home: _isBootstrapping || licenseStatus == null
+          ? const _BootstrappingSessionScreen(
+              message: 'Restoring your session...',
+            )
           : licenseStatus == LicenseStatus.hardLocked
           ? LockoutScreen(
               reason: LockoutReason.trialExpired,
@@ -284,7 +310,9 @@ class _HatchLogAppState extends State<HatchLogApp> {
               },
             )
           : _currentPermissions == null
-          ? const _BootstrappingSessionScreen()
+          ? const _BootstrappingSessionScreen(
+              message: 'Loading your farm...',
+            )
           : RoleGateway(
               currentUser: _currentUser!,
               permissions: _currentPermissions!,
@@ -298,21 +326,39 @@ class _HatchLogAppState extends State<HatchLogApp> {
               onSignOut: _signOut,
               localSalesQueue: widget.services.localSalesQueue,
               pdfInvoiceService: widget.services.pdfInvoiceService,
+              onRefreshFromCloud: () => widget.services.syncRepository
+                  .syncWithCloud(_currentUser!, forceFullRefresh: true),
+              remoteApi: widget.services.remoteApi,
             ),
     );
   }
 }
 
 class _BootstrappingSessionScreen extends StatelessWidget {
-  const _BootstrappingSessionScreen();
+  const _BootstrappingSessionScreen({this.message = 'Loading HatchLog...'});
+
+  final String message;
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
+    return Scaffold(
       body: Center(
-        child: SizedBox.square(
-          dimension: 34,
-          child: CircularProgressIndicator(strokeWidth: 3),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox.square(
+              dimension: 34,
+              child: CircularProgressIndicator(strokeWidth: 3),
+            ),
+            const SizedBox(height: 18),
+            Text(
+              message,
+              style: const TextStyle(
+                color: Color(0xff66736c),
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
         ),
       ),
     );

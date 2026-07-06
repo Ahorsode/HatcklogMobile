@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as path;
 import 'package:sqflite/sqflite.dart';
 
@@ -130,25 +131,67 @@ class LocalDatabase {
     final fullPath = path.join(databasePath, 'hatchlog_mobile.db');
     _database = await openDatabase(
       fullPath,
-      version: 9,
+      version: 16,
       onCreate: _createSchema,
       onUpgrade: _upgradeSchema,
     );
+    await _repairSchemaParity(_database!);
+  }
+
+  Future<void> requeueMobileLivestockForSync(String farmId) async {
+    if (farmId.isEmpty) {
+      return;
+    }
+    final updated = await _db.rawUpdate(
+      '''
+      update batches
+      set is_synced = 0, updated_at = ?
+      where farm_id = ?
+        and id like 'batch_%'
+        and coalesce(is_deleted, 0) = 0
+        and coalesce(is_synced, 1) = 1
+      ''',
+      [DateTime.now().toIso8601String(), farmId],
+    );
+    if (updated > 0) {
+      debugPrint(
+        '[DB] Re-queued $updated mobile livestock unit(s) for cloud sync',
+      );
+      _notifyTablesChanged(const ['batches']);
+    }
+  }
+
+  Future<void> _repairSchemaParity(Database db) async {
+    await _createWebSchemaCacheTables(db);
+    await _ensureWebSchemaColumns(db);
+    await _ensurePendingSyncQueueColumns(db);
+    await _ensureCoreHubColumns(db);
+    await _ensureFinanceAllocationColumns(db);
+    await _ensureMobileParityColumns(db);
+    await _ensureHealthScheduleParityColumns(db);
+    await _ensureHouseSyncParityColumns(db);
+    await _ensureHouseSoftDeleteColumns(db);
+    await _ensureBatchSyncParityColumns(db);
+    await _ensureSettingsProfileParityColumns(db);
+    await _ensureLivestockParityColumns(db);
   }
 
   void setLicenseTouchHandler(Future<void> Function()? handler) {
     _licenseTouchHandler = handler;
   }
 
-  Stream<void> watchTables(Iterable<String> tableNames) async* {
+  Stream<void> watchTables(Iterable<String> tableNames) {
     final watched = tableNames.toSet();
-    yield null;
-    await for (final changedTables in _tableChangeController.stream) {
-      if (watched.isEmpty ||
-          changedTables.any((table) => watched.contains(table))) {
-        yield null;
-      }
-    }
+    return Stream<void>.multi((controller) {
+      controller.add(null);
+      final subscription = _tableChangeController.stream.listen((changedTables) {
+        if (watched.isEmpty ||
+            changedTables.any((table) => watched.contains(table))) {
+          controller.add(null);
+        }
+      });
+      controller.onCancel = () => subscription.cancel();
+    }).asBroadcastStream();
   }
 
   Future<void> upsertUser(AppUser user) async {
@@ -215,6 +258,31 @@ class LocalDatabase {
       return null;
     }
 
+    return AppUser.fromMap(rows.first);
+  }
+
+  Future<AppUser?> readUserById(String userId) async {
+    final rows = await _db.query(
+      'local_users',
+      where: 'id = ?',
+      whereArgs: [userId],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      return null;
+    }
+    return AppUser.fromMap(rows.first);
+  }
+
+  Future<AppUser?> readLastActiveUser() async {
+    final rows = await _db.query(
+      'local_users',
+      orderBy: 'updated_at desc',
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      return null;
+    }
     return AppUser.fromMap(rows.first);
   }
 
@@ -308,6 +376,124 @@ class LocalDatabase {
       'pulled_at': pulledAt.toUtc().toIso8601String(),
     }, conflictAlgorithm: ConflictAlgorithm.replace);
     _notifyTablesChanged(const ['sync_state']);
+  }
+
+  static const _sessionUserScope = 'session:user_id';
+  static const _sessionFarmScope = 'session:farm_id';
+
+  Future<({String? userId, String? farmId})> readSessionContext() async {
+    return (
+      userId: await _readSessionValue(_sessionUserScope),
+      farmId: await _readSessionValue(_sessionFarmScope),
+    );
+  }
+
+  Future<void> writeSessionContext({
+    required String userId,
+    required String farmId,
+  }) async {
+    await _writeSessionValue(_sessionUserScope, userId);
+    await _writeSessionValue(_sessionFarmScope, farmId);
+  }
+
+  Future<void> clearSessionContext() async {
+    await _db.delete(
+      'sync_state',
+      where: 'scope in (?, ?)',
+      whereArgs: [_sessionUserScope, _sessionFarmScope],
+    );
+    _notifyTablesChanged(const ['sync_state']);
+  }
+
+  /// Wipes cached farm operational data so the next login can hydrate fresh
+  /// cloud records for a different user or farm.
+  Future<void> clearOperationalFarmCache() async {
+    const tables = [
+      'farm_members',
+      'user_permissions',
+      'farm_settings',
+      'house_environment_logs',
+      'houses',
+      'batches',
+      'inventory',
+      'egg_production',
+      'daily_feeding_logs',
+      'mortality',
+      'quarantine',
+      'expenses',
+      'expense_allocations',
+      'financial_transactions',
+      'sales',
+      'sale_items',
+      'customers',
+      'orders',
+      'order_items',
+      'health_records',
+      'weight_records',
+      'vaccination_schedules',
+      'medication_schedules',
+      'suppliers',
+      'egg_categories',
+      'feed_formulation_ingredients',
+      'feed_formulations',
+      'isolation_rooms',
+      'farms',
+    ];
+    await _db.transaction((txn) async {
+      for (final table in tables) {
+        await txn.delete(table);
+      }
+      await txn.delete('pending_sync_inputs');
+    });
+    _notifyTablesChanged(tables);
+    _notifyTablesChanged(const ['pending_sync_inputs']);
+  }
+
+  Future<void> clearFarmSyncCursors() async {
+    await _db.delete(
+      'sync_state',
+      where: "scope like 'farm:%'",
+    );
+    _notifyTablesChanged(const ['sync_state']);
+  }
+
+  Future<bool> prepareSessionForUser({
+    required String userId,
+    required String farmId,
+  }) async {
+    final previous = await readSessionContext();
+    final shouldReset =
+        (previous.userId != null && previous.userId != userId) ||
+        (previous.farmId != null && previous.farmId != farmId);
+    if (shouldReset) {
+      await clearOperationalFarmCache();
+      await clearFarmSyncCursors();
+    }
+    await writeSessionContext(userId: userId, farmId: farmId);
+    return shouldReset;
+  }
+
+  Future<String?> _readSessionValue(String scope) async {
+    final rows = await _db.query(
+      'sync_state',
+      columns: ['pulled_at'],
+      where: 'scope = ?',
+      whereArgs: [scope],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      return null;
+    }
+    final value = rows.first['pulled_at']?.toString() ?? '';
+    return value.isEmpty ? null : value;
+  }
+
+  Future<void> _writeSessionValue(String scope, String value) async {
+    await _db.insert(
+      'sync_state',
+      {'scope': scope, 'pulled_at': value},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
   }
 
   Future<void> upsertCloudRecords(
@@ -462,6 +648,7 @@ class LocalDatabase {
         email text,
         role text not null,
         first_name text,
+        middle_name text,
         last_name text,
         active_farm_id text,
         active_batch_id text,
@@ -494,6 +681,13 @@ class LocalDatabase {
 
     await _createSyncStateTable(db);
     await _createLicenseConfigsTable(db);
+    await _ensureMobileParityColumns(db);
+    await _ensureHealthScheduleParityColumns(db);
+    await _ensureHouseSyncParityColumns(db);
+    await _ensureHouseSoftDeleteColumns(db);
+    await _ensureBatchSyncParityColumns(db);
+    await _ensureSettingsProfileParityColumns(db);
+    await _ensureLivestockParityColumns(db);
   }
 
   Future<void> _upgradeSchema(
@@ -538,6 +732,89 @@ class LocalDatabase {
     if (oldVersion < 9) {
       await _ensureMobileParityColumns(db);
     }
+    if (oldVersion < 10) {
+      await _ensureHealthScheduleParityColumns(db);
+    }
+    if (oldVersion < 11) {
+      await _ensureHouseSyncParityColumns(db);
+    }
+    if (oldVersion < 12) {
+      await _ensureSettingsProfileParityColumns(db);
+    }
+    if (oldVersion < 13) {
+      await _ensureMobileParityColumns(db);
+      await _ensureLivestockParityColumns(db);
+    }
+    if (oldVersion < 14) {
+      await _ensureHouseSoftDeleteColumns(db);
+    }
+    if (oldVersion < 15) {
+      await _ensureBatchSyncParityColumns(db);
+    }
+    if (oldVersion < 16) {
+      await _repairSchemaParity(db);
+      await _requeueMobileLivestockForSyncAllFarms(db);
+    }
+  }
+
+  Future<void> _requeueMobileLivestockForSyncAllFarms(Database db) async {
+    final updated = await db.rawUpdate('''
+      update batches
+      set is_synced = 0
+      where id like 'batch_%' and coalesce(is_deleted, 0) = 0
+    ''');
+    if (updated > 0) {
+      debugPrint(
+        '[DB] One-time re-queue of $updated mobile livestock unit(s) for cloud sync',
+      );
+    }
+  }
+
+  Future<void> _ensureBatchSyncParityColumns(Database db) async {
+    await _addColumnIfMissing(
+      db,
+      'batches',
+      'is_synced',
+      'integer not null default 1',
+    );
+  }
+
+  Future<void> _ensureLivestockParityColumns(Database db) async {
+    await _addColumnIfMissing(
+      db,
+      'batches',
+      'growth_target_override',
+      'text',
+    );
+  }
+
+  Future<void> _ensureSettingsProfileParityColumns(Database db) async {
+    await _addColumnIfMissing(db, 'local_users', 'middle_name', 'text');
+    await _addColumnIfMissing(
+      db,
+      'farm_settings',
+      'growth_target_standard',
+      'integer',
+    );
+  }
+
+  Future<void> _ensureHouseSyncParityColumns(Database db) async {
+    await _addColumnIfMissing(
+      db,
+      'houses',
+      'is_synced',
+      'integer not null default 1',
+    );
+  }
+
+  Future<void> _ensureHouseSoftDeleteColumns(Database db) async {
+    await _addColumnIfMissing(
+      db,
+      'houses',
+      'is_deleted',
+      'integer not null default 0',
+    );
+    await _addColumnIfMissing(db, 'houses', 'deleted_at', 'text');
   }
 
   Future<void> _ensureMobileParityColumns(Database db) async {
@@ -568,6 +845,19 @@ class LocalDatabase {
 
     for (final column in const ['inventory_id', 'livestock_id']) {
       await _addColumnIfMissing(db, 'sale_items', column, 'text');
+    }
+  }
+
+  Future<void> _ensureHealthScheduleParityColumns(Database db) async {
+    for (final table in const ['vaccination_schedules', 'medication_schedules']) {
+      await _addColumnIfMissing(db, table, 'usage_type', 'text');
+      await _addColumnIfMissing(db, table, 'unit', 'text');
+      await _addColumnIfMissing(
+        db,
+        table,
+        'is_synced',
+        'integer not null default 1',
+      );
     }
   }
 
@@ -634,6 +924,8 @@ class LocalDatabase {
       'can_edit_team',
       'can_view_quarantine',
       'can_edit_quarantine',
+      'can_view_health',
+      'can_edit_health',
     ]) {
       await _addColumnIfMissing(
         db,
@@ -664,6 +956,12 @@ class LocalDatabase {
     }
     await _addColumnIfMissing(db, 'houses', 'environmental_state', 'text');
     await _addColumnIfMissing(db, 'houses', 'last_environment_log_at', 'text');
+    await _addColumnIfMissing(
+      db,
+      'houses',
+      'is_synced',
+      'integer not null default 1',
+    );
 
     for (final column in const [
       'user_id',
@@ -853,10 +1151,19 @@ class LocalDatabase {
     String column,
     String definition,
   ) async {
+    final tables = await db.rawQuery(
+      "select name from sqlite_master where type = 'table' and name = ?",
+      [table],
+    );
+    if (tables.isEmpty) {
+      return;
+    }
+
     final columns = await db.rawQuery('pragma table_info($table)');
     final exists = columns.any((row) => row['name'] == column);
     if (!exists) {
       await db.execute('alter table $table add column $column $definition');
+      debugPrint('[DB] Added missing column $table.$column');
     }
   }
 
@@ -906,6 +1213,8 @@ class LocalDatabase {
         can_edit_mortality integer not null default 0,
         can_view_quarantine integer not null default 0,
         can_edit_quarantine integer not null default 0,
+        can_view_health integer not null default 0,
+        can_edit_health integer not null default 0,
         can_view_customers integer not null default 0,
         can_edit_customers integer not null default 0,
         can_view_team integer not null default 0,
@@ -919,7 +1228,8 @@ class LocalDatabase {
         eggs_per_crate integer not null default 30,
         currency text not null default 'GHS',
         egg_record_reminder_time text,
-        feed_record_reminder_time text
+        feed_record_reminder_time text,
+        growth_target_standard integer
       )
     ''');
 
@@ -935,6 +1245,9 @@ class LocalDatabase {
         is_isolation integer not null default 0,
         environmental_state text,
         last_environment_log_at text,
+        is_deleted integer not null default 0,
+        deleted_at text,
+        is_synced integer not null default 1,
         created_at text,
         updated_at text
       )
@@ -976,6 +1289,7 @@ class LocalDatabase {
         arrival_date text not null,
         local_batch_id integer,
         is_deleted integer not null default 0,
+        is_synced integer not null default 1,
         created_at text,
         deleted_at text,
         updated_at text

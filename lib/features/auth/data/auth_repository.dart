@@ -73,24 +73,84 @@ class AuthRepository {
   Future<bool> get isOnline => _connectivityService.isOnline;
 
   Future<AppUser?> restoreActiveSession() async {
-    if (!_remoteApi.isConfigured) {
+    final localRestored = await _restoreLocalSession();
+    if (localRestored != null) {
+      if (await _connectivityService.isOnline) {
+        await _initTrialForUser(localRestored);
+      }
+      return localRestored;
+    }
+
+    if (_remoteApi.isConfigured && await _connectivityService.isOnline) {
+      try {
+        final cloudUser = await _remoteApi.currentAuthenticatedUser();
+        if (cloudUser != null) {
+          await _persistSession(cloudUser);
+          await _initTrialForUser(cloudUser);
+          return cloudUser.copyWith(
+            authenticatedOffline: false,
+            requiresInitialSetup: false,
+          );
+        }
+      } on Object {
+        // No saved session on this device.
+      }
+    }
+
+    return null;
+  }
+
+  Future<AppUser?> _restoreLocalSession() async {
+    final session = await _localDatabase.readSessionContext();
+    final sessionUserId = session.userId?.trim() ?? '';
+    if (sessionUserId.isEmpty) {
       return null;
     }
 
-    try {
-      final cloudUser = await _remoteApi.currentAuthenticatedUser();
-      if (cloudUser == null) {
-        return null;
-      }
-      await _localDatabase.upsertUser(cloudUser);
-      await _initTrialForUser(cloudUser);
-      return cloudUser.copyWith(
-        authenticatedOffline: false,
-        requiresInitialSetup: false,
-      );
-    } on Object {
+    final localUser = await _localDatabase.readUserById(sessionUserId);
+    if (localUser == null) {
       return null;
     }
+
+    final sessionFarmId = session.farmId?.trim() ?? '';
+    var resolvedUser = localUser;
+    if (sessionFarmId.isNotEmpty &&
+        resolvedUser.activeFarmId.trim() != sessionFarmId) {
+      resolvedUser = resolvedUser.copyWith(activeFarmId: sessionFarmId);
+    }
+
+    final online = await _connectivityService.isOnline;
+    var authenticatedOffline = true;
+    if (online && _remoteApi.isConfigured) {
+      try {
+        final cloudUser = await _remoteApi.currentAuthenticatedUser();
+        if (cloudUser != null && cloudUser.id == resolvedUser.id) {
+          resolvedUser = sessionFarmId.isNotEmpty
+              ? cloudUser.copyWith(activeFarmId: sessionFarmId)
+              : cloudUser;
+          authenticatedOffline = false;
+          await _persistSession(resolvedUser);
+        }
+      } on Object {
+        // Keep the cached local session when cloud auth is unavailable.
+      }
+    }
+
+    return resolvedUser.copyWith(
+      authenticatedOffline: authenticatedOffline,
+      requiresInitialSetup: false,
+    );
+  }
+
+  Future<void> _persistSession(AppUser user) async {
+    final cacheableUser = user.copyWith(
+      requiresInitialSetup: false,
+    );
+    await _localDatabase.upsertUser(cacheableUser);
+    await _localDatabase.writeSessionContext(
+      userId: cacheableUser.id,
+      farmId: cacheableUser.activeFarmId,
+    );
   }
 
   Future<AuthResult> signIn({
@@ -105,6 +165,14 @@ class AuthRepository {
       throw const AuthFailure('Email/phone and password are required.');
     }
 
+    if (!await _connectivityService.isOnline) {
+      return _signInOffline(
+        submittedIdentifier: submittedIdentifier,
+        normalizedIdentifier: normalizedIdentifier,
+        password: password,
+      );
+    }
+
     if (password == defaultPassword) {
       return _signInForInitialSetup(
         authIdentifier: submittedIdentifier,
@@ -113,50 +181,35 @@ class AuthRepository {
       );
     }
 
-    if (_remoteApi.isConfigured) {
-      try {
-        final cloudUser = await _remoteApi.signInWithCredentials(
-          identifier: submittedIdentifier,
-          fallbackIdentifier: normalizedIdentifier,
-          password: password,
-        );
-
-        if (cloudUser.requiresInitialSetup) {
-          return AuthResult(
-            user: cloudUser,
-            mode: AuthMode.initialSetupRequired,
-          );
-        }
-
-        await _cacheUserCredentials(cloudUser, password);
-        return AuthResult(user: cloudUser, mode: AuthMode.cloud);
-      } on AuthException catch (error) {
-        throw AuthFailure(error.message);
-      } on Object {
-        final offlineUser = await _tryOfflineSignIn(
-          normalizedIdentifier,
-          password,
-        );
-        if (offlineUser != null) {
-          return AuthResult(user: offlineUser, mode: AuthMode.offline);
-        }
-        throw const AuthFailure(
-          'Could not reach HatchLog cloud. Check your connection or use a verified offline password for this device.',
-        );
-      }
-    } else {
-      final offlineUser = await _tryOfflineSignIn(
-        normalizedIdentifier,
-        password,
+    if (!_remoteApi.isConfigured) {
+      throw const AuthFailure(
+        'Supabase is not configured for this build. Add SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY.',
       );
-      if (offlineUser != null) {
-        return AuthResult(user: offlineUser, mode: AuthMode.offline);
-      }
     }
 
-    throw const AuthFailure(
-      'Supabase is not configured for this build, and no verified offline login was found on this device.',
-    );
+    try {
+      final cloudUser = await _remoteApi.signInWithCredentials(
+        identifier: submittedIdentifier,
+        fallbackIdentifier: normalizedIdentifier,
+        password: password,
+      );
+
+      if (cloudUser.requiresInitialSetup) {
+        return AuthResult(
+          user: cloudUser,
+          mode: AuthMode.initialSetupRequired,
+        );
+      }
+
+      await _cacheUserCredentials(cloudUser, password);
+      return AuthResult(user: cloudUser, mode: AuthMode.cloud);
+    } on AuthException catch (error) {
+      throw AuthFailure(error.message);
+    } on Object {
+      throw const AuthFailure(
+        'Could not reach HatchLog cloud. Check your connection and try again.',
+      );
+    }
   }
 
   Future<AuthResult> signUp({
@@ -168,6 +221,11 @@ class AuthRepository {
     if (normalizedIdentifier.isEmpty || password.length < 8) {
       throw const AuthFailure(
         'Use an email or phone number and a password with at least 8 characters.',
+      );
+    }
+    if (!await _connectivityService.isOnline) {
+      throw const AuthFailure(
+        'An internet connection is required to create an account.',
       );
     }
     if (!_remoteApi.isConfigured) {
@@ -194,6 +252,11 @@ class AuthRepository {
   }
 
   Future<AuthResult> authenticateMobileWithGoogle() async {
+    if (!await _connectivityService.isOnline) {
+      throw const AuthFailure(
+        'An internet connection is required to sign in with Google.',
+      );
+    }
     if (!_remoteApi.isConfigured) {
       throw const AuthFailure(
         'Supabase is not configured for this build. Add SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY.',
@@ -232,19 +295,9 @@ class AuthRepository {
         accessToken: accessToken,
         email: googleUser.email,
       );
-      final hasOfflineKey = await _hasCachedOfflineKey(socialResult.user);
-      final needsOfflineKey =
-          socialResult.isNewMobileSocialRegistrant || !hasOfflineKey;
-      isNewMobileSocialRegistrant.value = needsOfflineKey;
-
-      if (needsOfflineKey) {
-        return AuthResult(
-          user: socialResult.user,
-          mode: AuthMode.socialRegistrationRequired,
-          isNewMobileSocialRegistrant: socialResult.isNewMobileSocialRegistrant,
-        );
-      }
-
+      isNewMobileSocialRegistrant.value = false;
+      await _persistSession(socialResult.user);
+      await _initTrialForUser(socialResult.user);
       return AuthResult(user: socialResult.user, mode: AuthMode.cloud);
     } on AuthFailure {
       rethrow;
@@ -314,6 +367,9 @@ class AuthRepository {
 
   Future<void> signOut() async {
     isNewMobileSocialRegistrant.value = false;
+    await _localDatabase.clearOperationalFarmCache();
+    await _localDatabase.clearFarmSyncCursors();
+    await _localDatabase.clearSessionContext();
     if (await _connectivityService.isOnline) {
       await _remoteApi.signOut();
     }
@@ -341,6 +397,53 @@ class AuthRepository {
       cleaned = '+$cleaned';
     }
     return cleaned;
+  }
+
+  Future<AuthResult> _signInOffline({
+    required String submittedIdentifier,
+    required String normalizedIdentifier,
+    required String password,
+  }) async {
+    CachedCredential? credential;
+    for (final identifier in [
+      submittedIdentifier.trim(),
+      normalizedIdentifier,
+    ]) {
+      if (identifier.isEmpty) {
+        continue;
+      }
+      credential = await _credentialStore.read(identifier);
+      if (credential != null) {
+        break;
+      }
+    }
+
+    if (credential == null) {
+      throw const AuthFailure(
+        'No saved login found on this device. Connect to the internet and sign in once.',
+      );
+    }
+
+    if (!await credential.matches(password)) {
+      throw const AuthFailure('Incorrect password for the saved account.');
+    }
+
+    final localUser =
+        await _localDatabase.readUserByIdentifier(submittedIdentifier) ??
+        await _localDatabase.readUserByIdentifier(normalizedIdentifier) ??
+        credential.user;
+
+    final offlineUser = localUser.copyWith(
+      authenticatedOffline: true,
+      requiresInitialSetup: false,
+    );
+    await _localDatabase.upsertUser(offlineUser);
+    await _localDatabase.writeSessionContext(
+      userId: offlineUser.id,
+      farmId: offlineUser.activeFarmId,
+    );
+
+    return AuthResult(user: offlineUser, mode: AuthMode.offline);
   }
 
   Future<AuthResult> _signInForInitialSetup({
@@ -375,25 +478,12 @@ class AuthRepository {
     );
   }
 
-  Future<AppUser?> _tryOfflineSignIn(String identifier, String password) async {
-    final cachedCredential = await _credentialStore.read(identifier);
-    if (cachedCredential == null || !await cachedCredential.matches(password)) {
-      return null;
-    }
-
-    final localUser = await _localDatabase.readUserByIdentifier(identifier);
-    return (localUser ?? cachedCredential.user).copyWith(
-      authenticatedOffline: true,
-      requiresInitialSetup: false,
-    );
-  }
-
   Future<void> _cacheUserCredentials(AppUser user, String password) async {
     final cacheableUser = user.copyWith(
       authenticatedOffline: false,
       requiresInitialSetup: false,
     );
-    await _localDatabase.upsertUser(cacheableUser);
+    await _persistSession(cacheableUser);
     await _credentialStore.save(user: cacheableUser, password: password);
     await _initTrialForUser(cacheableUser);
   }
@@ -414,17 +504,6 @@ class AuthRepository {
     if (error != null) {
       debugPrint('[License] Trial init warning: $error');
     }
-  }
-
-  Future<bool> _hasCachedOfflineKey(AppUser user) async {
-    if (await _credentialStore.read(user.loginIdentifier) != null) {
-      return true;
-    }
-    final email = user.email.trim().toLowerCase();
-    if (email.isNotEmpty && email != user.loginIdentifier.toLowerCase()) {
-      return await _credentialStore.read(email) != null;
-    }
-    return false;
   }
 
   Future<void> _ensureGoogleInitialized() async {

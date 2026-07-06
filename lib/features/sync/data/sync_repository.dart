@@ -1,11 +1,17 @@
+import 'package:flutter/foundation.dart';
+
 import '../../../core/models/app_user.dart';
 import '../../../core/models/worker_input_type.dart';
 import '../../../core/storage/local_database.dart';
+import '../../../utils/mortality_log_utils.dart';
 import '../../auth/data/supabase_remote_api.dart';
 import '../sync_engine_service.dart';
+import '../../../presentation/worker/worker_module_definitions.dart';
+import '../../../utils/worker_log_edit_policy.dart';
 import 'worker_input_sink.dart';
+import 'worker_log_mutator.dart';
 
-class SyncRepository implements WorkerInputSink {
+class SyncRepository implements WorkerInputSink, WorkerLogMutator {
   SyncRepository({
     required LocalDatabase localDatabase,
     required SupabaseRemoteApi remoteApi,
@@ -29,15 +35,24 @@ class SyncRepository implements WorkerInputSink {
     required WorkerInputType type,
     required Map<String, dynamic> payload,
   }) async {
+    final farmId = await _resolveFarmId(user);
+    if (farmId.isEmpty) {
+      throw StateError(
+        'No active farm is available on this device. Sync while online, then try again.',
+      );
+    }
     final selectedBatchId = _optionalString(payload['batch_id']).isEmpty
         ? user.activeBatchId
         : _optionalString(payload['batch_id']);
+    if (selectedBatchId.isEmpty) {
+      throw StateError('Choose a batch before saving this log.');
+    }
     final input = PendingSyncInput(
       userId: user.id,
       inputType: type.storageKey,
       payload: {
         ...payload,
-        'farm_id': user.activeFarmId,
+        'farm_id': farmId,
         'batch_id': selectedBatchId,
         'captured_by_role': user.role.name,
       },
@@ -45,6 +60,15 @@ class SyncRepository implements WorkerInputSink {
     );
     final queueId = await _localDatabase.insertPendingInput(input);
     await _insertLocalOperationalRecord(input, queueId);
+  }
+
+  Future<String> _resolveFarmId(AppUser user) async {
+    final fromUser = user.activeFarmId.trim();
+    if (fromUser.isNotEmpty) {
+      return fromUser;
+    }
+    final session = await _localDatabase.readSessionContext();
+    return session.farmId?.trim() ?? '';
   }
 
   @override
@@ -134,15 +158,38 @@ class SyncRepository implements WorkerInputSink {
         .toList();
 
     if (options.isEmpty && user.activeBatchId.isNotEmpty) {
+      final batchName = await _lookupLocalBatchName(
+        user.activeFarmId,
+        user.activeBatchId,
+      );
       return [
         WorkerUnitOption(
           batchId: user.activeBatchId,
-          batchLabel: user.batchLabel,
+          batchLabel: batchName.isNotEmpty ? batchName : user.batchLabel,
         ),
       ];
     }
 
     return options;
+  }
+
+  Future<String> _lookupLocalBatchName(String farmId, String batchId) async {
+    if (farmId.isEmpty || batchId.isEmpty) {
+      return '';
+    }
+    final rows = await _localDatabase.rawLocalQuery(
+      '''
+      select batch_name
+      from batches
+      where farm_id = ? and id = ? and is_deleted = 0
+      limit 1
+      ''',
+      [farmId, batchId],
+    );
+    if (rows.isEmpty) {
+      return '';
+    }
+    return _asString(rows.first['batch_name']).trim();
   }
 
   Future<void> flushPendingInputs() async {
@@ -164,18 +211,267 @@ class SyncRepository implements WorkerInputSink {
         if (id != null) {
           await _localDatabase.markInputAttemptFailed(id, error);
         }
-        return;
+        debugPrint('[Sync] Worker input push failed, continuing: $error');
       }
     }
 
     final user = _activeUser;
     if (user != null) {
-      await hydrateFromCloud(user);
+      await syncWithCloud(user);
     }
   }
 
-  Future<void> hydrateFromCloud(AppUser user) async {
-    await _syncEngineService.syncWebEntitiesToLocalCache(user: user);
+  Future<void> syncWithCloud(
+    AppUser user, {
+    bool forceFullRefresh = false,
+  }) async {
+    if (!_remoteApi.isConfigured) {
+      return;
+    }
+
+    _activeUser = user;
+    await _pushLocalChanges(user.activeFarmId);
+    await hydrateFromCloud(user, forceFullRefresh: forceFullRefresh);
+  }
+
+  Future<void> _pushLocalChanges(String farmId) async {
+    if (farmId.isEmpty) {
+      return;
+    }
+
+    try {
+      await _pushUnsyncedHouses(farmId);
+    } on Object catch (error) {
+      debugPrint('[Sync] House push failed: $error');
+    }
+
+    try {
+      await _pushUnsyncedBatches(farmId);
+    } on Object catch (error) {
+      debugPrint('[Sync] Batch push failed: $error');
+    }
+
+    try {
+      await _pushUnsyncedHealthSchedules(farmId);
+    } on Object catch (error) {
+      debugPrint('[Sync] Health schedule push failed: $error');
+    }
+
+    try {
+      await _pushUnsyncedPartnerSettlements(farmId);
+    } on Object catch (error) {
+      debugPrint('[Sync] Partner settlement push failed: $error');
+    }
+  }
+
+  Future<void> _pushUnsyncedBatches(String farmId) async {
+    if (farmId.isEmpty) {
+      return;
+    }
+
+    final batches = await _localDatabase.queryLocalRecords(
+      'batches',
+      where: 'farm_id = ? and is_synced = 0 and coalesce(is_deleted, 0) = 0',
+      whereArgs: [farmId],
+    );
+    if (batches.isEmpty) {
+      return;
+    }
+
+    debugPrint('[Sync] Pushing ${batches.length} unsynced livestock unit(s) to cloud');
+
+    final syncedIds = await _remoteApi.pushUnsyncedBatches(
+      farmId: farmId,
+      batches: batches,
+    );
+
+    for (final id in syncedIds) {
+      await _localDatabase.updateLocalRecord(
+        'batches',
+        {'is_synced': 1},
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+    }
+    debugPrint('[Sync] Synced ${syncedIds.length} livestock unit(s) to cloud');
+  }
+
+  Future<void> _pushUnsyncedHouses(String farmId) async {
+    if (farmId.isEmpty) {
+      return;
+    }
+
+    final houses = await _localDatabase.queryLocalRecords(
+      'houses',
+      where: 'farm_id = ? and is_synced = 0',
+      whereArgs: [farmId],
+    );
+    if (houses.isEmpty) {
+      return;
+    }
+
+    debugPrint('[Sync] Pushing ${houses.length} unsynced house(s) to cloud');
+
+    final syncedIds = await _remoteApi.pushUnsyncedHouses(
+      farmId: farmId,
+      houses: houses,
+    );
+
+    for (final id in syncedIds) {
+      await _localDatabase.updateLocalRecord(
+        'houses',
+        {'is_synced': 1},
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+    }
+    debugPrint('[Sync] Synced ${syncedIds.length} house(s) to cloud');
+  }
+
+  Future<void> _pushUnsyncedPartnerSettlements(String farmId) async {
+    if (farmId.isEmpty) {
+      return;
+    }
+
+    final settlements = await _localDatabase.queryLocalRecords(
+      'expenses',
+      where:
+          "farm_id = ? and is_synced = 0 and is_deleted = 0 and upper(category) in ('PAYMENT', 'COLLECTION')",
+      whereArgs: [farmId],
+    );
+    if (settlements.isEmpty) {
+      return;
+    }
+
+    final supplierIds = settlements
+        .map((row) => row['supplier_id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    final suppliers = supplierIds.isEmpty
+        ? const <Map<String, Object?>>[]
+        : await _localDatabase.queryLocalRecords(
+            'suppliers',
+            where: 'farm_id = ? and id in (${List.filled(supplierIds.length, '?').join(',')})',
+            whereArgs: [farmId, ...supplierIds],
+          );
+
+    final customerIds = <String>{};
+    for (final row in settlements) {
+      final description = row['description']?.toString() ?? '';
+      final match = RegExp(r'customer ([A-Za-z0-9_-]+)').firstMatch(description);
+      if (match != null) {
+        customerIds.add(match.group(1)!);
+      }
+    }
+    final customers = customerIds.isEmpty
+        ? const <Map<String, Object?>>[]
+        : await _localDatabase.queryLocalRecords(
+            'customers',
+            where: 'farm_id = ? and id in (${List.filled(customerIds.length, '?').join(',')})',
+            whereArgs: [farmId, ...customerIds],
+          );
+
+    await _remoteApi.pushUnsyncedPartnerSettlements(
+      farmId: farmId,
+      expenses: settlements,
+      suppliers: suppliers,
+      customers: customers,
+    );
+
+    for (final row in settlements) {
+      final id = row['id']?.toString();
+      if (id == null || id.isEmpty) {
+        continue;
+      }
+      await _localDatabase.updateLocalRecord(
+        'expenses',
+        {'is_synced': 1},
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+    }
+  }
+
+  Future<void> _pushUnsyncedHealthSchedules(String farmId) async {
+    if (farmId.isEmpty) {
+      return;
+    }
+
+    final vaccinations = await _localDatabase.queryLocalRecords(
+      'vaccination_schedules',
+      where: 'farm_id = ? and is_synced = 0',
+      whereArgs: [farmId],
+    );
+    final medications = await _localDatabase.queryLocalRecords(
+      'medication_schedules',
+      where: 'farm_id = ? and is_synced = 0',
+      whereArgs: [farmId],
+    );
+    if (vaccinations.isEmpty && medications.isEmpty) {
+      return;
+    }
+
+    await _remoteApi.pushUnsyncedHealthSchedules(
+      farmId: farmId,
+      vaccinations: vaccinations,
+      medications: medications,
+    );
+
+    for (final row in vaccinations) {
+      final id = row['id']?.toString();
+      if (id == null || id.isEmpty) {
+        continue;
+      }
+      await _localDatabase.updateLocalRecord(
+        'vaccination_schedules',
+        {'is_synced': 1},
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+    }
+    for (final row in medications) {
+      final id = row['id']?.toString();
+      if (id == null || id.isEmpty) {
+        continue;
+      }
+      await _localDatabase.updateLocalRecord(
+        'medication_schedules',
+        {'is_synced': 1},
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+    }
+  }
+
+  Future<void> hydrateFromCloud(
+    AppUser user, {
+    bool forceFullRefresh = false,
+  }) async {
+    final sessionChanged = await _localDatabase.prepareSessionForUser(
+      userId: user.id,
+      farmId: user.activeFarmId,
+    );
+    var shouldForceFullRefresh = forceFullRefresh || sessionChanged;
+    if (!shouldForceFullRefresh && user.activeFarmId.isNotEmpty) {
+      final cachedHouses = await _localDatabase.queryLocalRecords(
+        'houses',
+        where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+        whereArgs: [user.activeFarmId],
+        limit: 1,
+      );
+      final cachedBatches = await _localDatabase.queryLocalRecords(
+        'batches',
+        where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+        whereArgs: [user.activeFarmId],
+        limit: 1,
+      );
+      shouldForceFullRefresh =
+          cachedHouses.isEmpty || cachedBatches.isEmpty;
+    }
+    await _syncEngineService.syncWebEntitiesToLocalCache(
+      user: user,
+      forceFullRefresh: shouldForceFullRefresh,
+    );
   }
 
   Future<void> _insertLocalOperationalRecord(
@@ -194,6 +490,7 @@ class SyncRepository implements WorkerInputSink {
             ? payloadEggs
             : (crates * eggsPerCrate).round() + singleEggs;
         final unusableCount = _asInt(payload['unusable_count']);
+        final usableEggs = (eggsCollected - unusableCount).clamp(0, eggsCollected);
         final logDate = _optionalString(payload['log_date']).isEmpty
             ? input.createdAt.toIso8601String()
             : _optionalString(payload['log_date']);
@@ -206,7 +503,7 @@ class SyncRepository implements WorkerInputSink {
           'user_id': input.userId,
           'eggs_collected': eggsCollected,
           'crates_collected': crates,
-          'eggs_remaining': eggsCollected,
+          'eggs_remaining': usableEggs,
           'unusable_count': unusableCount,
           'cracked_count': unusableCount,
           'quality_grade': payload['quality_grade'],
@@ -221,8 +518,13 @@ class SyncRepository implements WorkerInputSink {
         });
       case 'feed_usage':
         final logDate = _optionalString(payload['log_date']).isEmpty
-            ? input.createdAt.toIso8601String()
+            ? _optionalString(payload['device_logged_at']).isEmpty
+                ? input.createdAt.toIso8601String()
+                : _optionalString(payload['device_logged_at'])
             : _optionalString(payload['log_date']);
+        final amountConsumed = _asDouble(
+          payload['amount_consumed'] ?? payload['bags'],
+        );
         await _localDatabase.insertLocalRecord('daily_feeding_logs', {
           'id': serverRecordId,
           'local_queue_id': queueId,
@@ -231,9 +533,7 @@ class SyncRepository implements WorkerInputSink {
           'formulation_id': payload['formulation_id'],
           'farm_id': payload['farm_id'],
           'user_id': input.userId,
-          'amount_consumed': _asDouble(
-            payload['amount_consumed'] ?? payload['bags'],
-          ),
+          'amount_consumed': amountConsumed,
           'feed_type_label': payload['feed_type'],
           'note': payload['note'],
           'log_date': logDate,
@@ -241,22 +541,28 @@ class SyncRepository implements WorkerInputSink {
           'is_deleted': 0,
           'is_synced': 0,
         });
+        await _decrementFeedStock(
+          feedTypeId: _optionalString(payload['feed_type_id']),
+          formulationId: _optionalString(payload['formulation_id']),
+          amount: amountConsumed,
+        );
       case 'mortality':
-        final healthType = _optionalString(
-          payload['health_type'] ?? payload['type'],
-        ).toUpperCase();
-        final resolvedHealthType = healthType == 'SICK' ? 'SICK' : 'DEAD';
+        final healthType = resolveHealthType(
+          _optionalString(payload['health_type'] ?? payload['type']),
+        );
         final logDate = _optionalString(payload['log_date']).isEmpty
             ? input.createdAt.toIso8601String()
             : _optionalString(payload['log_date']);
+        final batchId = _optionalString(payload['batch_id']);
+        final count = _asInt(payload['count']);
         await _localDatabase.insertLocalRecord('mortality', {
           'id': serverRecordId,
           'local_queue_id': queueId,
-          'batch_id': payload['batch_id'],
+          'batch_id': batchId,
           'farm_id': payload['farm_id'],
           'user_id': input.userId,
-          'count': _asInt(payload['count']),
-          'type': resolvedHealthType,
+          'count': count,
+          'type': healthType,
           'reason': payload['reason'],
           'category': payload['category'],
           'sub_category': payload['sub_category'],
@@ -268,6 +574,11 @@ class SyncRepository implements WorkerInputSink {
           'is_deleted': 0,
           'is_synced': 0,
         });
+        await _applyMortalityBatchCounts(
+          batchId: batchId,
+          healthType: healthType,
+          count: count,
+        );
       case 'inventory_item':
         final now = input.createdAt.toIso8601String();
         await _localDatabase.insertLocalRecord('inventory', {
@@ -340,6 +651,8 @@ class SyncRepository implements WorkerInputSink {
       'mortality' => 'mortality',
       'inventory_item' => 'inventory',
       'expense_allocation' => 'expenses',
+      'worker_log_update' || 'worker_log_delete' =>
+        _workerLogTableFromPayload(input.payload),
       _ => '',
     };
     if (table.isEmpty) {
@@ -347,6 +660,11 @@ class SyncRepository implements WorkerInputSink {
     }
     final recordId = input.inputType == 'expense_allocation'
         ? '${input.resolvedServerRecordId}_expense'
+        : input.inputType == 'worker_log_update' ||
+              input.inputType == 'worker_log_delete'
+        ? _optionalString(input.payload['record_id']).isEmpty
+              ? input.resolvedServerRecordId
+              : _optionalString(input.payload['record_id'])
         : input.resolvedServerRecordId;
     await _localDatabase.updateLocalRecord(
       table,
@@ -379,8 +697,7 @@ class SyncRepository implements WorkerInputSink {
         return '$bags bags of $feedType feed';
       case WorkerInputType.mortality:
         final count = _numberText(payload['count']);
-        final type = _optionalString(payload['health_type']).toUpperCase();
-        return type == 'SICK'
+        return isSickHealthType(_optionalString(payload['health_type']))
             ? '$count sick birds logged'
             : '$count bird losses logged';
       case WorkerInputType.inventoryItem:
@@ -435,5 +752,456 @@ class SyncRepository implements WorkerInputSink {
 
   String _asString(Object? value) {
     return value?.toString() ?? '';
+  }
+
+  Future<void> _applyMortalityBatchCounts({
+    required String batchId,
+    required String healthType,
+    required int count,
+  }) async {
+    if (batchId.isEmpty || count <= 0) {
+      return;
+    }
+
+    final rows = await _localDatabase.rawLocalQuery(
+      'select current_count, isolation_count from batches where id = ?',
+      [batchId],
+    );
+    if (rows.isEmpty) {
+      return;
+    }
+
+    final row = rows.first;
+    final currentCount =
+        int.tryParse(row['current_count']?.toString() ?? '') ?? 0;
+    final isolationCount =
+        int.tryParse(row['isolation_count']?.toString() ?? '') ?? 0;
+    final deltas = healthLogBatchDeltas(healthType: healthType, count: count);
+    final nextCurrentCount = currentCount + deltas.currentCountDelta;
+    final nextIsolationCount = isolationCount + deltas.isolationCountDelta;
+
+    await _localDatabase.rawLocalUpdate(
+      'batches',
+      {
+        'current_count': nextCurrentCount < 0 ? 0 : nextCurrentCount,
+        'isolation_count': nextIsolationCount < 0 ? 0 : nextIsolationCount,
+        'is_synced': 0,
+      },
+      'id = ?',
+      [batchId],
+    );
+  }
+
+  Future<void> _decrementFeedStock({
+    required String feedTypeId,
+    required String formulationId,
+    required double amount,
+  }) async {
+    if (amount <= 0) {
+      return;
+    }
+    if (feedTypeId.isNotEmpty) {
+      final rows = await _localDatabase.queryLocalRecords(
+        'inventory',
+        where: 'id = ? and is_deleted = 0',
+        whereArgs: [feedTypeId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        return;
+      }
+      final current = _asDouble(rows.first['stock_level']);
+      await _localDatabase.updateLocalRecord(
+        'inventory',
+        {
+          'stock_level': (current - amount).clamp(0, 999999),
+          'is_synced': 0,
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [feedTypeId],
+      );
+      return;
+    }
+    if (formulationId.isNotEmpty) {
+      final rows = await _localDatabase.queryLocalRecords(
+        'feed_formulations',
+        where: 'id = ?',
+        whereArgs: [formulationId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        return;
+      }
+      final current = _asDouble(rows.first['stockLevel'] ?? rows.first['stock_level']);
+      await _localDatabase.updateLocalRecord(
+        'feed_formulations',
+        {
+          'stockLevel': (current - amount).clamp(0, 999999),
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [formulationId],
+      );
+    }
+  }
+
+  @override
+  Future<void> deleteWorkerLog({
+    required AppUser user,
+    required WorkerModule module,
+    required String recordId,
+  }) async {
+    final table = _workerLogTable(module);
+    final rows = await _localDatabase.queryLocalRecords(
+      table,
+      where: 'id = ? and coalesce(is_deleted, 0) = 0',
+      whereArgs: [recordId],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      throw StateError('Log record not found.');
+    }
+    final row = rows.first;
+    if (!canWorkerMutateLogRow(currentUserId: user.id, row: row)) {
+      throw StateError(workerLogLockMessage());
+    }
+
+    final now = DateTime.now().toIso8601String();
+    await _localDatabase.updateLocalRecord(
+      table,
+      {'is_deleted': 1, 'deleted_at': now, 'is_synced': 0},
+      where: 'id = ?',
+      whereArgs: [recordId],
+    );
+
+    if (module == WorkerModule.mortality) {
+      await _reverseMortalityBatchCounts(
+        batchId: _optionalString(row['batch_id']),
+        healthType: resolveHealthType(_optionalString(row['type'])),
+        count: _asInt(row['count']),
+      );
+    } else if (module == WorkerModule.feeding) {
+      await _incrementFeedStock(
+        feedTypeId: _optionalString(row['feed_type_id']),
+        formulationId: _optionalString(row['formulation_id']),
+        amount: _asDouble(row['amount_consumed']),
+      );
+    }
+
+    await _localDatabase.insertPendingInput(
+      PendingSyncInput(
+        userId: user.id,
+        inputType: 'worker_log_delete',
+        payload: {
+          'table': table,
+          'record_id': recordId,
+          'farm_id': user.activeFarmId,
+        },
+        createdAt: DateTime.now(),
+        serverRecordId: recordId,
+      ),
+    );
+  }
+
+  @override
+  Future<void> updateWorkerLog({
+    required AppUser user,
+    required WorkerModule module,
+    required String recordId,
+    required Map<String, dynamic> payload,
+  }) async {
+    final table = _workerLogTable(module);
+    final rows = await _localDatabase.queryLocalRecords(
+      table,
+      where: 'id = ? and coalesce(is_deleted, 0) = 0',
+      whereArgs: [recordId],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      throw StateError('Log record not found.');
+    }
+    final row = rows.first;
+    if (!canWorkerMutateLogRow(currentUserId: user.id, row: row)) {
+      throw StateError(workerLogLockMessage());
+    }
+
+    final recordType = _workerLogRecordType(module);
+    final mergedPayload = {
+      ...payload,
+      'farm_id': user.activeFarmId,
+      'batch_id': _optionalString(payload['batch_id']).isEmpty
+          ? _optionalString(row['batch_id'])
+          : payload['batch_id'],
+    };
+
+    switch (module) {
+      case WorkerModule.eggs:
+        await _applyEggLogUpdate(recordId, mergedPayload);
+      case WorkerModule.feeding:
+        await _applyFeedLogUpdate(recordId, row, mergedPayload);
+      case WorkerModule.mortality:
+        await _applyMortalityLogUpdate(recordId, row, mergedPayload);
+      default:
+        throw StateError('Unsupported worker log module: $module');
+    }
+
+    await _localDatabase.insertPendingInput(
+      PendingSyncInput(
+        userId: user.id,
+        inputType: 'worker_log_update',
+        payload: {
+          ...mergedPayload,
+          'record_type': recordType,
+          'record_id': recordId,
+        },
+        createdAt: DateTime.now(),
+        serverRecordId: recordId,
+      ),
+    );
+  }
+
+  String _workerLogTable(WorkerModule module) {
+    return switch (module) {
+      WorkerModule.eggs => 'egg_production',
+      WorkerModule.feeding => 'daily_feeding_logs',
+      WorkerModule.mortality => 'mortality',
+      _ => throw StateError('Unsupported worker log module: $module'),
+    };
+  }
+
+  String _workerLogRecordType(WorkerModule module) {
+    return switch (module) {
+      WorkerModule.eggs => 'egg_collection',
+      WorkerModule.feeding => 'feed_usage',
+      WorkerModule.mortality => 'mortality',
+      _ => throw StateError('Unsupported worker log module: $module'),
+    };
+  }
+
+  String _workerLogTableFromPayload(Map<String, dynamic> payload) {
+    final recordType = _optionalString(payload['record_type']);
+    return switch (recordType) {
+      'egg_collection' => 'egg_production',
+      'feed_usage' => 'daily_feeding_logs',
+      'mortality' => 'mortality',
+      _ => _optionalString(payload['table']),
+    };
+  }
+
+  Future<void> _applyEggLogUpdate(
+    String recordId,
+    Map<String, dynamic> payload,
+  ) async {
+    final eggsPerCrate = _asInt(payload['eggs_per_crate'], fallback: 30);
+    final crates = _asDouble(payload['crates']);
+    final singleEggs = _asInt(payload['single_eggs']);
+    final payloadEggs = _asInt(payload['eggs_collected']);
+    final eggsCollected = payloadEggs > 0
+        ? payloadEggs
+        : (crates * eggsPerCrate).round() + singleEggs;
+    final unusableCount = _asInt(payload['unusable_count']);
+    final usableEggs = (eggsCollected - unusableCount).clamp(0, eggsCollected);
+    final logDate = _optionalString(payload['log_date']);
+
+    await _localDatabase.updateLocalRecord(
+      'egg_production',
+      {
+        'eggs_collected': eggsCollected,
+        'crates_collected': crates,
+        'eggs_remaining': usableEggs,
+        'unusable_count': unusableCount,
+        'cracked_count': unusableCount,
+        'quality_grade': payload['quality_grade'],
+        'small_count': _asInt(payload['small_count']),
+        'medium_count': _asInt(payload['medium_count']),
+        'large_count': _asInt(payload['large_count']),
+        'is_sorted': _asBool(payload['is_sorted']) ? 1 : 0,
+        if (logDate.isNotEmpty) 'log_date': logDate,
+        'is_synced': 0,
+      },
+      where: 'id = ?',
+      whereArgs: [recordId],
+    );
+  }
+
+  Future<void> _applyFeedLogUpdate(
+    String recordId,
+    Map<String, Object?> existing,
+    Map<String, dynamic> payload,
+  ) async {
+    final oldAmount = _asDouble(existing['amount_consumed']);
+    final newAmount = _asDouble(
+      payload['amount_consumed'] ?? payload['bags'],
+    );
+    final oldFeedTypeId = _optionalString(existing['feed_type_id']);
+    final oldFormulationId = _optionalString(existing['formulation_id']);
+    final newFeedTypeId = _optionalString(payload['feed_type_id']);
+    final newFormulationId = _optionalString(payload['formulation_id']);
+    final logDate = _optionalString(payload['log_date']);
+
+    await _incrementFeedStock(
+      feedTypeId: oldFeedTypeId,
+      formulationId: oldFormulationId,
+      amount: oldAmount,
+    );
+    await _decrementFeedStock(
+      feedTypeId: newFeedTypeId,
+      formulationId: newFormulationId,
+      amount: newAmount,
+    );
+
+    await _localDatabase.updateLocalRecord(
+      'daily_feeding_logs',
+      {
+        'feed_type_id': newFeedTypeId.isEmpty ? null : newFeedTypeId,
+        'formulation_id': newFormulationId.isEmpty ? null : newFormulationId,
+        'amount_consumed': newAmount,
+        'feed_type_label': payload['feed_type'],
+        if (logDate.isNotEmpty) 'log_date': logDate,
+        'is_synced': 0,
+      },
+      where: 'id = ?',
+      whereArgs: [recordId],
+    );
+  }
+
+  Future<void> _applyMortalityLogUpdate(
+    String recordId,
+    Map<String, Object?> existing,
+    Map<String, dynamic> payload,
+  ) async {
+    final oldBatchId = _optionalString(existing['batch_id']);
+    final oldHealthType = resolveHealthType(_optionalString(existing['type']));
+    final oldCount = _asInt(existing['count']);
+    final newHealthType = resolveHealthType(
+      _optionalString(payload['health_type'] ?? payload['type']),
+    );
+    final newCount = _asInt(payload['count']);
+    final newBatchId = _optionalString(payload['batch_id']).isEmpty
+        ? oldBatchId
+        : _optionalString(payload['batch_id']);
+    final logDate = _optionalString(payload['log_date']);
+
+    await _reverseMortalityBatchCounts(
+      batchId: oldBatchId,
+      healthType: oldHealthType,
+      count: oldCount,
+    );
+    await _applyMortalityBatchCounts(
+      batchId: newBatchId,
+      healthType: newHealthType,
+      count: newCount,
+    );
+
+    await _localDatabase.updateLocalRecord(
+      'mortality',
+      {
+        'count': newCount,
+        'type': newHealthType,
+        'reason': payload['reason'],
+        'category': payload['category'],
+        'sub_category': payload['sub_category'],
+        'isolation_room_id': payload['isolation_room_id'],
+        if (logDate.isNotEmpty) 'log_date': logDate,
+        'is_synced': 0,
+      },
+      where: 'id = ?',
+      whereArgs: [recordId],
+    );
+  }
+
+  Future<void> _reverseMortalityBatchCounts({
+    required String batchId,
+    required String healthType,
+    required int count,
+  }) async {
+    if (batchId.isEmpty || count <= 0) {
+      return;
+    }
+
+    final rows = await _localDatabase.rawLocalQuery(
+      'select current_count, isolation_count from batches where id = ?',
+      [batchId],
+    );
+    if (rows.isEmpty) {
+      return;
+    }
+
+    final row = rows.first;
+    final currentCount =
+        int.tryParse(row['current_count']?.toString() ?? '') ?? 0;
+    final isolationCount =
+        int.tryParse(row['isolation_count']?.toString() ?? '') ?? 0;
+    final deltas = healthLogBatchDeltas(healthType: healthType, count: count);
+    final nextCurrentCount = currentCount - deltas.currentCountDelta;
+    final nextIsolationCount = isolationCount - deltas.isolationCountDelta;
+
+    await _localDatabase.rawLocalUpdate(
+      'batches',
+      {
+        'current_count': nextCurrentCount < 0 ? 0 : nextCurrentCount,
+        'isolation_count': nextIsolationCount < 0 ? 0 : nextIsolationCount,
+        'is_synced': 0,
+      },
+      'id = ?',
+      [batchId],
+    );
+  }
+
+  Future<void> _incrementFeedStock({
+    required String feedTypeId,
+    required String formulationId,
+    required double amount,
+  }) async {
+    if (amount <= 0) {
+      return;
+    }
+    if (feedTypeId.isNotEmpty) {
+      final rows = await _localDatabase.queryLocalRecords(
+        'inventory',
+        where: 'id = ? and is_deleted = 0',
+        whereArgs: [feedTypeId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        return;
+      }
+      final current = _asDouble(rows.first['stock_level']);
+      await _localDatabase.updateLocalRecord(
+        'inventory',
+        {
+          'stock_level': current + amount,
+          'is_synced': 0,
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [feedTypeId],
+      );
+      return;
+    }
+    if (formulationId.isNotEmpty) {
+      final rows = await _localDatabase.queryLocalRecords(
+        'feed_formulations',
+        where: 'id = ?',
+        whereArgs: [formulationId],
+        limit: 1,
+      );
+      if (rows.isEmpty) {
+        return;
+      }
+      final current = _asDouble(
+        rows.first['stockLevel'] ?? rows.first['stock_level'],
+      );
+      await _localDatabase.updateLocalRecord(
+        'feed_formulations',
+        {
+          'stockLevel': current + amount,
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [formulationId],
+      );
+    }
   }
 }

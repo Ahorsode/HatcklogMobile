@@ -3,7 +3,9 @@ import 'package:flutter/material.dart';
 import '../../../core/models/app_user.dart';
 import '../../../core/permissions/farm_permissions.dart';
 import '../../../core/storage/local_database.dart';
+import '../../../features/auth/data/supabase_remote_api.dart';
 import '../../../features/management/data/management_repository.dart';
+import '../../../features/sync/data/sync_repository.dart';
 import '../../../features/sync/data/worker_input_sink.dart';
 import '../../../presentation/universal/universal_mobile_dashboard.dart';
 import '../../../presentation/worker/worker_home_screen.dart';
@@ -22,6 +24,8 @@ class RoleGateway extends StatelessWidget {
     this.showSoftLockBanner = false,
     this.localSalesQueue,
     this.pdfInvoiceService,
+    this.onRefreshFromCloud,
+    this.remoteApi,
   });
 
   final AppUser currentUser;
@@ -35,15 +39,18 @@ class RoleGateway extends StatelessWidget {
   final bool showSoftLockBanner;
   final dynamic localSalesQueue;
   final dynamic pdfInvoiceService;
+  final Future<void> Function()? onRefreshFromCloud;
+  final SupabaseRemoteApi? remoteApi;
 
   @override
   Widget build(BuildContext context) {
     final String userRole = currentUser.role.name.toLowerCase().trim();
     debugPrint('HatchLog Auth Engine: Authenticated user role is -> $userRole');
 
-    if (currentUser.role == UserRole.worker) {
+    if (currentUser.role == UserRole.worker ||
+        currentUser.role == UserRole.cashier) {
       debugPrint(
-        'HatchLog Auth Engine: Worker access granted. Navigating to worker-first dashboard.',
+        'HatchLog Auth Engine: Worker/cashier access granted. Navigating to worker-first dashboard.',
       );
       return WorkerHomeScreen(
         currentUser: currentUser,
@@ -56,6 +63,11 @@ class RoleGateway extends StatelessWidget {
         showSoftLockBanner: showSoftLockBanner,
         localSalesQueue: localSalesQueue,
         pdfInvoiceService: pdfInvoiceService,
+        onRefreshFromCloud: onRefreshFromCloud,
+        remoteApi: remoteApi,
+        logMutator: inputSink is SyncRepository
+            ? inputSink as SyncRepository
+            : null,
       );
     }
 
@@ -71,6 +83,8 @@ class RoleGateway extends StatelessWidget {
       showSoftLockBanner: showSoftLockBanner,
       localSalesQueue: localSalesQueue,
       pdfInvoiceService: pdfInvoiceService,
+      onRefreshFromCloud: onRefreshFromCloud,
+      remoteApi: remoteApi,
     );
   }
 }

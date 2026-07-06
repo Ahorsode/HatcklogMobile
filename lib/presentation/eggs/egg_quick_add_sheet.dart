@@ -4,6 +4,8 @@ import 'package:flutter/services.dart';
 import '../../core/models/app_user.dart';
 import '../../core/models/worker_input_type.dart';
 import '../../features/sync/data/worker_input_sink.dart';
+import '../../features/sync/data/worker_log_mutator.dart';
+import '../../utils/egg_log_utils.dart';
 import '../worker/widgets/quick_add_batch_grid.dart';
 
 class EggQuickAddSheet extends StatefulWidget {
@@ -12,11 +14,15 @@ class EggQuickAddSheet extends StatefulWidget {
     required this.currentUser,
     required this.batch,
     required this.inputSink,
+    this.editConfig,
+    this.initialRow,
   });
 
   final AppUser currentUser;
   final BatchSummary batch;
   final WorkerInputSink inputSink;
+  final WorkerLogEditConfig? editConfig;
+  final Map<String, Object?>? initialRow;
 
   @override
   State<EggQuickAddSheet> createState() => _EggQuickAddSheetState();
@@ -37,13 +43,12 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
   DateTime _logDate = DateTime.now();
   String _qualityGrade = 'MEDIUM';
 
-  int get _eggsCollected {
-    if (_useCrates) {
-      return (_intValue(_cratesController) * 30) +
-          _intValue(_remainderController).clamp(0, 29);
-    }
-    return _intValue(_totalEggsController);
-  }
+  int get _eggsCollected => calculateEggsCollected(
+    useCrates: _useCrates,
+    crates: _intValue(_cratesController),
+    remainder: _intValue(_remainderController),
+    individualTotal: _intValue(_totalEggsController),
+  );
 
   int get _allocated =>
       _intValue(_smallController) +
@@ -52,20 +57,82 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
 
   int get _unusable => _intValue(_unusableController);
 
-  String? get _validationError {
-    if (_eggsCollected <= 0) {
-      return 'Eggs collected is required.';
-    }
-    if (_isSorted && _allocated > _eggsCollected) {
-      return 'Sum of sizes exceeds total eggs collected';
-    }
-    if (_unusable > _eggsCollected) {
-      return 'Unusable eggs cannot exceed total eggs collected.';
-    }
-    return null;
-  }
+  String? get _validationError => validateEggLog(
+    eggsCollected: _eggsCollected,
+    unusableCount: _unusable,
+    isSorted: _isSorted,
+    smallCount: _intValue(_smallController),
+    mediumCount: _intValue(_mediumController),
+    largeCount: _intValue(_largeController),
+  );
 
   bool get _canSubmit => !_isSaving && _validationError == null;
+
+  @override
+  void initState() {
+    super.initState();
+    _hydrateFromInitialRow();
+  }
+
+  void _hydrateFromInitialRow() {
+    final row = widget.initialRow;
+    if (row == null) {
+      return;
+    }
+    final eggsCollected = _rowInt(row['eggs_collected']);
+    final crates = _rowDouble(row['crates_collected']);
+    if (crates > 0) {
+      _useCrates = true;
+      _cratesController.text = crates.toString();
+      final remainder = eggsCollected - (crates * defaultEggsPerCrate).round();
+      if (remainder > 0) {
+        _remainderController.text = remainder.toString();
+      }
+    } else {
+      _totalEggsController.text = eggsCollected.toString();
+    }
+    _unusableController.text = _rowInt(row['unusable_count']).toString();
+    _isSorted = _rowBool(row['is_sorted']);
+    _qualityGrade = normalizeQualityGrade(row['quality_grade']?.toString());
+    _smallController.text = _rowInt(row['small_count']).toString();
+    _mediumController.text = _rowInt(row['medium_count']).toString();
+    _largeController.text = _rowInt(row['large_count']).toString();
+    final logDate = DateTime.tryParse(row['log_date']?.toString() ?? '');
+    if (logDate != null) {
+      _logDate = logDate;
+    }
+  }
+
+  int _rowInt(Object? value) {
+    if (value is int) {
+      return value;
+    }
+    if (value is num) {
+      return value.round();
+    }
+    return int.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  double _rowDouble(Object? value) {
+    if (value is double) {
+      return value;
+    }
+    if (value is num) {
+      return value.toDouble();
+    }
+    return double.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  bool _rowBool(Object? value) {
+    if (value is bool) {
+      return value;
+    }
+    if (value is num) {
+      return value != 0;
+    }
+    final text = value?.toString().trim().toLowerCase() ?? '';
+    return text == 'true' || text == '1';
+  }
 
   @override
   void dispose() {
@@ -85,28 +152,43 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
     }
     setState(() => _isSaving = true);
     try {
-      await widget.inputSink.enqueueWorkerInput(
-        user: widget.currentUser,
-        type: WorkerInputType.eggCollection,
-        payload: {
-          'batch_id': widget.batch.id,
-          'eggs_collected': _eggsCollected,
-          'unusable_count': _unusable,
-          'quality_grade': _isSorted ? null : _qualityGrade,
-          'is_sorted': _isSorted,
-          'small_count': _isSorted ? _intValue(_smallController) : 0,
-          'medium_count': _isSorted ? _intValue(_mediumController) : 0,
-          'large_count': _isSorted ? _intValue(_largeController) : 0,
-          'log_date': _logDate.toIso8601String(),
-          'crates': _useCrates ? _intValue(_cratesController) : 0,
-          'single_eggs': _useCrates
-              ? _intValue(_remainderController).clamp(0, 29)
-              : _eggsCollected,
-          'eggs_per_crate': 30,
-        },
+      final payload = buildEggLogPayload(
+        batchId: widget.batch.id,
+        eggsCollected: _eggsCollected,
+        unusableCount: _unusable,
+        isSorted: _isSorted,
+        qualityGrade: _qualityGrade,
+        smallCount: _intValue(_smallController),
+        mediumCount: _intValue(_mediumController),
+        largeCount: _intValue(_largeController),
+        logDate: _logDate,
+        useCrates: _useCrates,
+        crates: _intValue(_cratesController),
+        remainder: _intValue(_remainderController),
       );
+      final editConfig = widget.editConfig;
+      if (editConfig != null) {
+        await editConfig.mutator.updateWorkerLog(
+          user: widget.currentUser,
+          module: editConfig.module,
+          recordId: editConfig.recordId,
+          payload: payload,
+        );
+      } else {
+        await widget.inputSink.enqueueWorkerInput(
+          user: widget.currentUser,
+          type: WorkerInputType.eggCollection,
+          payload: payload,
+        );
+      }
       if (mounted) {
         Navigator.of(context).pop(true);
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not save egg log: $error')),
+        );
       }
     } finally {
       if (mounted) {
@@ -215,7 +297,14 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
                   ],
                   selected: {_isSorted},
                   onSelectionChanged: (values) {
-                    setState(() => _isSorted = values.first);
+                    setState(() {
+                      _isSorted = values.first;
+                      if (!_isSorted) {
+                        _smallController.clear();
+                        _mediumController.clear();
+                        _largeController.clear();
+                      }
+                    });
                   },
                 ),
                 const SizedBox(height: 14),

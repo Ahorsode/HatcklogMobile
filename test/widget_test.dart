@@ -5,6 +5,8 @@ import 'package:hatchlog_m/core/license/license_status.dart';
 import 'package:hatchlog_m/core/models/app_user.dart';
 import 'package:hatchlog_m/core/models/worker_input_type.dart';
 import 'package:hatchlog_m/core/permissions/farm_permissions.dart';
+import 'package:hatchlog_m/core/permissions/navigation_permissions.dart';
+import 'package:hatchlog_m/presentation/dashboard/dashboard_type.dart';
 import 'package:hatchlog_m/features/auth/data/auth_repository.dart';
 import 'package:hatchlog_m/features/auth/data/supabase_remote_api.dart';
 import 'package:hatchlog_m/features/management/data/management_models.dart';
@@ -15,7 +17,9 @@ import 'package:hatchlog_m/presentation/analytics/analytics_models.dart';
 import 'package:hatchlog_m/core/storage/local_database.dart';
 import 'package:hatchlog_m/services/encryption_service.dart';
 import 'package:hatchlog_m/features/sales/sale_line_draft.dart';
+import 'package:hatchlog_m/services/local_partner_service.dart';
 import 'package:hatchlog_m/services/local_sales_queue.dart';
+import 'package:hatchlog_m/services/missing_finance_setup_service.dart';
 
 void main() {
   test('phone identifiers are masked as internal email auth identities', () {
@@ -34,6 +38,10 @@ void main() {
     expect(
       AuthRepository.normalizePhoneNumber('055 410 1675'),
       '+233554101675',
+    );
+    expect(
+      AuthRepository.normalizePhoneNumber('+233206117611'),
+      '+233206117611',
     );
   });
 
@@ -199,6 +207,86 @@ void main() {
     });
   }
 
+  test('farm-scoped role matches web dashboard routing', () {
+    expect(
+      resolveEffectiveFarmRole(
+        farmOwnerId: 'owner-1',
+        userId: 'owner-1',
+        membershipRole: UserRole.manager,
+      ),
+      UserRole.owner,
+    );
+    expect(
+      resolveEffectiveFarmRole(
+        farmOwnerId: 'owner-1',
+        userId: 'worker-1',
+        membershipRole: UserRole.worker,
+      ),
+      UserRole.worker,
+    );
+    expect(
+      resolveEffectiveFarmRole(
+        farmOwnerId: 'owner-1',
+        userId: 'acct-1',
+        membershipRole: UserRole.accountant,
+      ),
+      UserRole.accountant,
+    );
+    expect(
+      resolveEffectiveFarmRole(
+        farmOwnerId: 'owner-1',
+        userId: 'mgr-1',
+        membershipRole: UserRole.manager,
+      ),
+      UserRole.manager,
+    );
+    expect(
+      resolveEffectiveFarmRole(
+        farmOwnerId: 'owner-1',
+        userId: 'guest-1',
+      ),
+      UserRole.worker,
+    );
+  });
+
+  test('mobile dashboard type resolves per role', () {
+    expect(
+      resolveMobileDashboardType(
+        role: UserRole.accountant,
+        subscriptionTier: null,
+      ),
+      MobileDashboardType.accountant,
+    );
+    expect(
+      resolveMobileDashboardType(
+        role: UserRole.worker,
+        subscriptionTier: null,
+      ),
+      MobileDashboardType.worker,
+    );
+    expect(
+      resolveMobileDashboardType(
+        role: UserRole.manager,
+        subscriptionTier: null,
+      ),
+      MobileDashboardType.farmOverview,
+    );
+    expect(
+      resolveMobileDashboardType(
+        role: UserRole.owner,
+        subscriptionTier: 'PREMIUM',
+      ),
+      MobileDashboardType.executive,
+    );
+    expect(
+      resolveMobileDashboardType(
+        role: UserRole.owner,
+        subscriptionTier: 'FREE',
+      ),
+      MobileDashboardType.farmOverview,
+    );
+  });
+
   testWidgets('worker receives operations dashboard without finance figures', (
     tester,
   ) async {
@@ -260,10 +348,8 @@ void main() {
 
     await tester.pump();
 
-    expect(find.text('Financial Overview'), findsOneWidget);
-    expect(find.text('Daily Operations'), findsNothing);
-    expect(find.text('Add Livestock'), findsNothing);
-    expect(find.text('Access Denied'), findsNothing);
+    expect(find.text('Quick Log'), findsNothing);
+    expect(find.text('Your Modules'), findsNothing);
   });
 }
 
@@ -355,6 +441,7 @@ class _FakeManagementDataSource implements ManagementDataSource {
       houseRecords: [],
       eggRecords: [],
       feedingRecords: [],
+      healthRecords: [],
       mortalityRecords: [],
       quarantineRecords: [],
       salesRecords: [],
@@ -389,4 +476,23 @@ class _FakeManagementDataSource implements ManagementDataSource {
     required TeamMemberRecord member,
     required UserRole targetRole,
   }) async {}
+
+  @override
+  Future<List<MissingCostBatch>> loadBatchesMissingCost(AppUser user) async {
+    return const [];
+  }
+
+  @override
+  Future<List<MissingCostHealthItem>> loadHealthItemsMissingCost(
+    AppUser user,
+  ) async {
+    return const [];
+  }
+
+  @override
+  LocalPartnerService get partnerService =>
+      LocalPartnerService(LocalDatabase());
+
+  @override
+  LocalDatabase get localDatabase => LocalDatabase();
 }

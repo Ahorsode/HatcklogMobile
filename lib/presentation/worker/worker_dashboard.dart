@@ -8,6 +8,7 @@ import '../../core/models/worker_input_type.dart';
 import '../../core/storage/local_database.dart';
 import '../../features/sync/data/worker_input_sink.dart';
 import '../../features/sales/sale_entry_screen.dart';
+import '../../utils/mortality_log_utils.dart';
 import '../shared/session_mode_badge.dart';
 
 class WorkerDashboard extends StatefulWidget {
@@ -35,6 +36,7 @@ class WorkerDashboard extends StatefulWidget {
 }
 
 class _WorkerDashboardState extends State<WorkerDashboard> {
+  final LocalDatabase _localDatabase = LocalDatabase();
   StreamSubscription<bool>? _connectionSubscription;
   StreamSubscription<WorkerDashboardSnapshot>? _dashboardSubscription;
 
@@ -142,6 +144,7 @@ class _WorkerDashboardState extends State<WorkerDashboard> {
         child: _MortalityOverlay(
           heroTag: _HeroTags.mortality,
           unitOptions: _availableUnitOptions,
+          localDatabase: _localDatabase,
           onSave: (payload) =>
               _saveLog(type: WorkerInputType.mortality, payload: payload),
         ),
@@ -808,11 +811,13 @@ class _MortalityOverlay extends StatefulWidget {
   const _MortalityOverlay({
     required this.heroTag,
     required this.unitOptions,
+    required this.localDatabase,
     required this.onSave,
   });
 
   final String heroTag;
   final List<WorkerUnitOption> unitOptions;
+  final LocalDatabase localDatabase;
   final Future<void> Function(Map<String, dynamic> payload) onSave;
 
   @override
@@ -823,6 +828,7 @@ class _MortalityOverlayState extends State<_MortalityOverlay> {
   int _count = 0;
   WorkerUnitOption? _selectedUnit;
   bool _isSaving = false;
+  final Map<String, int> _batchCurrentCounts = {};
 
   @override
   void initState() {
@@ -830,22 +836,70 @@ class _MortalityOverlayState extends State<_MortalityOverlay> {
     _selectedUnit = widget.unitOptions.isEmpty
         ? null
         : widget.unitOptions.first;
+    _loadBatchCounts();
   }
+
+  Future<void> _loadBatchCounts() async {
+    final batchIds = widget.unitOptions
+        .map((option) => option.batchId)
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    if (batchIds.isEmpty) {
+      return;
+    }
+
+    final placeholders = List.filled(batchIds.length, '?').join(', ');
+    final rows = await widget.localDatabase.rawLocalQuery(
+      '''
+      select id, current_count
+      from batches
+      where id in ($placeholders)
+      ''',
+      batchIds.toList(),
+    );
+
+    final counts = <String, int>{};
+    for (final row in rows) {
+      final id = row['id']?.toString() ?? '';
+      if (id.isEmpty) {
+        continue;
+      }
+      counts[id] = int.tryParse(row['current_count']?.toString() ?? '') ?? 0;
+    }
+
+    if (!mounted) {
+      return;
+    }
+    setState(() => _batchCurrentCounts.addAll(counts));
+  }
+
+  int get _currentCount =>
+      _batchCurrentCounts[_selectedUnit?.batchId ?? ''] ?? 0;
+
+  String? get _validationError => validateHealthLog(
+        count: _count,
+        currentCount: _currentCount,
+        healthType: 'DEAD',
+      );
 
   Future<void> _save() async {
     final unit = _selectedUnit;
-    if (_isSaving || unit == null || _count == 0) {
+    if (_isSaving || unit == null || _validationError != null) {
       return;
     }
 
     HapticFeedback.lightImpact();
     setState(() => _isSaving = true);
-    await widget.onSave({
-      'batch_id': unit.batchId,
-      'house_id': unit.houseId,
-      'count': _count,
-      'device_logged_at': DateTime.now().toIso8601String(),
-    });
+    await widget.onSave(
+      buildHealthLogPayload(
+        batchId: unit.batchId,
+        count: _count,
+        healthType: 'DEAD',
+        category: 'Unknown',
+        subCategory: 'Unknown cause yet',
+        logDate: DateTime.now(),
+      ),
+    );
 
     if (mounted) {
       Navigator.of(context).pop(true);
@@ -861,7 +915,7 @@ class _MortalityOverlayState extends State<_MortalityOverlay> {
       icon: Icons.warning_amber_rounded,
       accentColor: _WorkerColors.alert,
       isSaving: _isSaving,
-      canSave: _selectedUnit != null && _count > 0,
+      canSave: _selectedUnit != null && _validationError == null,
       onSave: _save,
       children: [
         _WorkerUnitPicker(
@@ -881,13 +935,25 @@ class _MortalityOverlayState extends State<_MortalityOverlay> {
           onMinus: () => _changeCount(-1),
           onPlus: () => _changeCount(1),
         ),
+        if (_validationError != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            _validationError!,
+            style: const TextStyle(
+              color: Color(0xffb83b3b),
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
       ],
     );
   }
 
   void _changeCount(int delta) {
     HapticFeedback.lightImpact();
-    setState(() => _count = (_count + delta).clamp(0, 999));
+    setState(
+      () => _count = (_count + delta).clamp(0, _currentCount > 0 ? _currentCount : 999),
+    );
   }
 }
 

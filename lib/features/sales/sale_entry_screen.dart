@@ -5,7 +5,7 @@ import '../../core/models/app_user.dart';
 import '../../core/storage/local_database.dart';
 import '../../services/local_sales_queue.dart';
 import '../../services/pdf_invoice_service.dart';
-import 'sale_line_draft.dart';
+import '../../utils/inventory_sale_utils.dart';
 
 enum _DiscountMode { flat, percentage }
 
@@ -80,6 +80,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   List<Map<String, Object?>> _customers = const [];
   List<_ProductOption> _inventoryOptions = const [];
   List<_ProductOption> _livestockOptions = const [];
+  bool _inventoryIsEggCatalog = false;
   final List<_SaleLineState> _lines = [_SaleLineState()];
 
   @override
@@ -109,10 +110,12 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       );
       final inventoryRows = await widget.localDatabase.queryLocalRecords(
         'inventory',
-        where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+        where:
+            'farm_id = ? and coalesce(is_deleted, 0) = 0 and coalesce(stock_level, 0) > 0',
         whereArgs: [farmId],
         orderBy: 'item_name asc',
       );
+      final saleInventoryRows = inventoryRowsForSale(inventoryRows);
       final batchRows = await widget.localDatabase.queryLocalRecords(
         'batches',
         where:
@@ -125,29 +128,42 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       }
       setState(() {
         _customers = customers;
-        _inventoryOptions = inventoryRows
+        _inventoryIsEggCatalog = inventoryCatalogIsEggFocused(saleInventoryRows);
+        _inventoryOptions = saleInventoryRows
             .map(
-              (row) => _ProductOption(
-                id: _text(row['id']),
-                label: _text(row['item_name'], 'Inventory item'),
-                description: _text(row['item_name'], 'Inventory item'),
-                unitPrice: _asDouble(row['cost_per_unit']),
-                available: _asDouble(row['stock_level']),
-                productType: SaleProductType.inventory,
-              ),
+              (row) {
+                final sellingPrice = _asDouble(row['selling_price']);
+                final costPerUnit = _asDouble(row['cost_per_unit']);
+                final label = formatSaleInventoryLabel(row);
+                return _ProductOption(
+                  id: _text(row['id']),
+                  label: label,
+                  description: label,
+                  unitPrice: sellingPrice > 0 ? sellingPrice : costPerUnit,
+                  available: inventoryStockLevel(row['stock_level']),
+                  productType: SaleProductType.inventory,
+                );
+              },
             )
             .where((option) => option.id.isNotEmpty)
             .toList(growable: false);
         _livestockOptions = batchRows
             .map(
-              (row) => _ProductOption(
-                id: _text(row['id']),
-                label: _text(row['batch_name'], 'Batch'),
-                description: _text(row['batch_name'], 'Livestock batch'),
-                unitPrice: 0,
-                available: _asDouble(row['current_count']),
-                productType: SaleProductType.livestock,
-              ),
+              (row) {
+                final initialCost = _asDouble(row['initial_actual_cost']);
+                final initialCount = _asInt(row['initial_count'], fallback: 1);
+                final basePrice = initialCount > 0
+                    ? initialCost / initialCount
+                    : 0.0;
+                return _ProductOption(
+                  id: _text(row['id']),
+                  label: _text(row['batch_name'], 'Batch'),
+                  description: _text(row['batch_name'], 'Livestock batch'),
+                  unitPrice: basePrice,
+                  available: _asDouble(row['current_count']),
+                  productType: SaleProductType.livestock,
+                );
+              },
             )
             .where((option) => option.id.isNotEmpty)
             .toList(growable: false);
@@ -256,11 +272,16 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       }
     }
     final cash = double.tryParse(_cashReceivedController.text.trim()) ?? 0;
+    if (cash < 0) {
+      return false;
+    }
+    if (widget.canOverridePrices) {
+      return cash >= 0 && _computedTotal > 0;
+    }
     if (cash <= 0) {
       return false;
     }
-    if (!widget.canOverridePrices &&
-        (cash - _computedTotal).abs() > 0.01) {
+    if ((cash - _computedTotal).abs() > 0.01) {
       return false;
     }
     return true;
@@ -482,6 +503,8 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                     line: _lines[index],
                     index: index,
                     canOverridePrices: widget.canOverridePrices,
+                    inventoryTypeLabel:
+                        _inventoryIsEggCatalog ? 'Eggs' : 'Inventory',
                     options: _optionsFor(_lines[index].productType),
                     onChanged: _onFieldChanged,
                     onRemove: _lines.length == 1
@@ -628,6 +651,7 @@ class _LineCard extends StatelessWidget {
     required this.line,
     required this.index,
     required this.canOverridePrices,
+    required this.inventoryTypeLabel,
     required this.options,
     required this.onChanged,
     this.onRemove,
@@ -636,6 +660,7 @@ class _LineCard extends StatelessWidget {
   final _SaleLineState line;
   final int index;
   final bool canOverridePrices;
+  final String inventoryTypeLabel;
   final List<_ProductOption> options;
   final ValueChanged<VoidCallback?> onChanged;
   final VoidCallback? onRemove;
@@ -665,9 +690,9 @@ class _LineCard extends StatelessWidget {
             ),
             SegmentedButton<SaleProductType>(
               segments: [
-                const ButtonSegment(
+                ButtonSegment(
                   value: SaleProductType.inventory,
-                  label: Text('Inventory'),
+                  label: Text(inventoryTypeLabel),
                 ),
                 const ButtonSegment(
                   value: SaleProductType.livestock,
@@ -822,4 +847,14 @@ double _asDouble(Object? value) {
     return value.toDouble();
   }
   return double.tryParse(value?.toString() ?? '') ?? 0;
+}
+
+int _asInt(Object? value, {int fallback = 0}) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  return int.tryParse(value?.toString() ?? '') ?? fallback;
 }

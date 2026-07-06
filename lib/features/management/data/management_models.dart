@@ -1,4 +1,6 @@
 import '../../../core/models/app_user.dart';
+import '../../../core/permissions/farm_permissions.dart';
+import '../../../core/permissions/navigation_permissions.dart';
 
 enum ManagementSection {
   dashboard,
@@ -6,6 +8,7 @@ enum ManagementSection {
   houses,
   eggs,
   feeding,
+  health,
   mortality,
   quarantine,
   sales,
@@ -43,7 +46,47 @@ class ManagementPermissions {
     return true;
   }
 
-  static ManagementPermissions forRole(UserRole role) {
+  static ManagementPermissions fromAccess({
+    required UserRole role,
+    required bool isFarmOwner,
+    required FarmPermissions permissions,
+  }) {
+    if (isFarmOwner || role == UserRole.owner || role == UserRole.manager) {
+      return ManagementPermissions.all();
+    }
+
+    bool view(String module) => canViewModule(
+      role: role,
+      isFarmOwner: isFarmOwner,
+      permissions: permissions,
+      module: module,
+    );
+    bool edit(String module) => canEditModule(
+      role: role,
+      isFarmOwner: isFarmOwner,
+      permissions: permissions,
+      module: module,
+    );
+
+    return ManagementPermissions(
+      canViewFinance: view('finance'),
+      canEditFinance: edit('finance'),
+      canViewOperations:
+          view('batches') ||
+          view('houses') ||
+          view('eggs') ||
+          view('feeding') ||
+          view('mortality'),
+      canEditBatches: edit('batches'),
+      canIssueInvoices: edit('sales'),
+      canDiscount: edit('sales'),
+      canManageTeam: view('team'),
+      canPromoteUsers: isFarmOwner && edit('team'),
+      canEditHistoricalLedger: edit('finance'),
+    );
+  }
+
+  static ManagementPermissions all() {
     return const ManagementPermissions(
       canViewFinance: true,
       canEditFinance: true,
@@ -55,6 +98,10 @@ class ManagementPermissions {
       canPromoteUsers: true,
       canEditHistoricalLedger: true,
     );
+  }
+
+  static ManagementPermissions forRole(UserRole role) {
+    return all();
   }
 }
 
@@ -245,6 +292,7 @@ class ManagementSnapshot {
     required this.houseRecords,
     required this.eggRecords,
     required this.feedingRecords,
+    required this.healthRecords,
     required this.mortalityRecords,
     required this.quarantineRecords,
     required this.salesRecords,
@@ -265,6 +313,7 @@ class ManagementSnapshot {
   final List<HubModuleRecord> houseRecords;
   final List<HubModuleRecord> eggRecords;
   final List<HubModuleRecord> feedingRecords;
+  final List<HubModuleRecord> healthRecords;
   final List<HubModuleRecord> mortalityRecords;
   final List<HubModuleRecord> quarantineRecords;
   final List<HubModuleRecord> salesRecords;

@@ -54,10 +54,10 @@ class SessionWatcher {
       if (!client.isConfigured) return;
       if (!await connectivityService.isOnline) return;
 
-      final remoteRole = await client.fetchUserRoleByIdentifier(
-        currentUser.loginIdentifier,
+      final remoteUserRole = await client.fetchEffectiveFarmRole(
+        userId: currentUser.id,
+        farmId: currentUser.activeFarmId,
       );
-      final remoteUserRole = UserRole.fromString(remoteRole);
       if (remoteUserRole != UserRole.unknown &&
           remoteUserRole != currentUser.role) {
         // Role changed remotely — force logout

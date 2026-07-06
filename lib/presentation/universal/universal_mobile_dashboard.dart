@@ -11,16 +11,32 @@ import '../../core/permissions/farm_permissions.dart';
 import '../../core/storage/local_database.dart';
 import '../../features/management/data/management_repository.dart';
 import '../../features/sync/data/worker_input_sink.dart';
+import '../../features/auth/data/supabase_remote_api.dart';
+import '../../services/local_house_service.dart';
+import '../../utils/active_farm_id.dart';
+import '../../utils/house_climate_utils.dart';
 import '../../services/local_sales_queue.dart';
 import '../../services/pdf_invoice_service.dart';
 import '../analytics/farm_analytics_screen.dart';
+import '../analytics/batch_compare_screen.dart';
 import '../../features/inventory/data/inventory_repository.dart';
+import '../../services/dashboard_stats_service.dart';
 import '../../services/executive_metrics_service.dart';
-import '../executive/executive_dashboard_screen.dart';
+import '../../utils/livestock_breed_options.dart';
+import '../../utils/feed_source_utils.dart';
+import '../../utils/inventory_sale_utils.dart';
+import '../../utils/egg_log_utils.dart';
+import '../eggs/egg_quick_add_sheet.dart';
+import '../worker/widgets/quick_add_batch_grid.dart';
+import '../dashboard/mobile_dashboard_host.dart';
 import '../inventory/inventory_list_screen.dart';
+import '../health/health_screen.dart';
 import '../houses/climate_control_screen.dart';
+import '../livestock/livestock_hub_screen.dart';
 import '../license/soft_lock_banner.dart';
 import '../reports/farm_report_screen.dart';
+import '../profile/profile_screen.dart';
+import '../settings/settings_hub_screen.dart';
 import '../settings/trash_screen.dart';
 import '../shared/hatchlog_details_popup.dart';
 import '../shared/session_mode_badge.dart';
@@ -39,6 +55,8 @@ class UniversalMobileDashboard extends StatefulWidget {
     this.showSoftLockBanner = false,
     this.localSalesQueue,
     this.pdfInvoiceService,
+    this.onRefreshFromCloud,
+    this.remoteApi,
   });
 
   final AppUser currentUser;
@@ -52,6 +70,8 @@ class UniversalMobileDashboard extends StatefulWidget {
   final bool showSoftLockBanner;
   final LocalSalesQueue? localSalesQueue;
   final PdfInvoiceService? pdfInvoiceService;
+  final Future<void> Function()? onRefreshFromCloud;
+  final SupabaseRemoteApi? remoteApi;
 
   @override
   State<UniversalMobileDashboard> createState() =>
@@ -60,17 +80,18 @@ class UniversalMobileDashboard extends StatefulWidget {
 
 class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
   SupabaseClient? _supabase;
-  late final List<_HatchModuleConfig> _modules;
+  late List<_HatchModuleConfig> _modules;
   late List<_HatchModuleConfig> _visibleModules;
   late Map<String, Stream<List<Map<String, dynamic>>>> _streams;
   StreamSubscription<bool>? _connectionSubscription;
   Map<String, dynamic> _permissions = const <String, dynamic>{};
+  Map<String, String> _batchNameById = const {};
   final bool _permissionsLoading = false;
   Object? _permissionError;
   bool _isOnline = true;
   int _selectedIndex = 0;
-  bool _showExecutiveDashboard = false;
   late final ExecutiveMetricsService _executiveMetricsService;
+  late final DashboardStatsService _dashboardStatsService;
   late final InventoryRepository _inventoryRepository;
 
   @override
@@ -82,7 +103,15 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       debugPrint('WARN: Supabase unavailable for dashboard streams: $error');
     }
     _modules = _buildModules();
-    _executiveMetricsService = ExecutiveMetricsService(widget.localDatabase);
+    _loadBatchNameCache();
+    _executiveMetricsService = ExecutiveMetricsService(
+      widget.localDatabase,
+      widget.remoteApi,
+    );
+    _dashboardStatsService = DashboardStatsService(
+      widget.localDatabase,
+      widget.remoteApi,
+    );
     _inventoryRepository = InventoryRepository(widget.localDatabase);
     _permissions = widget.permissions.toMap();
     _visibleModules = _buildFencedModules(_modules, _permissions);
@@ -100,21 +129,6 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         setState(() => _isOnline = online);
       }
     });
-    _loadExecutiveAccess();
-  }
-
-  Future<void> _loadExecutiveAccess() async {
-    try {
-      final allowed = await _executiveMetricsService.isPremiumOwner(
-        widget.currentUser.activeFarmId,
-        widget.currentUser.role.name,
-      );
-      if (mounted) {
-        setState(() => _showExecutiveDashboard = allowed);
-      }
-    } on Object {
-      // Local cache may be unavailable during tests or early boot.
-    }
   }
 
   Map<String, Stream<List<Map<String, dynamic>>>> _buildStreams(
@@ -170,13 +184,20 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
   }
 
   Stream<List<Map<String, dynamic>>> _streamFor(_HatchModuleConfig module) {
+    if (module.table == 'houses') {
+      return widget.localDatabase
+          .watchTables(const ['houses', 'batches'])
+          .asyncMap((_) => _loadLocalHouseRows())
+          .asBroadcastStream();
+    }
+
     final supabase = _supabase;
     if (supabase == null) {
-      return const Stream<List<Map<String, dynamic>>>.empty();
+      return Stream<List<Map<String, dynamic>>>.empty().asBroadcastStream();
     }
     final activeFarmId = _activeFarmId(supabase);
     if (activeFarmId.isEmpty || module.tenantColumn == null) {
-      return const Stream<List<Map<String, dynamic>>>.empty();
+      return Stream<List<Map<String, dynamic>>>.empty().asBroadcastStream();
     }
 
     final stream = supabase
@@ -186,24 +207,131 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         .order(module.orderBy, ascending: false)
         .limit(100);
     if (module.streamEquals.isEmpty) {
-      return stream;
+      return stream.asBroadcastStream();
     }
-    return stream.map((rows) => _applyEqualsFilters(rows, module.streamEquals));
+    return stream
+        .map((rows) => _applyEqualsFilters(rows, module.streamEquals))
+        .asBroadcastStream();
   }
 
   String _activeFarmId(SupabaseClient supabase) {
-    final metadata = supabase.auth.currentUser?.userMetadata;
-    return metadata?['farm_id']?.toString() ??
-        metadata?['farmId']?.toString() ??
-        metadata?['tenant_id']?.toString() ??
-        metadata?['tenantId']?.toString() ??
-        widget.currentUser.activeFarmId;
+    return resolveActiveFarmId(
+      user: widget.currentUser,
+      supabase: supabase,
+    );
+  }
+
+  String _dashboardFarmId() {
+    final supabase = _supabase;
+    if (supabase != null) {
+      final resolved = _activeFarmId(supabase);
+      if (resolved.isNotEmpty) {
+        return resolved;
+      }
+    }
+    return widget.currentUser.activeFarmId;
+  }
+
+  Future<void> _loadBatchNameCache() async {
+    final farmId = _dashboardFarmId();
+    if (farmId.isEmpty) {
+      return;
+    }
+
+    try {
+      final rows = await widget.localDatabase.rawLocalQuery(
+        '''
+        select id, batch_name
+        from batches
+        where farm_id = ? and is_deleted = 0
+        order by batch_name asc
+        ''',
+        [farmId],
+      );
+      final names = <String, String>{};
+      for (final row in rows) {
+        final id = row['id']?.toString() ?? '';
+        if (id.isEmpty) {
+          continue;
+        }
+        final name = row['batch_name']?.toString().trim() ?? '';
+        names[id] = name.isEmpty ? 'Batch' : name;
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _batchNameById = names;
+        _modules = _buildModules(_batchNameById);
+        _visibleModules = _buildFencedModules(_modules, _permissions);
+      });
+    } on Object catch (error) {
+      debugPrint('WARN: Failed to load batch name cache: $error');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _loadLocalHouseRows() async {
+    final farmId = widget.currentUser.activeFarmId;
+    if (farmId.isEmpty) {
+      return const [];
+    }
+
+    final rows = await widget.localDatabase.rawLocalQuery(
+      '''
+      select h.*,
+             coalesce(sum(case when b.is_deleted = 0 then b.current_count else 0 end), 0) as occupied
+      from houses h
+      left join batches b on b.house_id = h.id
+      where h.farm_id = ?
+        and coalesce(h.is_deleted, 0) = 0
+      group by h.id
+      order by h.name asc
+      ''',
+      [farmId],
+    );
+
+    return rows
+        .map(
+          (row) => {
+            'id': row['id'],
+            'farmId': row['farm_id'],
+            'userId': row['user_id'],
+            'name': row['name'],
+            'capacity': row['capacity'],
+            'currentTemperature': row['current_temperature'],
+            'currentHumidity': row['current_humidity'],
+            'isIsolation': (row['is_isolation'] as int? ?? 0) == 1,
+            'environmental_state': row['environmental_state'],
+            'currentPopulation': row['occupied'],
+            'createdAt': row['created_at'],
+            'updatedAt': row['updated_at'],
+          },
+        )
+        .toList(growable: false);
   }
 
   Future<void> _insertRow(
     _HatchModuleConfig module,
     Map<String, dynamic> row,
   ) async {
+    if (module.table == 'houses') {
+      final service = LocalHouseService(widget.localDatabase);
+      await service.createHouse(
+        farmId: widget.currentUser.activeFarmId,
+        userId: widget.currentUser.id,
+        name: _objectText(row['name'] ?? row['house_number']),
+        capacity: _objectInt(row['capacity']),
+        isIsolation: _objectBool(row['isIsolation'] ?? row['is_isolation']),
+        currentTemperature: _nullablePayloadDouble(
+          row['currentTemperature'] ?? row['current_temperature'],
+        ),
+        currentHumidity: _nullablePayloadDouble(
+          row['currentHumidity'] ?? row['current_humidity'],
+        ),
+      );
+      return;
+    }
+
     final queuedInput = _queuedWorkerInputFor(module, row);
     if (queuedInput != null) {
       await widget.inputSink.enqueueWorkerInput(
@@ -236,10 +364,65 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       metadata[module.creatorColumn!] = createdBy;
     }
 
+    final recordId = row['id']?.toString() ?? _newTextId(module.table);
+
     await supabase.from(module.table).insert({
-      'id': row['id'] ?? _newTextId(module.table),
+      'id': recordId,
       ...metadata,
       ...row,
+    });
+
+    if (module.table == 'batches') {
+      await _mirrorBatchToLocal(
+        row: {
+          'id': recordId,
+          ...metadata,
+          ...row,
+        },
+        farmId: activeTenantId,
+        userId: createdBy,
+      );
+    }
+  }
+
+  Future<void> _mirrorBatchToLocal({
+    required Map<String, dynamic> row,
+    required String farmId,
+    required String userId,
+  }) async {
+    if (farmId.isEmpty) {
+      return;
+    }
+    final now = DateTime.now().toIso8601String();
+    final status = _objectText(row['status']);
+    await widget.localDatabase.insertLocalRecord('batches', {
+      'id': _objectText(row['id']),
+      'farm_id': farmId,
+      'house_id': _objectText(row['houseId'] ?? row['house_id']),
+      'user_id': userId,
+      'batch_name': _objectText(row['batchName'] ?? row['batch_name']),
+      'breed_type': _objectText(row['breedType'] ?? row['breed_type']),
+      'bird_strain': _objectText(row['breedType'] ?? row['breed_type']),
+      'type': _objectText(row['type']),
+      'status': status.isEmpty ? 'active' : status,
+      'active_state': status.isEmpty ? 'active' : status,
+      'current_count': _objectInt(row['currentCount'] ?? row['current_count']),
+      'initial_count': _objectInt(row['initialCount'] ?? row['initial_count']),
+      'isolation_count': _objectInt(
+        row['isolationCount'] ?? row['isolation_count'],
+      ),
+      'arrival_date': _objectText(
+        row['arrivalDate'] ?? row['arrival_date'],
+      ).isEmpty
+          ? now
+          : _objectText(row['arrivalDate'] ?? row['arrival_date']),
+      'is_deleted': 0,
+      'created_at': _objectText(row['createdAt'] ?? row['created_at']).isEmpty
+          ? now
+          : _objectText(row['createdAt'] ?? row['created_at']),
+      'updated_at': _objectText(row['updatedAt'] ?? row['updated_at']).isEmpty
+          ? now
+          : _objectText(row['updatedAt'] ?? row['updated_at']),
     });
   }
 
@@ -251,31 +434,49 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       case 'egg_production':
         return _QueuedWorkerInput(
           type: WorkerInputType.eggCollection,
-          payload: {
-            'batch_id': _objectText(row['batchId'] ?? row['batch_id']),
-            'house_id': _objectText(row['houseId'] ?? row['house_id']),
-            'crates': _objectDouble(
-              row['cratesCollected'] ?? row['crates_collected'],
+          payload: buildEggLogPayload(
+            batchId: _objectText(row['batchId'] ?? row['batch_id']),
+            eggsCollected: _objectInt(
+              row['eggsCollected'] ?? row['eggs_collected'],
             ),
-            'single_eggs': 0,
-            'eggs_per_crate': 30,
-            'device_logged_at':
-                _objectText(row['logDate'] ?? row['log_date']).isEmpty
-                ? DateTime.now().toIso8601String()
-                : _objectText(row['logDate'] ?? row['log_date']),
-          },
+            unusableCount: _objectInt(
+              row['unusableCount'] ?? row['unusable_count'],
+            ),
+            isSorted: _objectBool(row['isSorted'] ?? row['is_sorted']),
+            qualityGrade: _objectText(row['qualityGrade'] ?? row['quality_grade']),
+            smallCount: _objectInt(row['smallCount'] ?? row['small_count']),
+            mediumCount: _objectInt(row['mediumCount'] ?? row['medium_count']),
+            largeCount: _objectInt(row['largeCount'] ?? row['large_count']),
+            logDate: _objectText(row['logDate'] ?? row['log_date']).isEmpty
+                ? DateTime.now()
+                : DateTime.parse(_objectText(row['logDate'] ?? row['log_date'])),
+            useCrates: _objectDouble(
+                  row['cratesCollected'] ?? row['crates_collected'],
+                ) >
+                0,
+            crates: _objectDouble(
+              row['cratesCollected'] ?? row['crates_collected'],
+            ).round(),
+            remainder: _objectInt(row['eggsCollected'] ?? row['eggs_collected']) %
+                defaultEggsPerCrate,
+          ),
         );
       case 'daily_feeding_logs':
         return _QueuedWorkerInput(
           type: WorkerInputType.feedUsage,
           payload: {
             'batch_id': _objectText(row['batch_id'] ?? row['batchId']),
+            'amount_consumed': _objectDouble(
+              row['amount_consumed'] ?? row['sacks_used'],
+            ),
             'bags': _objectDouble(row['amount_consumed'] ?? row['sacks_used']),
-            'feed_type': _objectText(row['feed_type'] ?? row['feed_variant']),
+            'feed_type': _objectText(
+              row['feed_type_label'] ?? row['feed_type'] ?? row['feed_variant'],
+            ),
             'feed_type_id': _objectText(row['feed_type_id']),
             'formulation_id': _objectText(row['formulation_id']),
             'note': _objectText(row['note'] ?? row['notes']),
-            'device_logged_at':
+            'log_date':
                 _objectText(row['log_date'] ?? row['logged_at']).isEmpty
                 ? DateTime.now().toIso8601String()
                 : _objectText(row['log_date'] ?? row['logged_at']),
@@ -305,6 +506,11 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
 
   Future<void> _openEntryForm(_HatchModuleConfig module) async {
     HapticFeedback.lightImpact();
+    if (module.table == 'egg_production') {
+      await _openEggEntryForm(module);
+      return;
+    }
+
     final message = await showModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
@@ -313,6 +519,8 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       builder: (context) {
         return _ModuleEntrySheet(
           module: module,
+          localDatabase: widget.localDatabase,
+          currentUser: widget.currentUser,
           onSubmit: (payload) => _insertRow(module, module.toRow(payload)),
         );
       },
@@ -327,26 +535,130 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
     );
   }
 
-  Future<void> _signOut() async {
-    HapticFeedback.lightImpact();
-    await widget.onSignOut();
-  }
+  Future<void> _openEggEntryForm(_HatchModuleConfig module) async {
+    final batchRows = await widget.localDatabase.rawLocalQuery(
+      '''
+      select id, batch_name, breed_type, current_count, house_id
+      from batches
+      where farm_id = ?
+        and is_deleted = 0
+        and lower(coalesce(status, '')) = 'active'
+        and upper(coalesce(type, '')) = 'POULTRY_LAYER'
+      order by batch_name asc
+      ''',
+      [widget.currentUser.activeFarmId],
+    );
+    final batches = batchRows
+        .map(
+          (row) => BatchSummary(
+            id: row['id']?.toString() ?? '',
+            batchLabel: row['batch_name']?.toString() ?? 'Layer batch',
+            livestockType: row['breed_type']?.toString() ?? 'POULTRY_LAYER',
+            currentCount: int.tryParse(row['current_count']?.toString() ?? '') ?? 0,
+            houseId: row['house_id']?.toString() ?? '',
+          ),
+        )
+        .where((batch) => batch.id.isNotEmpty)
+        .toList();
 
-  Future<void> _openExecutive() async {
-    HapticFeedback.lightImpact();
-    await Navigator.of(context).maybePop();
     if (!mounted) {
       return;
     }
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (context) => ExecutiveDashboardScreen(
-          currentUser: widget.currentUser,
-          permissions: widget.permissions,
-          executiveMetricsService: _executiveMetricsService,
+
+    if (batches.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No active layer batches are available.'),
+          behavior: SnackBarBehavior.floating,
         ),
-      ),
+      );
+      return;
+    }
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: 0.68,
+          minChildSize: 0.44,
+          maxChildSize: 0.9,
+          builder: (context, scrollController) {
+            return Material(
+              color: const Color(0xfff8faf7),
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(18)),
+              child: SafeArea(
+                top: false,
+                child: ListView(
+                  controller: scrollController,
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
+                  children: [
+                    Row(
+                      children: [
+                        Icon(module.icon, color: module.color),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            module.title,
+                            style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 0,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Close',
+                          onPressed: () => Navigator.of(context).pop(),
+                          icon: const Icon(Icons.close),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    QuickAddBatchGrid(
+                      batches: batches,
+                      accentColor: module.color,
+                      icon: module.icon,
+                      emptyMessage: 'No active layer batches found.',
+                      onTapAdd: (batch) async {
+                        Navigator.of(context).pop();
+                        final saved = await showModalBottomSheet<bool>(
+                          context: this.context,
+                          isScrollControlled: true,
+                          useSafeArea: true,
+                          backgroundColor: Colors.transparent,
+                          builder: (context) => EggQuickAddSheet(
+                            currentUser: widget.currentUser,
+                            batch: batch,
+                            inputSink: widget.inputSink,
+                          ),
+                        );
+                        if (!mounted || saved != true) {
+                          return;
+                        }
+                        ScaffoldMessenger.of(this.context).showSnackBar(
+                          SnackBar(
+                            content: Text(module.successMessage),
+                            behavior: SnackBarBehavior.floating,
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
     );
+  }
+
+  Future<void> _signOut() async {
+    HapticFeedback.lightImpact();
+    await widget.onSignOut();
   }
 
   Future<void> _openInventoryHub() async {
@@ -360,6 +672,23 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         builder: (context) => InventoryListScreen(
           currentUser: widget.currentUser,
           inventoryRepository: _inventoryRepository,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openHealthHub() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => HealthScreen(
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+          canEdit: widget.permissions.canEditHealth,
         ),
       ),
     );
@@ -381,6 +710,23 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
     );
   }
 
+  Future<void> _openBatchCompare() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => BatchCompareScreen(
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+          permissions: widget.permissions,
+        ),
+      ),
+    );
+  }
+
   Future<void> _openClimate() async {
     HapticFeedback.lightImpact();
     await Navigator.of(context).maybePop();
@@ -392,6 +738,7 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         builder: (context) => ClimateControlScreen(
           currentUser: widget.currentUser,
           localDatabase: widget.localDatabase,
+          canEdit: widget.permissions.canEditHouses,
         ),
       ),
     );
@@ -408,6 +755,7 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         builder: (context) => FarmReportScreen(
           currentUser: widget.currentUser,
           localDatabase: widget.localDatabase,
+          permissions: widget.permissions,
         ),
       ),
     );
@@ -429,6 +777,50 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
     );
   }
 
+  Future<void> _openSettings() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => SettingsHubScreen(
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+          onOpenProfile: _openProfile,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openProfile() async {
+    HapticFeedback.lightImpact();
+    await Navigator.of(context).maybePop();
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => ProfileScreen(
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _refreshDashboard() async {
+    HapticFeedback.lightImpact();
+    setState(() {
+      _permissions = widget.permissions.toMap();
+      _visibleModules = _buildFencedModules(_modules, _permissions);
+      _streams = _buildStreams(_visibleModules);
+      _selectedIndex = _clampedIndex(_selectedIndex, _visibleModules);
+    });
+    await _loadBatchNameCache();
+    final refresh = widget.onRefreshFromCloud;
+    if (refresh != null) {
+      await refresh();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final module = _visibleModules[_selectedIndex];
@@ -448,9 +840,14 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         onOpenAnalytics: () {
           _openAnalytics();
         },
-        onOpenExecutive: _showExecutiveDashboard ? _openExecutive : null,
+        onOpenBatchCompare: widget.permissions.canViewBatches
+            ? _openBatchCompare
+            : null,
         onOpenInventoryHub: widget.permissions.canViewInventory
             ? _openInventoryHub
+            : null,
+        onOpenHealthHub: widget.permissions.canViewHealth
+            ? _openHealthHub
             : null,
         onOpenClimate: widget.permissions.canViewHouses ? _openClimate : null,
         onOpenFarmReport: widget.permissions.canViewFinance
@@ -461,6 +858,12 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
                 widget.currentUser.role == UserRole.manager
             ? _openTrash
             : null,
+        onOpenSettings:
+            widget.currentUser.role == UserRole.owner ||
+                widget.currentUser.role == UserRole.manager
+            ? _openSettings
+            : null,
+        onOpenProfile: _openProfile,
         onSignOut: _signOut,
       ),
       appBar: AppBar(
@@ -470,15 +873,7 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
         actions: [
           IconButton(
             tooltip: 'Refresh streams',
-            onPressed: () {
-              HapticFeedback.lightImpact();
-              setState(() {
-                _permissions = widget.permissions.toMap();
-                _visibleModules = _buildFencedModules(_modules, _permissions);
-                _streams = _buildStreams(_visibleModules);
-                _selectedIndex = _clampedIndex(_selectedIndex, _visibleModules);
-              });
-            },
+            onPressed: _refreshDashboard,
             icon: const Icon(Icons.sync),
           ),
           IconButton(
@@ -517,6 +912,7 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       floatingActionButton:
           module.isDashboard ||
               module.isPermissionAdmin ||
+              module.isLivestockHub ||
               !canEditSelectedModule
           ? null
           : FloatingActionButton.extended(
@@ -530,15 +926,18 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
             if (widget.showSoftLockBanner) const SoftLockBanner(),
             Expanded(
               child: module.isDashboard
-                  ? FarmDashboardHomeView(
-                      supabase: _supabase,
-                      activeFarmId: _supabase == null
-                          ? widget.currentUser.activeFarmId
-                          : _activeFarmId(_supabase!),
+                  ? MobileDashboardHost(
+                      localDatabase: widget.localDatabase,
+                      dashboardStatsService: _dashboardStatsService,
+                      executiveMetricsService: _executiveMetricsService,
+                      permissions: widget.permissions,
+                      activeFarmId: _dashboardFarmId(),
+                      activeFarmNameFallback: widget.currentUser.activeFarmName,
                       displayName: widget.currentUser.displayName,
                       role: widget.currentUser.role,
                       permissionError: _permissionError,
                       permissionsLoading: _permissionsLoading,
+                      onRefreshFromCloud: widget.onRefreshFromCloud,
                     )
                   : module.isPermissionAdmin
                   ? _OwnerPermissionsControlPanel(
@@ -548,10 +947,22 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
                           : _activeFarmId(_supabase!),
                       currentUser: widget.currentUser,
                     )
+                  : module.isLivestockHub
+                  ? LivestockHubScreen(
+                      currentUser: widget.currentUser,
+                      permissions: widget.permissions,
+                      localDatabase: widget.localDatabase,
+                      remoteApi: widget.remoteApi,
+                      onRefreshFromCloud: widget.onRefreshFromCloud,
+                      inputSink: widget.inputSink,
+                      localSalesQueue: widget.localSalesQueue,
+                      pdfInvoiceService: widget.pdfInvoiceService,
+                    )
                   : _ModuleDataView(
                       key: ValueKey(module.table),
                       module: module,
                       stream: _streams[module.table]!,
+                      onRefresh: widget.onRefreshFromCloud,
                     ),
             ),
           ],
@@ -634,1008 +1045,6 @@ String _newTextId(String prefix) {
   return '${prefix}_${DateTime.now().microsecondsSinceEpoch}_$suffix';
 }
 
-class FarmDashboardHomeView extends StatelessWidget {
-  const FarmDashboardHomeView({
-    super.key,
-    required this.supabase,
-    required this.activeFarmId,
-    required this.displayName,
-    required this.role,
-    required this.permissionsLoading,
-    this.permissionError,
-  });
-
-  final SupabaseClient? supabase;
-  final String activeFarmId;
-  final String displayName;
-  final UserRole role;
-  final bool permissionsLoading;
-  final Object? permissionError;
-
-  @override
-  Widget build(BuildContext context) {
-    if (role == UserRole.worker) {
-      return _WorkerDashboardHomeView(
-        supabase: supabase,
-        activeFarmId: activeFarmId,
-        displayName: displayName,
-        permissionsLoading: permissionsLoading,
-        permissionError: permissionError,
-      );
-    }
-    if (role == UserRole.accountant) {
-      return _AccountantDashboardHomeView(
-        supabase: supabase,
-        activeFarmId: activeFarmId,
-        displayName: displayName,
-        permissionsLoading: permissionsLoading,
-        permissionError: permissionError,
-      );
-    }
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 104),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _DashboardWelcomeBanner(
-            displayName: displayName,
-            activeFarmId: activeFarmId,
-          ),
-          _PermissionStatusBanner(
-            isLoading: permissionsLoading,
-            error: permissionError,
-          ),
-          const SizedBox(height: 18),
-          Text(
-            'Operational Pulse',
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-              color: _UniversalColors.ink,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0,
-            ),
-          ),
-          const SizedBox(height: 12),
-          GridView.count(
-            crossAxisCount: 2,
-            crossAxisSpacing: 12,
-            mainAxisSpacing: 12,
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            childAspectRatio: 1.08,
-            children: [
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'batches',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'createdAt',
-                ),
-                builder: (context, snapshot) {
-                  final rows = snapshot.data ?? const <Map<String, dynamic>>[];
-                  final activeRows = rows
-                      .where(
-                        (row) =>
-                            _text(row, const [
-                              'status',
-                            ], 'active').toLowerCase() !=
-                            'closed',
-                      )
-                      .toList(growable: false);
-                  final totalBirds = _sumInt(activeRows, const [
-                    'currentCount',
-                    'current_count',
-                  ]);
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.groups_3_outlined,
-                    color: const Color(0xff1f7a4d),
-                    metric: '$totalBirds',
-                    label: 'Active Layers/Broilers',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'houses',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'createdAt',
-                ),
-                builder: (context, snapshot) {
-                  final rows = snapshot.data ?? const <Map<String, dynamic>>[];
-                  final activeCount = rows
-                      .where(
-                        (row) =>
-                            _text(row, const [
-                              'status',
-                            ], 'active').toLowerCase() !=
-                            'inactive',
-                      )
-                      .length;
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.home_work_outlined,
-                    color: const Color(0xff2f5f8f),
-                    metric: '$activeCount / ${rows.length}',
-                    label: 'Houses Active',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'egg_production',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'logDate',
-                ),
-                builder: (context, snapshot) {
-                  final todayRows =
-                      (snapshot.data ?? const <Map<String, dynamic>>[])
-                          .where(
-                            (row) => _isToday(
-                              _first(row, const ['logDate', 'collection_date']),
-                            ),
-                          )
-                          .toList(growable: false);
-                  final crates = _sumDouble(todayRows, const [
-                    'cratesCollected',
-                    'crates_collected',
-                  ]);
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.egg_alt_outlined,
-                    color: const Color(0xffc7851f),
-                    metric: crates.toStringAsFixed(1),
-                    label: 'Crates Yielded Today',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'inventory',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'createdAt',
-                ),
-                builder: (context, snapshot) {
-                  final rows = snapshot.data ?? const <Map<String, dynamic>>[];
-                  final feedRows = rows
-                      .where((row) {
-                        final category = _text(row, const [
-                          'category',
-                        ]).toLowerCase();
-                        final unit = _text(row, const ['unit']).toLowerCase();
-                        final item = _text(row, const [
-                          'itemName',
-                          'item_name',
-                        ]).toLowerCase();
-                        return category.contains('feed') ||
-                            unit.contains('sack') ||
-                            item.contains('feed');
-                      })
-                      .toList(growable: false);
-                  final source = feedRows.isEmpty ? rows : feedRows;
-                  final sacks = _sumDouble(source, const [
-                    'stockLevel',
-                    'stock_level',
-                  ]);
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.inventory_2_outlined,
-                    color: const Color(0xff7a5c1f),
-                    metric: sacks.toStringAsFixed(1),
-                    label: 'Sacks Left',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'financial_transactions',
-                  farmColumn: 'farm_id',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'transaction_date',
-                  equals: const {'type': 'sale'},
-                ),
-                builder: (context, snapshot) {
-                  final salesRows =
-                      (snapshot.data ?? const <Map<String, dynamic>>[])
-                          .where(_includeRevenueTransaction)
-                          .where(
-                            (row) => _isToday(
-                              _first(row, const [
-                                'transaction_date',
-                                'created_at',
-                              ]),
-                            ),
-                          )
-                          .toList(growable: false);
-                  final sales = _sumDouble(salesRows, const ['amount']);
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.point_of_sale_outlined,
-                    color: const Color(0xff16845c),
-                    metric: _money(sales),
-                    label: 'Formulated Today',
-                  );
-                },
-              ),
-            ],
-          ),
-          const SizedBox(height: 22),
-          Text(
-            'Recent Activity',
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-              color: _UniversalColors.ink,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0,
-            ),
-          ),
-          const SizedBox(height: 12),
-          _DashboardActivityStream(
-            title: 'Egg Production',
-            icon: Icons.egg_alt_outlined,
-            color: const Color(0xffc7851f),
-            stream: _dashboardStream(
-              supabase,
-              table: 'egg_production',
-              farmColumn: 'farmId',
-              activeFarmId: activeFarmId,
-              orderBy: 'logDate',
-              limit: 5,
-            ),
-            titleFor: (row) =>
-                '${_double(row, const ['cratesCollected', 'crates_collected']).toStringAsFixed(1)} crates',
-            subtitleFor: (row) =>
-                _dateText(_first(row, const ['logDate', 'createdAt'])),
-          ),
-          const SizedBox(height: 10),
-          _DashboardActivityStream(
-            title: 'Feed Logs',
-            icon: Icons.inventory_2_outlined,
-            color: const Color(0xff7a5c1f),
-            stream: _dashboardStream(
-              supabase,
-              table: 'daily_feeding_logs',
-              farmColumn: 'farmId',
-              activeFarmId: activeFarmId,
-              orderBy: 'log_date',
-              limit: 5,
-            ),
-            titleFor: (row) =>
-                '${_double(row, const ['amount_consumed']).toStringAsFixed(1)} sacks used',
-            subtitleFor: (row) => _dateText(row['log_date']),
-          ),
-          const SizedBox(height: 10),
-          _DashboardActivityStream(
-            title: 'Financial Sales',
-            icon: Icons.receipt_long_outlined,
-            color: const Color(0xff16845c),
-            stream:
-                _dashboardStream(
-                  supabase,
-                  table: 'financial_transactions',
-                  farmColumn: 'farm_id',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'transaction_date',
-                  limit: 5,
-                  equals: const {'type': 'sale'},
-                ).map(
-                  (rows) => rows
-                      .where(_includeRevenueTransaction)
-                      .toList(growable: false),
-                ),
-            titleFor: (row) => _money(_double(row, const ['amount'])),
-            subtitleFor: (row) =>
-                _text(row, const ['description'], 'Sales ledger entry'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _WorkerDashboardHomeView extends StatelessWidget {
-  const _WorkerDashboardHomeView({
-    required this.supabase,
-    required this.activeFarmId,
-    required this.displayName,
-    required this.permissionsLoading,
-    this.permissionError,
-  });
-
-  final SupabaseClient? supabase;
-  final String activeFarmId;
-  final String displayName;
-  final bool permissionsLoading;
-  final Object? permissionError;
-
-  @override
-  Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 104),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _DashboardWelcomeBanner(
-            displayName: displayName,
-            activeFarmId: activeFarmId,
-          ),
-          _PermissionStatusBanner(
-            isLoading: permissionsLoading,
-            error: permissionError,
-          ),
-          const SizedBox(height: 18),
-          Text(
-            'Daily Operations',
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-              color: _UniversalColors.ink,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0,
-            ),
-          ),
-          const SizedBox(height: 12),
-          GridView.count(
-            crossAxisCount: 2,
-            crossAxisSpacing: 12,
-            mainAxisSpacing: 12,
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            childAspectRatio: 1.08,
-            children: [
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'egg_production',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'logDate',
-                ),
-                builder: (context, snapshot) {
-                  final todayRows =
-                      (snapshot.data ?? const <Map<String, dynamic>>[])
-                          .where(
-                            (row) => _isToday(
-                              _first(row, const ['logDate', 'createdAt']),
-                            ),
-                          )
-                          .toList(growable: false);
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.egg_alt_outlined,
-                    color: const Color(0xffc7851f),
-                    metric:
-                        '${_sumInt(todayRows, const ['eggsCollected', 'eggs_collected'])}',
-                    label: 'Eggs Collected Today',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'daily_feeding_logs',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'log_date',
-                ),
-                builder: (context, snapshot) {
-                  final todayRows =
-                      (snapshot.data ?? const <Map<String, dynamic>>[])
-                          .where((row) => _isToday(row['log_date']))
-                          .toList(growable: false);
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.inventory_2_outlined,
-                    color: const Color(0xff7a5c1f),
-                    metric: _sumDouble(todayRows, const [
-                      'amount_consumed',
-                      'sacks_used',
-                    ]).toStringAsFixed(1),
-                    label: 'Feed Sacks Used',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'mortality',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'logDate',
-                ),
-                builder: (context, snapshot) {
-                  final todayRows =
-                      (snapshot.data ?? const <Map<String, dynamic>>[])
-                          .where(_includeDeadMortality)
-                          .where(
-                            (row) => _isToday(
-                              _first(row, const ['logDate', 'createdAt']),
-                            ),
-                          )
-                          .toList(growable: false);
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.warning_amber_rounded,
-                    color: const Color(0xffb83b3b),
-                    metric: '${_sumInt(todayRows, const ['count'])}',
-                    label: 'Mortality Logged',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'houses',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'createdAt',
-                ),
-                builder: (context, snapshot) {
-                  final rows = snapshot.data ?? const <Map<String, dynamic>>[];
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.home_work_outlined,
-                    color: const Color(0xff2f5f8f),
-                    metric: '${rows.length}',
-                    label: 'House Checks Open',
-                  );
-                },
-              ),
-            ],
-          ),
-          const SizedBox(height: 22),
-          Text(
-            'Action Tracks',
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-              color: _UniversalColors.ink,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0,
-            ),
-          ),
-          const SizedBox(height: 12),
-          _DashboardActivityStream(
-            title: 'Egg Collection Schedule',
-            icon: Icons.egg_alt_outlined,
-            color: const Color(0xffc7851f),
-            stream: _dashboardStream(
-              supabase,
-              table: 'egg_production',
-              farmColumn: 'farmId',
-              activeFarmId: activeFarmId,
-              orderBy: 'logDate',
-              limit: 5,
-            ),
-            titleFor: (row) =>
-                '${_int(row, const ['eggsCollected', 'eggs_collected'])} eggs',
-            subtitleFor: (row) => _dateText(row['logDate']),
-          ),
-          const SizedBox(height: 10),
-          _DashboardActivityStream(
-            title: 'Feed Bucket Usage',
-            icon: Icons.inventory_2_outlined,
-            color: const Color(0xff7a5c1f),
-            stream: _dashboardStream(
-              supabase,
-              table: 'daily_feeding_logs',
-              farmColumn: 'farmId',
-              activeFarmId: activeFarmId,
-              orderBy: 'log_date',
-              limit: 5,
-            ),
-            titleFor: (row) =>
-                '${_double(row, const ['amount_consumed']).toStringAsFixed(1)} sacks',
-            subtitleFor: (row) => _dateText(row['log_date']),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _AccountantDashboardHomeView extends StatelessWidget {
-  const _AccountantDashboardHomeView({
-    required this.supabase,
-    required this.activeFarmId,
-    required this.displayName,
-    required this.permissionsLoading,
-    this.permissionError,
-  });
-
-  final SupabaseClient? supabase;
-  final String activeFarmId;
-  final String displayName;
-  final bool permissionsLoading;
-  final Object? permissionError;
-
-  @override
-  Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 104),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _DashboardWelcomeBanner(
-            displayName: displayName,
-            activeFarmId: activeFarmId,
-          ),
-          _PermissionStatusBanner(
-            isLoading: permissionsLoading,
-            error: permissionError,
-          ),
-          const SizedBox(height: 18),
-          Text(
-            'Financial Overview',
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-              color: _UniversalColors.ink,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0,
-            ),
-          ),
-          const SizedBox(height: 12),
-          GridView.count(
-            crossAxisCount: 2,
-            crossAxisSpacing: 12,
-            mainAxisSpacing: 12,
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            childAspectRatio: 1.08,
-            children: [
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'financial_transactions',
-                  farmColumn: 'farm_id',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'transaction_date',
-                  equals: const {'type': 'sale'},
-                ),
-                builder: (context, snapshot) {
-                  final todayRows =
-                      (snapshot.data ?? const <Map<String, dynamic>>[])
-                          .where(_includeRevenueTransaction)
-                          .where((row) => _isToday(row['transaction_date']))
-                          .toList(growable: false);
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.point_of_sale_outlined,
-                    color: const Color(0xff16845c),
-                    metric: _money(_sumDouble(todayRows, const ['amount'])),
-                    label: 'Sales Ledger Today',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'customers',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'createdAt',
-                ),
-                builder: (context, snapshot) {
-                  final rows = snapshot.data ?? const <Map<String, dynamic>>[];
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.credit_score_outlined,
-                    color: const Color(0xff6a4c93),
-                    metric: _money(
-                      _sumDouble(rows, const ['balanceOwed', 'balance_owed']),
-                    ),
-                    label: 'Customer Credit',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'suppliers',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'createdAt',
-                ),
-                builder: (context, snapshot) {
-                  final rows = snapshot.data ?? const <Map<String, dynamic>>[];
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.local_shipping_outlined,
-                    color: const Color(0xff4d6475),
-                    metric: _money(
-                      _sumDouble(rows, const ['balanceOwed', 'balance_owed']),
-                    ),
-                    label: 'Supplier Payables',
-                  );
-                },
-              ),
-              StreamBuilder<List<Map<String, dynamic>>>(
-                stream: _dashboardStream(
-                  supabase,
-                  table: 'expenses',
-                  farmColumn: 'farmId',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'expense_date',
-                ),
-                builder: (context, snapshot) {
-                  final rows = snapshot.data ?? const <Map<String, dynamic>>[];
-                  return _DashboardKpiCard(
-                    isLoading: _isLoading(snapshot),
-                    error: snapshot.error,
-                    icon: Icons.account_balance_wallet_outlined,
-                    color: const Color(0xff27364a),
-                    metric: _money(_sumDouble(rows, const ['amount'])),
-                    label: 'Operating Costs',
-                  );
-                },
-              ),
-            ],
-          ),
-          const SizedBox(height: 22),
-          Text(
-            'Transaction Logs',
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-              color: _UniversalColors.ink,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0,
-            ),
-          ),
-          const SizedBox(height: 12),
-          _DashboardActivityStream(
-            title: 'Sales Ledgers',
-            icon: Icons.receipt_long_outlined,
-            color: const Color(0xff16845c),
-            stream:
-                _dashboardStream(
-                  supabase,
-                  table: 'financial_transactions',
-                  farmColumn: 'farm_id',
-                  activeFarmId: activeFarmId,
-                  orderBy: 'transaction_date',
-                  limit: 5,
-                  equals: const {'type': 'sale'},
-                ).map(
-                  (rows) => rows
-                      .where(_includeRevenueTransaction)
-                      .toList(growable: false),
-                ),
-            titleFor: (row) => _money(_double(row, const ['amount'])),
-            subtitleFor: (row) =>
-                _text(row, const ['description'], 'Sales ledger entry'),
-          ),
-          const SizedBox(height: 10),
-          _DashboardActivityStream(
-            title: 'Expense Register',
-            icon: Icons.account_balance_wallet_outlined,
-            color: const Color(0xff27364a),
-            stream: _dashboardStream(
-              supabase,
-              table: 'expenses',
-              farmColumn: 'farmId',
-              activeFarmId: activeFarmId,
-              orderBy: 'expense_date',
-              limit: 5,
-            ),
-            titleFor: (row) => _money(_double(row, const ['amount'])),
-            subtitleFor: (row) =>
-                _text(row, const ['description', 'category'], 'Expense'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _PermissionStatusBanner extends StatelessWidget {
-  const _PermissionStatusBanner({required this.isLoading, this.error});
-
-  final bool isLoading;
-  final Object? error;
-
-  @override
-  Widget build(BuildContext context) {
-    if (!isLoading && error == null) {
-      return const SizedBox.shrink();
-    }
-
-    final hasError = error != null;
-    return Padding(
-      padding: const EdgeInsets.only(top: 12),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: hasError ? const Color(0xfffff4f4) : const Color(0xffeef6ff),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: hasError ? const Color(0xffffcccc) : const Color(0xffcfe6ff),
-          ),
-        ),
-        child: Text(
-          hasError
-              ? 'Data Sync Interrupted: $error'
-              : 'Loading permission matrix...',
-          style: TextStyle(
-            color: hasError ? const Color(0xff9f2626) : const Color(0xff25527a),
-            fontWeight: FontWeight.w800,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _DashboardWelcomeBanner extends StatelessWidget {
-  const _DashboardWelcomeBanner({
-    required this.displayName,
-    required this.activeFarmId,
-  });
-
-  final String displayName;
-  final String activeFarmId;
-
-  @override
-  Widget build(BuildContext context) {
-    final name = displayName.trim().isEmpty ? 'HatchLog User' : displayName;
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: _UniversalColors.ink,
-        borderRadius: BorderRadius.circular(8),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x1a546570),
-            blurRadius: 22,
-            offset: Offset(0, 12),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Icon(
-            Icons.monitor_heart_outlined,
-            color: Colors.white,
-            size: 32,
-          ),
-          const SizedBox(height: 12),
-          Text(
-            'Hello, $name',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-              color: Colors.white,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0,
-            ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            activeFarmId.isEmpty
-                ? 'Active Farm Monitor'
-                : 'Active Farm Monitor - $activeFarmId',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: Colors.white70,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _DashboardKpiCard extends StatelessWidget {
-  const _DashboardKpiCard({
-    required this.isLoading,
-    required this.icon,
-    required this.color,
-    required this.metric,
-    required this.label,
-    this.error,
-  });
-
-  final bool isLoading;
-  final IconData icon;
-  final Color color;
-  final String metric;
-  final String label;
-  final Object? error;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      elevation: 0,
-      clipBehavior: Clip.antiAlias,
-      color: color.withValues(alpha: 0.1),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8),
-        side: BorderSide(color: color.withValues(alpha: 0.18)),
-      ),
-      child: InkWell(
-        onTap: () {
-          HapticFeedback.selectionClick();
-          showHatchLogDetailsPopup(context, {
-            'metric': metric,
-            'label': label,
-            'isLoading': isLoading,
-            if (error != null) 'error': error.toString(),
-          }, '$label Details');
-        },
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, color: color, size: 32),
-              const SizedBox(height: 10),
-              if (error != null)
-                const Icon(Icons.sync_problem_outlined, color: Colors.redAccent)
-              else if (isLoading)
-                SizedBox.square(
-                  dimension: 24,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: color,
-                  ),
-                )
-              else
-                FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: Text(
-                    metric,
-                    maxLines: 1,
-                    style: const TextStyle(
-                      color: _UniversalColors.ink,
-                      fontSize: 24,
-                      fontWeight: FontWeight.w900,
-                    ),
-                  ),
-                ),
-              const SizedBox(height: 7),
-              Text(
-                error == null ? label : 'Data Sync Interrupted',
-                textAlign: TextAlign.center,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: _UniversalColors.muted,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _DashboardActivityStream extends StatelessWidget {
-  const _DashboardActivityStream({
-    required this.title,
-    required this.icon,
-    required this.color,
-    required this.stream,
-    required this.titleFor,
-    required this.subtitleFor,
-  });
-
-  final String title;
-  final IconData icon;
-  final Color color;
-  final Stream<List<Map<String, dynamic>>> stream;
-  final String Function(Map<String, dynamic> row) titleFor;
-  final String Function(Map<String, dynamic> row) subtitleFor;
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: stream,
-      builder: (context, snapshot) {
-        final rows = (snapshot.data ?? const <Map<String, dynamic>>[])
-            .take(5)
-            .toList(growable: false);
-        return Container(
-          decoration: _panelDecoration(),
-          child: Column(
-            children: [
-              ListTile(
-                leading: CircleAvatar(
-                  backgroundColor: color.withValues(alpha: 0.12),
-                  foregroundColor: color,
-                  child: Icon(icon),
-                ),
-                title: Text(
-                  title,
-                  style: const TextStyle(fontWeight: FontWeight.w900),
-                ),
-                subtitle: Text(
-                  snapshot.hasError
-                      ? 'Unable to load this activity stream.'
-                      : '${rows.length} recent entries',
-                ),
-              ),
-              if (_isLoading(snapshot))
-                const Padding(
-                  padding: EdgeInsets.all(16),
-                  child: LinearProgressIndicator(),
-                )
-              else if (rows.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
-                  child: Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      'No recent entries for this farm.',
-                      style: TextStyle(
-                        color: _UniversalColors.muted,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                )
-              else
-                for (final row in rows)
-                  ListTile(
-                    dense: true,
-                    title: Text(titleFor(row)),
-                    subtitle: Text(subtitleFor(row)),
-                    trailing: const Icon(Icons.chevron_right),
-                    onTap: () => showHatchLogDetailsPopup(
-                      context,
-                      row,
-                      '$title Details',
-                    ),
-                  ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-Stream<List<Map<String, dynamic>>> _dashboardStream(
-  SupabaseClient? supabase, {
-  required String table,
-  required String farmColumn,
-  required String activeFarmId,
-  required String orderBy,
-  int limit = 100,
-  Map<String, Object> equals = const {},
-}) {
-  if (supabase == null || activeFarmId.isEmpty) {
-    return const Stream<List<Map<String, dynamic>>>.empty();
-  }
-  final stream = supabase
-      .from(table)
-      .stream(primaryKey: ['id'])
-      .eq(farmColumn, activeFarmId)
-      .order(orderBy, ascending: false)
-      .limit(limit);
-  if (equals.isEmpty) {
-    return stream;
-  }
-  return stream.map((rows) => _applyEqualsFilters(rows, equals));
-}
 
 List<Map<String, dynamic>> _applyEqualsFilters(
   List<Map<String, dynamic>> rows,
@@ -1657,20 +1066,6 @@ List<Map<String, dynamic>> _applyEqualsFilters(
 bool _isLoading(AsyncSnapshot<Object?> snapshot) {
   return snapshot.connectionState == ConnectionState.waiting &&
       !snapshot.hasData;
-}
-
-bool _isToday(Object? value) {
-  final parsed = value is DateTime
-      ? value
-      : DateTime.tryParse(value?.toString() ?? '');
-  if (parsed == null) {
-    return false;
-  }
-  final now = DateTime.now();
-  final local = parsed.toLocal();
-  return local.year == now.year &&
-      local.month == now.month &&
-      local.day == now.day;
 }
 
 class _OwnerPermissionsControlPanel extends StatefulWidget {
@@ -1744,102 +1139,155 @@ class _OwnerPermissionsControlPanelState
           return const Center(child: CircularProgressIndicator());
         }
 
-        final members = (membersSnapshot.data ?? const <Map<String, dynamic>>[])
-            .map(_TeamMemberVm.fromRow)
-            .where((member) {
-              if (member.userId == widget.currentUser.id) return false;
-              final q = _query.trim().toLowerCase();
-              return q.isEmpty || member.searchText.contains(q);
-            })
+        final memberRows = membersSnapshot.data ?? const <Map<String, dynamic>>[];
+        final memberIds = memberRows
+            .map((row) => _text(row, const ['userId', 'user_id']))
+            .where((id) => id.isNotEmpty)
             .toList(growable: false);
-        final selected = _firstWhereOrNull(
-          members,
-          (member) => member.userId == _selectedUserId,
-        );
-        final effectiveSelected =
-            selected ?? (members.isEmpty ? null : members.first);
-        _selectedUserId = effectiveSelected?.userId;
 
-        return StreamBuilder<List<Map<String, dynamic>>>(
-          stream: supabase
-              .from('user_permissions')
-              .stream(primaryKey: ['id'])
-              .eq('farm_id', widget.activeFarmId),
-          builder: (context, permissionSnapshot) {
-            if (permissionSnapshot.hasError) {
-              return Center(
-                child: _StatePanel(
-                  icon: Icons.sync_problem_outlined,
-                  title: 'Data Sync Interrupted',
-                  message: permissionSnapshot.error.toString(),
-                ),
-              );
-            }
-
-            final permissionRows =
-                permissionSnapshot.data ?? const <Map<String, dynamic>>[];
-            final selectedPermissions = _firstWhereOrNull(
-              permissionRows,
-              (row) =>
-                  _text(row, const ['user_id']) ==
-                  (effectiveSelected?.userId ?? ''),
+        return FutureBuilder<Map<String, String>>(
+          future: _loadMemberDisplayNames(supabase, memberIds),
+          builder: (context, namesSnapshot) {
+            final displayNames = namesSnapshot.data ?? const {};
+            final members = memberRows
+                .map((row) => _TeamMemberVm.fromRow(row, displayNames: displayNames))
+                .where((member) {
+                  if (member.userId == widget.currentUser.id) return false;
+                  final q = _query.trim().toLowerCase();
+                  return q.isEmpty || member.searchText.contains(q);
+                })
+                .toList(growable: false);
+            final selected = _firstWhereOrNull(
+              members,
+              (member) => member.userId == _selectedUserId,
             );
+            final effectiveSelected =
+                selected ?? (members.isEmpty ? null : members.first);
+            _selectedUserId = effectiveSelected?.userId;
 
-            return ListView(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 104),
-              children: [
-                _PermissionsHeader(
-                  searchController: _searchController,
-                  onSearchChanged: (value) => setState(() => _query = value),
-                ),
-                const SizedBox(height: 14),
-                if (members.isEmpty)
-                  const _StatePanel(
-                    icon: Icons.people_outline,
-                    title: 'No operators found',
-                    message:
-                        'Invite workers, accountants, or managers before assigning access rights.',
-                  )
-                else ...[
-                  SizedBox(
-                    height: 92,
-                    child: ListView.separated(
-                      scrollDirection: Axis.horizontal,
-                      itemCount: members.length,
-                      separatorBuilder: (context, index) =>
-                          const SizedBox(width: 10),
-                      itemBuilder: (context, index) {
-                        final member = members[index];
-                        return _OperatorChip(
-                          member: member,
-                          selected: member.userId == _selectedUserId,
-                          onTap: () {
-                            HapticFeedback.selectionClick();
-                            setState(() => _selectedUserId = member.userId);
+            return StreamBuilder<List<Map<String, dynamic>>>(
+              stream: supabase
+                  .from('user_permissions')
+                  .stream(primaryKey: ['id'])
+                  .eq('farm_id', widget.activeFarmId),
+              builder: (context, permissionSnapshot) {
+                if (permissionSnapshot.hasError) {
+                  return Center(
+                    child: _StatePanel(
+                      icon: Icons.sync_problem_outlined,
+                      title: 'Data Sync Interrupted',
+                      message: permissionSnapshot.error.toString(),
+                    ),
+                  );
+                }
+
+                final permissionRows =
+                    permissionSnapshot.data ?? const <Map<String, dynamic>>[];
+                final selectedPermissions = _firstWhereOrNull(
+                  permissionRows,
+                  (row) =>
+                      _text(row, const ['user_id']) ==
+                      (effectiveSelected?.userId ?? ''),
+                );
+
+                return ListView(
+                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 104),
+                  children: [
+                    _PermissionsHeader(
+                      searchController: _searchController,
+                      onSearchChanged: (value) => setState(() => _query = value),
+                    ),
+                    const SizedBox(height: 14),
+                    if (members.isEmpty)
+                      const _StatePanel(
+                        icon: Icons.people_outline,
+                        title: 'No operators found',
+                        message:
+                            'Invite workers, accountants, or managers before assigning access rights.',
+                      )
+                    else ...[
+                      SizedBox(
+                        height: 92,
+                        child: ListView.separated(
+                          scrollDirection: Axis.horizontal,
+                          itemCount: members.length,
+                          separatorBuilder: (context, index) =>
+                              const SizedBox(width: 10),
+                          itemBuilder: (context, index) {
+                            final member = members[index];
+                            return _OperatorChip(
+                              member: member,
+                              selected: member.userId == _selectedUserId,
+                              onTap: () {
+                                HapticFeedback.selectionClick();
+                                setState(() => _selectedUserId = member.userId);
+                              },
+                            );
                           },
-                        );
-                      },
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  _PermissionMatrixCard(
-                    member: effectiveSelected!,
-                    permissions: selectedPermissions,
-                    saving: _saving || _isLoading(permissionSnapshot),
-                    onChanged: (column, value) => _updateOperatorPermission(
-                      effectiveSelected.userId,
-                      column,
-                      value,
-                      selectedPermissions,
-                    ),
-                  ),
-                ],
-              ],
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      _PermissionMatrixCard(
+                        member: effectiveSelected!,
+                        permissions: selectedPermissions,
+                        saving: _saving || _isLoading(permissionSnapshot),
+                        onChanged: (column, value) => _updateOperatorPermission(
+                          effectiveSelected.userId,
+                          column,
+                          value,
+                          selectedPermissions,
+                        ),
+                      ),
+                    ],
+                  ],
+                );
+              },
             );
           },
         );
       },
     );
+  }
+
+  Future<Map<String, String>> _loadMemberDisplayNames(
+    SupabaseClient supabase,
+    List<String> userIds,
+  ) async {
+    final ids = userIds.map((id) => id.trim()).where((id) => id.isNotEmpty).toSet();
+    if (ids.isEmpty) {
+      return const {};
+    }
+
+    try {
+      final rows = await supabase
+          .from('users')
+          .select('id, firstname, surname, name, phone_number')
+          .inFilter('id', ids.toList());
+      final names = <String, String>{};
+      for (final row in rows) {
+        final userId = _text(row, const ['id']);
+        if (userId.isEmpty) {
+          continue;
+        }
+        final fullName = _text(row, const ['name']).trim();
+        if (fullName.isNotEmpty) {
+          names[userId] = fullName;
+          continue;
+        }
+        final composed =
+            '${_text(row, const ['firstname'])} ${_text(row, const ['surname'])}'
+                .trim();
+        if (composed.isNotEmpty) {
+          names[userId] = composed;
+          continue;
+        }
+        final phone = _text(row, const ['phone_number']).trim();
+        names[userId] = phone.isNotEmpty ? phone : 'Team member';
+      }
+      return names;
+    } on Object {
+      return const {};
+    }
   }
 
   Future<void> _updateOperatorPermission(
@@ -2044,7 +1492,6 @@ class _PermissionMatrixCard extends StatelessWidget {
             SwitchListTile(
               value: _permissionEnabled(permissions?[permission.column]),
               title: Text(permission.label),
-              subtitle: Text(permission.column),
               secondary: Icon(permission.icon),
               onChanged: saving
                   ? null
@@ -2069,13 +1516,17 @@ class _TeamMemberVm {
 
   String get searchText => '$label $roleLabel $userId'.toLowerCase();
 
-  static _TeamMemberVm fromRow(Map<String, dynamic> row) {
+  static _TeamMemberVm fromRow(
+    Map<String, dynamic> row, {
+    Map<String, String> displayNames = const {},
+  }) {
     final userId = _text(row, const ['userId', 'user_id']);
     final role = UserRole.fromString(_text(row, const ['role']));
+    final resolvedName = displayNames[userId]?.trim() ?? '';
     return _TeamMemberVm(
       userId: userId,
       roleLabel: role.label,
-      label: userId.isEmpty ? 'Team member' : 'Operator $userId',
+      label: resolvedName.isNotEmpty ? resolvedName : 'Team member',
     );
   }
 }
@@ -2142,6 +1593,16 @@ const _permissionColumns = [
     Icons.health_and_safety_outlined,
   ),
   _PermissionColumnSpec(
+    'can_view_health',
+    'View Health (Vaccines & Meds)',
+    Icons.vaccines_outlined,
+  ),
+  _PermissionColumnSpec(
+    'can_edit_health',
+    'Edit Health (Vaccines & Meds)',
+    Icons.medical_services_outlined,
+  ),
+  _PermissionColumnSpec(
     'can_view_customers',
     'View Customers',
     Icons.contacts_outlined,
@@ -2158,11 +1619,14 @@ class _UniversalDrawer extends StatelessWidget {
     required this.selectedIndex,
     required this.onSelected,
     required this.onOpenAnalytics,
-    this.onOpenExecutive,
+    this.onOpenBatchCompare,
     this.onOpenInventoryHub,
+    this.onOpenHealthHub,
     this.onOpenClimate,
     this.onOpenFarmReport,
     this.onOpenTrash,
+    this.onOpenSettings,
+    this.onOpenProfile,
     required this.onSignOut,
   });
 
@@ -2171,11 +1635,14 @@ class _UniversalDrawer extends StatelessWidget {
   final int selectedIndex;
   final ValueChanged<int> onSelected;
   final VoidCallback onOpenAnalytics;
-  final VoidCallback? onOpenExecutive;
+  final VoidCallback? onOpenBatchCompare;
   final VoidCallback? onOpenInventoryHub;
+  final VoidCallback? onOpenHealthHub;
   final VoidCallback? onOpenClimate;
   final VoidCallback? onOpenFarmReport;
   final VoidCallback? onOpenTrash;
+  final VoidCallback? onOpenSettings;
+  final VoidCallback? onOpenProfile;
   final VoidCallback onSignOut;
 
   @override
@@ -2239,14 +1706,14 @@ class _UniversalDrawer extends StatelessWidget {
                     ),
                     onTap: onOpenAnalytics,
                   ),
-                  if (onOpenExecutive != null)
+                  if (onOpenBatchCompare != null)
                     ListTile(
-                      leading: const Icon(Icons.insights_outlined),
-                      title: const Text('Executive Summary'),
+                      leading: const Icon(Icons.compare_arrows),
+                      title: const Text('Compare Batches'),
                       subtitle: const Text(
-                        'Premium owner KPIs, priorities, and revenue velocity',
+                        'FCR, mortality, eggs, and finance side-by-side',
                       ),
-                      onTap: onOpenExecutive,
+                      onTap: onOpenBatchCompare,
                     ),
                   if (onOpenInventoryHub != null)
                     ListTile(
@@ -2256,6 +1723,15 @@ class _UniversalDrawer extends StatelessWidget {
                         'In stock, used up, and usage history',
                       ),
                       onTap: onOpenInventoryHub,
+                    ),
+                  if (onOpenHealthHub != null)
+                    ListTile(
+                      leading: const Icon(Icons.vaccines_outlined),
+                      title: const Text('Health Schedules'),
+                      subtitle: const Text(
+                        'Vaccination and medication planning',
+                      ),
+                      onTap: onOpenHealthHub,
                     ),
                   if (onOpenClimate != null)
                     ListTile(
@@ -2279,6 +1755,20 @@ class _UniversalDrawer extends StatelessWidget {
                       title: const Text('Data Recovery'),
                       subtitle: const Text('Restore locally deleted records'),
                       onTap: onOpenTrash,
+                    ),
+                  if (onOpenSettings != null)
+                    ListTile(
+                      leading: const Icon(Icons.settings_outlined),
+                      title: const Text('Farm Settings'),
+                      subtitle: const Text('Farm info, reminders, stock levels'),
+                      onTap: onOpenSettings,
+                    ),
+                  if (onOpenProfile != null)
+                    ListTile(
+                      leading: const Icon(Icons.person_outline),
+                      title: const Text('Profile'),
+                      subtitle: const Text('Personal identity and farm context'),
+                      onTap: onOpenProfile,
                     ),
                   const Divider(height: 1),
                   ListTile(
@@ -2343,20 +1833,31 @@ class _ModuleTabStrip extends StatelessWidget {
   }
 }
 
-class _ModuleDataView extends StatelessWidget {
+class _ModuleDataView extends StatefulWidget {
   const _ModuleDataView({
     super.key,
     required this.module,
     required this.stream,
+    this.onRefresh,
   });
 
   final _HatchModuleConfig module;
   final Stream<List<Map<String, dynamic>>> stream;
+  final Future<void> Function()? onRefresh;
+
+  @override
+  State<_ModuleDataView> createState() => _ModuleDataViewState();
+}
+
+class _ModuleDataViewState extends State<_ModuleDataView> {
+  String _eggStockFilter = 'active';
+
+  bool get _isEggModule => widget.module.table == 'egg_production';
 
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: stream,
+      stream: widget.stream,
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting &&
             !snapshot.hasData) {
@@ -2366,35 +1867,77 @@ class _ModuleDataView extends StatelessWidget {
         if (snapshot.hasError) {
           return _StatePanel(
             icon: Icons.error_outline,
-            title: '${module.title} stream failed',
+            title: '${widget.module.title} stream failed',
             message: snapshot.error.toString(),
           );
         }
 
         final rows = (snapshot.data ?? const <Map<String, dynamic>>[])
-            .where(module.includeRow)
+            .where(widget.module.includeRow)
             .toList(growable: false);
+        final displayRows = _isEggModule
+            ? rows
+                  .where((row) => matchesEggStockFilter(row, _eggStockFilter))
+                  .toList(growable: false)
+            : rows;
 
         return RefreshIndicator(
           onRefresh: () async {
+            final refresh = widget.onRefresh;
+            if (refresh != null) {
+              await refresh();
+              return;
+            }
             await Future<void>.delayed(const Duration(milliseconds: 300));
           },
           child: ListView(
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 104),
             children: [
-              _SummaryCard(module: module, rows: rows),
+              _SummaryCard(module: widget.module, rows: displayRows),
               const SizedBox(height: 14),
-              if (rows.isEmpty)
+              if (_isEggModule) ...[
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    ChoiceChip(
+                      label: const Text('In stock'),
+                      selected: _eggStockFilter == 'active',
+                      onSelected: (_) {
+                        setState(() => _eggStockFilter = 'active');
+                      },
+                    ),
+                    ChoiceChip(
+                      label: const Text('Sold out'),
+                      selected: _eggStockFilter == 'sold_out',
+                      onSelected: (_) {
+                        setState(() => _eggStockFilter = 'sold_out');
+                      },
+                    ),
+                    ChoiceChip(
+                      label: const Text('All'),
+                      selected: _eggStockFilter == 'all',
+                      onSelected: (_) {
+                        setState(() => _eggStockFilter = 'all');
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+              ],
+              if (displayRows.isEmpty)
                 _StatePanel(
-                  icon: module.icon,
-                  title: 'No ${module.shortLabel.toLowerCase()} records yet',
-                  message: module.emptyText,
+                  icon: widget.module.icon,
+                  title: _isEggModule && rows.isNotEmpty
+                      ? 'No egg logs match this filter'
+                      : 'No ${widget.module.shortLabel.toLowerCase()} records yet',
+                  message: widget.module.emptyText,
                 )
               else
-                for (final row in rows)
+                for (final row in displayRows)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 10),
-                    child: _RecordCard(module: module, row: row),
+                    child: _RecordCard(module: widget.module, row: row),
                   ),
             ],
           ),
@@ -2625,10 +2168,17 @@ class _RecordCard extends StatelessWidget {
 }
 
 class _ModuleEntrySheet extends StatefulWidget {
-  const _ModuleEntrySheet({required this.module, required this.onSubmit});
+  const _ModuleEntrySheet({
+    required this.module,
+    required this.onSubmit,
+    this.localDatabase,
+    this.currentUser,
+  });
 
   final _HatchModuleConfig module;
   final Future<void> Function(Map<String, dynamic> payload) onSubmit;
+  final LocalDatabase? localDatabase;
+  final AppUser? currentUser;
 
   @override
   State<_ModuleEntrySheet> createState() => _ModuleEntrySheetState();
@@ -2640,22 +2190,164 @@ class _ModuleEntrySheetState extends State<_ModuleEntrySheet> {
   final Map<String, String> _dropdownValues = {};
   final Map<String, DateTime> _dateValues = {};
   final Map<String, Set<String>> _checklistValues = {};
+  final Map<String, bool> _toggleValues = {};
+  final Map<String, List<String>> _dynamicDropdownOptions = {};
+  final Map<String, String> _dynamicDropdownLabels = {};
   bool _saving = false;
+  bool _loadingDynamicOptions = false;
 
   @override
   void initState() {
     super.initState();
+    if (widget.module.table == 'batches') {
+      _dropdownValues['livestock_category'] =
+          LivestockBreedCatalog.categories.first;
+      final breeds = _breedLabelsForCategory(
+        _dropdownValues['livestock_category']!,
+      );
+      _dropdownValues['livestock_breed'] =
+          breeds.isNotEmpty ? breeds.first : '';
+    }
+
     for (final field in widget.module.fields) {
       if (field.type == _FieldType.dropdown) {
-        _dropdownValues[field.key] = field.options.first;
+        _dropdownValues.putIfAbsent(
+          field.key,
+          () => field.options.isNotEmpty ? field.options.first : '',
+        );
       } else if (field.type == _FieldType.date) {
         _dateValues[field.key] = DateTime.now();
       } else if (field.type == _FieldType.checklist) {
         _checklistValues[field.key] = <String>{};
+      } else if (field.type == _FieldType.toggle) {
+        _toggleValues[field.key] = false;
       } else {
         _controllers[field.key] = TextEditingController();
       }
     }
+
+    if (widget.module.table == 'daily_feeding_logs') {
+      _loadFeedingOptions();
+    }
+  }
+
+  Future<void> _loadFeedingOptions() async {
+    final db = widget.localDatabase;
+    final user = widget.currentUser;
+    if (db == null || user == null) {
+      return;
+    }
+    setState(() => _loadingDynamicOptions = true);
+    try {
+      final batchRows = await db.rawLocalQuery(
+        '''
+        select id, batch_name, breed_type
+        from batches
+        where farm_id = ?
+          and is_deleted = 0
+          and lower(coalesce(status, '')) = 'active'
+        order by batch_name asc
+        ''',
+        [user.activeFarmId],
+      );
+      final inventoryRows = await db.rawLocalQuery(
+        '''
+        select id, item_name
+        from inventory
+        where farm_id = ?
+          and is_deleted = 0
+          and (lower(coalesce(category, '')) = 'feed'
+            or lower(coalesce(item_group, '')) = 'feed')
+        order by item_name asc
+        ''',
+        [user.activeFarmId],
+      );
+      final formulationRows = await db.rawLocalQuery(
+        '''
+        select id, name
+        from feed_formulations
+        where farm_id = ?
+        order by name asc
+        ''',
+        [user.activeFarmId],
+      );
+
+      final batchOptions = <String>[];
+      final batchLabels = <String, String>{};
+      for (final row in batchRows) {
+        final id = row['id']?.toString() ?? '';
+        if (id.isEmpty) {
+          continue;
+        }
+        final breed = LivestockBreedCatalog.labelForKey(
+          row['breed_type']?.toString(),
+        );
+        final name = row['batch_name']?.toString().trim().isEmpty ?? true
+            ? 'Batch $id'
+            : row['batch_name']?.toString() ?? 'Batch $id';
+        batchOptions.add(id);
+        batchLabels[id] = '$name ($breed)';
+      }
+
+      final feedOptions = <String>[];
+      final feedLabels = <String, String>{};
+      for (final row in inventoryRows) {
+        final id = row['id']?.toString() ?? '';
+        if (id.isEmpty) {
+          continue;
+        }
+        final value = 'inv_$id';
+        feedOptions.add(value);
+        feedLabels[value] = '[Inventory] ${row['item_name']}';
+      }
+      for (final row in formulationRows) {
+        final id = row['id']?.toString() ?? '';
+        if (id.isEmpty) {
+          continue;
+        }
+        final value = 'form_$id';
+        feedOptions.add(value);
+        feedLabels[value] = '[Formulation] ${row['name']}';
+      }
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _dynamicDropdownOptions['batch_id'] = batchOptions;
+        _dynamicDropdownLabels.addAll(batchLabels);
+        _dynamicDropdownOptions['feed_source'] = feedOptions;
+        _dynamicDropdownLabels.addAll(feedLabels);
+        if (batchOptions.isNotEmpty) {
+          _dropdownValues['batch_id'] = batchOptions.first;
+        }
+        if (feedOptions.isNotEmpty) {
+          _dropdownValues['feed_source'] = feedOptions.first;
+        }
+        _loadingDynamicOptions = false;
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() => _loadingDynamicOptions = false);
+      }
+    }
+  }
+
+  List<String> _breedLabelsForCategory(String category) {
+    return LivestockBreedCatalog.optionsForCategory(category)
+        .map((option) => option.label)
+        .toList();
+  }
+
+  void _onDropdownChanged(String key, String value) {
+    setState(() {
+      _dropdownValues[key] = value;
+      if (widget.module.table == 'batches' && key == 'livestock_category') {
+        final breeds = _breedLabelsForCategory(value);
+        _dropdownValues['livestock_breed'] =
+            breeds.isNotEmpty ? breeds.first : '';
+      }
+    });
   }
 
   @override
@@ -2701,8 +2393,10 @@ class _ModuleEntrySheetState extends State<_ModuleEntrySheet> {
     for (final field in widget.module.fields) {
       switch (field.type) {
         case _FieldType.number:
-          payload[field.key] =
-              num.tryParse(_controllers[field.key]!.text.trim()) ?? 0;
+          final numberText = _controllers[field.key]!.text.trim();
+          payload[field.key] = field.required
+              ? (num.tryParse(numberText) ?? 0)
+              : (numberText.isEmpty ? null : num.tryParse(numberText));
         case _FieldType.money:
           payload[field.key] =
               double.tryParse(_controllers[field.key]!.text.trim()) ?? 0;
@@ -2715,9 +2409,27 @@ class _ModuleEntrySheetState extends State<_ModuleEntrySheet> {
           payload[field.key] = _controllers[field.key]!.text.trim();
         case _FieldType.checklist:
           payload[field.key] = _checklistValues[field.key]!.toList();
+        case _FieldType.toggle:
+          payload[field.key] = _toggleValues[field.key] ?? false;
       }
     }
+    if (widget.module.table == 'daily_feeding_logs') {
+      final feedSource = _dropdownValues['feed_source'] ?? '';
+      payload['feed_source_label'] =
+          _dynamicDropdownLabels[feedSource] ?? feedSource;
+    }
     return payload;
+  }
+
+  void _setFeedAmount(double amount) {
+    final controller = _controllers['amount_consumed'];
+    if (controller == null) {
+      return;
+    }
+    controller.text = amount.toStringAsFixed(
+      amount.truncateToDouble() == amount ? 0 : 2,
+    );
+    setState(() {});
   }
 
   @override
@@ -2767,9 +2479,33 @@ class _ModuleEntrySheetState extends State<_ModuleEntrySheet> {
                   const SizedBox(height: 12),
                   _SheetHeader(module: widget.module),
                   const SizedBox(height: 18),
-                  for (final field in widget.module.fields) ...[
-                    _fieldFor(field),
-                    const SizedBox(height: 12),
+                  if (_loadingDynamicOptions)
+                    const Center(child: CircularProgressIndicator())
+                  else ...[
+                    for (final field in widget.module.fields) ...[
+                      _fieldFor(field),
+                      if (widget.module.table == 'daily_feeding_logs' &&
+                          field.key == 'amount_consumed') ...[
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            for (final entry in const [
+                              (0.25, '1/4 Bag'),
+                              (0.5, '1/2 Bag'),
+                              (0.75, '3/4 Bag'),
+                              (1.0, '1 Bag'),
+                            ])
+                              ActionChip(
+                                label: Text(entry.$2),
+                                onPressed: () => _setFeedAmount(entry.$1),
+                              ),
+                          ],
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                    ],
                   ],
                 ],
               ),
@@ -2783,20 +2519,38 @@ class _ModuleEntrySheetState extends State<_ModuleEntrySheet> {
   Widget _fieldFor(_FieldSpec field) {
     switch (field.type) {
       case _FieldType.dropdown:
+        final options = widget.module.table == 'daily_feeding_logs' &&
+                _dynamicDropdownOptions.containsKey(field.key)
+            ? _dynamicDropdownOptions[field.key]!
+            : widget.module.table == 'batches' &&
+                  field.key == 'livestock_breed'
+            ? _breedLabelsForCategory(
+                _dropdownValues['livestock_category'] ??
+                    LivestockBreedCatalog.categories.first,
+              )
+            : field.options;
         return DropdownButtonFormField<String>(
           initialValue: _dropdownValues[field.key],
           decoration: _decoration(field),
-          items: field.options
+          items: options
               .map(
-                (option) =>
-                    DropdownMenuItem(value: option, child: Text(option)),
+                (option) => DropdownMenuItem(
+                  value: option,
+                  child: Text(
+                    _dynamicDropdownLabels[option] ?? option,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
               )
               .toList(),
-          onChanged: (value) {
-            if (value != null) {
-              setState(() => _dropdownValues[field.key] = value);
-            }
-          },
+          onChanged: options.isEmpty
+              ? null
+              : (value) {
+                  if (value != null) {
+                    _onDropdownChanged(field.key, value);
+                  }
+                },
         );
       case _FieldType.date:
         return InkWell(
@@ -2813,6 +2567,15 @@ class _ModuleEntrySheetState extends State<_ModuleEntrySheet> {
           selected: _checklistValues[field.key]!,
           onChanged: (selected) {
             setState(() => _checklistValues[field.key] = selected);
+          },
+        );
+      case _FieldType.toggle:
+        return SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: Text(field.label),
+          value: _toggleValues[field.key] ?? false,
+          onChanged: (value) {
+            setState(() => _toggleValues[field.key] = value);
           },
         );
       case _FieldType.multiline:
@@ -3023,6 +2786,7 @@ class _HatchModuleConfig {
     required this.toRow,
     this.isDashboard = false,
     this.isPermissionAdmin = false,
+    this.isLivestockHub = false,
     this.tenantColumn,
     this.creatorColumn,
     this.viewPermissionKey,
@@ -3047,6 +2811,7 @@ class _HatchModuleConfig {
   final String successMessage;
   final bool isDashboard;
   final bool isPermissionAdmin;
+  final bool isLivestockHub;
   final String? tenantColumn;
   final String? creatorColumn;
   final String? viewPermissionKey;
@@ -3101,9 +2866,14 @@ class _FieldSpec {
   final bool required;
 }
 
-enum _FieldType { text, number, money, dropdown, date, multiline, checklist }
+enum _FieldType { text, number, money, dropdown, date, multiline, checklist, toggle }
 
-List<_HatchModuleConfig> _buildModules() {
+List<_HatchModuleConfig> _buildModules([
+  Map<String, String> batchNames = const {},
+]) {
+  String batchLabel(Map<String, dynamic> row) =>
+      _batchLabelForRow(row, batchNames);
+
   return [
     _HatchModuleConfig(
       title: 'HatchLog Central Dashboard',
@@ -3144,109 +2914,39 @@ List<_HatchModuleConfig> _buildModules() {
     _HatchModuleConfig(
       title: 'Livestock',
       shortLabel: 'Livestock',
-      subtitle: 'Bird batches, strains, age, and population',
-      formSubtitle: 'Create a batch with strain, hatch date, and bird count.',
+      subtitle: 'Livestock units, breeds, age, and population',
+      formSubtitle: '',
       table: 'batches',
       orderBy: 'createdAt',
-      tenantColumn: 'farmId',
-      creatorColumn: 'userId',
+      icon: Icons.groups_3_outlined,
+      color: const Color(0xff1f7a4d),
+      emptyText: '',
+      summaryTitle: '',
+      successMessage: '',
+      isLivestockHub: true,
       viewPermissionKey: 'can_view_batches',
       editPermissionKey: 'can_edit_batches',
       viewPermissionAliases: const ['can_view_livestock'],
       editPermissionAliases: const ['can_edit_livestock'],
-      icon: Icons.groups_3_outlined,
-      color: const Color(0xff1f7a4d),
-      emptyText: 'Add a livestock batch to begin tracking flock movement.',
-      summaryTitle: 'Total Birds',
-      successMessage: 'Livestock batch saved successfully!',
-      summaryValue: (rows) =>
-          '${_sumInt(rows, const ['currentCount', 'current_population', 'current_count', 'population'])}',
-      record: (row) {
-        final hatchDate = _dateText(
-          _first(row, const [
-            'arrivalDate',
-            'date_hatched',
-            'hatched_at',
-            'hatch_date',
-          ]),
-        );
-        return _RecordVm(
-          title: _text(row, const [
-            'batchName',
-            'batch_name',
-            'name',
-          ], 'Unnamed batch'),
-          subtitle:
-              '${_text(row, const ['breedType', 'bird_strain', 'strain'], 'Unknown strain')} | ${_ageWeeks(row)} weeks | Hatched $hatchDate',
-          metric:
-              '${_int(row, const ['currentCount', 'current_population', 'current_count', 'population'])} birds',
-          status: _text(row, const ['status'], ''),
-        );
-      },
-      fields: const [
-        _FieldSpec(
-          key: 'batch_name',
-          label: 'Batch Name',
-          icon: Icons.badge_outlined,
-        ),
-        _FieldSpec(
-          key: 'initial_count',
-          label: 'Initial Bird Count',
-          icon: Icons.pin_outlined,
-          type: _FieldType.number,
-        ),
-        _FieldSpec(
-          key: 'bird_strain',
-          label: 'Bird Strain',
-          icon: Icons.category_outlined,
-          type: _FieldType.dropdown,
-          options: ['Layer', 'Broiler', 'Noiler', 'Sasso', 'Cockerel'],
-        ),
-        _FieldSpec(
-          key: 'date_hatched',
-          label: 'Date Hatched',
-          icon: Icons.event_outlined,
-          type: _FieldType.date,
-        ),
-        _FieldSpec(
-          key: 'house_id',
-          label: 'Assigned House ID',
-          icon: Icons.home_work_outlined,
-        ),
-      ],
-      toRow: (payload) {
-        final now = DateTime.now().toIso8601String();
-        final livestockType = payload['bird_strain'].toString().toUpperCase();
-        return {
-          'batchName': payload['batch_name'],
-          'initialCount': payload['initial_count'],
-          'currentCount': payload['initial_count'],
-          'breedType': payload['bird_strain'],
-          'arrivalDate': payload['date_hatched'],
-          'houseId': payload['house_id'],
-          'status': 'ACTIVE',
-          'type': livestockType,
-          'isolationCount': 0,
-          'createdAt': now,
-          'updatedAt': now,
-          'is_deleted': false,
-        };
-      },
+      summaryValue: (_) => '',
+      record: (_) => const _RecordVm(title: '', subtitle: '', metric: ''),
+      fields: const [],
+      toRow: (_) => const <String, dynamic>{},
     ),
     _HatchModuleConfig(
       title: 'Houses',
       shortLabel: 'Houses',
-      subtitle: 'Capacity and ambient conditions',
-      formSubtitle: 'Register a house and its latest environment reading.',
+      subtitle: 'Capacity, isolation flags, and environment',
+      formSubtitle: 'Register a house with optional climate readings.',
       table: 'houses',
-      orderBy: 'createdAt',
+      orderBy: 'name',
       tenantColumn: 'farmId',
       creatorColumn: 'userId',
       viewPermissionKey: 'can_view_houses',
       editPermissionKey: 'can_edit_houses',
       icon: Icons.home_work_outlined,
       color: const Color(0xff2f5f8f),
-      emptyText: 'Add poultry houses to monitor capacity and temperature.',
+      emptyText: 'Add poultry houses to monitor capacity and climate.',
       summaryTitle: 'Total Capacity',
       successMessage: 'House saved successfully!',
       summaryValue: (rows) => '${_sumInt(rows, const ['capacity'])}',
@@ -3263,19 +2963,34 @@ List<_HatchModuleConfig> _buildModules() {
         return population / capacity;
       },
       record: (row) {
+        final temperature = _nullableDouble(
+          row,
+          const ['currentTemperature', 'current_temperature'],
+        );
+        final humidity = _nullableDouble(
+          row,
+          const ['currentHumidity', 'current_humidity'],
+        );
+        final status = resolveClimateStatus(
+          temperature: temperature,
+          humidity: humidity,
+        );
         return _RecordVm(
-          title: _text(row, const ['house_number', 'name'], 'Unnamed house'),
+          title: _text(row, const ['name', 'house_number'], 'Unnamed house'),
           subtitle:
               'Capacity ${_int(row, const ['capacity'])} | ${_int(row, const ['currentPopulation', 'current_population', 'occupied'])} occupied',
-          metric:
-              '${_double(row, const ['currentTemperature', 'ambient_temperature', 'current_temperature']).toStringAsFixed(1)}C',
-          status: _text(row, const ['status', 'environmental_state'], ''),
+          metric: temperature == null
+              ? 'Climate not set'
+              : '${temperature.toStringAsFixed(1)}C / ${humidity?.toStringAsFixed(0) ?? '--'}%',
+          status: _bool(row, const ['isIsolation', 'is_isolation'])
+              ? 'Isolation'
+              : status.label,
         );
       },
       fields: const [
         _FieldSpec(
-          key: 'house_number',
-          label: 'House Number',
+          key: 'name',
+          label: 'House Name / Number',
           icon: Icons.home_outlined,
         ),
         _FieldSpec(
@@ -3285,37 +3000,44 @@ List<_HatchModuleConfig> _buildModules() {
           type: _FieldType.number,
         ),
         _FieldSpec(
-          key: 'ambient_temperature',
-          label: 'Ambient Temperature',
+          key: 'current_temperature',
+          label: 'Temperature (C)',
           icon: Icons.thermostat_outlined,
           type: _FieldType.number,
+          required: false,
         ),
         _FieldSpec(
-          key: 'status',
-          label: 'Status',
-          icon: Icons.fact_check_outlined,
-          type: _FieldType.dropdown,
-          options: ['Active', 'Cleaning', 'Maintenance', 'Empty'],
+          key: 'current_humidity',
+          label: 'Humidity (%)',
+          icon: Icons.water_drop_outlined,
+          type: _FieldType.number,
+          required: false,
+        ),
+        _FieldSpec(
+          key: 'is_isolation',
+          label: 'Isolation House',
+          icon: Icons.health_and_safety_outlined,
+          type: _FieldType.toggle,
+          required: false,
         ),
       ],
       toRow: (payload) {
-        final now = DateTime.now().toIso8601String();
         return {
-          'name': payload['house_number'],
+          'name': payload['name'],
           'capacity': payload['capacity'],
-          'currentTemperature': payload['ambient_temperature'],
-          'currentHumidity': 0,
-          'isIsolation': false,
-          'createdAt': now,
-          'updatedAt': now,
+          'currentTemperature': _nullablePayloadDouble(
+            payload['current_temperature'],
+          ),
+          'currentHumidity': _nullablePayloadDouble(payload['current_humidity']),
+          'isIsolation': payload['is_isolation'] == true,
         };
       },
     ),
     _HatchModuleConfig(
       title: 'Eggs',
       shortLabel: 'Eggs',
-      subtitle: 'Collection, grading, cracked, and dirty counts',
-      formSubtitle: 'Capture crates, broken eggs, time slot, and house.',
+      subtitle: 'Daily collection, grading, and unusable counts',
+      formSubtitle: 'Log batch production with crate math and sorting.',
       table: 'egg_production',
       orderBy: 'logDate',
       tenantColumn: 'farmId',
@@ -3328,93 +3050,46 @@ List<_HatchModuleConfig> _buildModules() {
       summaryTitle: 'Daily Egg Tally',
       successMessage: 'Egg log saved successfully!',
       summaryValue: (rows) =>
-          '${_sumInt(rows, const ['cratesCollected', 'crates_collected', 'large_crates', 'crates'])} crates',
+          '${_sumInt(rows, const ['eggsCollected', 'eggs_collected'])} eggs',
       record: (row) {
+        final eggs = _int(row, const ['eggsCollected', 'eggs_collected']);
+        final remaining = _int(row, const ['eggsRemaining', 'eggs_remaining']);
+        final unusable = _int(row, const ['unusableCount', 'unusable_count']);
+        final sorted = _objectBool(row['isSorted'] ?? row['is_sorted']);
+        final sold = eggSoldCount(
+          collected: eggs,
+          unusable: unusable,
+          remaining: remaining,
+        );
+        final activePct = eggActivePercent(
+          collected: eggs,
+          unusable: unusable,
+          remaining: remaining,
+        );
         return _RecordVm(
           title: _dateText(
             _first(row, const [
               'logDate',
-              'collection_date',
+              'log_date',
               'createdAt',
               'created_at',
             ]),
           ),
           subtitle:
-              'Batch ${_text(row, const ['batchId', 'batch_id'], 'Unassigned')} | ${_text(row, const ['collection_slot', 'time_slot'], 'Any time')}',
-          metric:
-              '${_int(row, const ['cratesCollected', 'crates_collected', 'large_crates', 'crates'])} crates',
+              '${batchLabel(row)} | ${sorted ? 'Sorted' : 'Unsorted'} | $activePct% active',
+          metric: '$remaining left · $sold sold',
           status:
-              '${_int(row, const ['unusableCount', 'dirty_count', 'dirt_count'])} damaged',
+              '${_int(row, const ['unusableCount', 'unusable_count'])} unusable',
         );
       },
-      fields: const [
-        _FieldSpec(
-          key: 'crates_collected',
-          label: 'Crates Collected',
-          icon: Icons.inventory_2_outlined,
-          type: _FieldType.number,
-        ),
-        _FieldSpec(
-          key: 'dirty_count',
-          label: 'Dirty Eggs',
-          icon: Icons.blur_on_outlined,
-          type: _FieldType.number,
-          required: false,
-        ),
-        _FieldSpec(
-          key: 'cracked_count',
-          label: 'Cracked or Broken Eggs',
-          icon: Icons.warning_amber_outlined,
-          type: _FieldType.number,
-          required: false,
-        ),
-        _FieldSpec(
-          key: 'collection_slot',
-          label: 'Collection Time Slot',
-          icon: Icons.schedule_outlined,
-          type: _FieldType.dropdown,
-          options: ['Morning', 'Afternoon', 'Evening'],
-        ),
-        _FieldSpec(
-          key: 'house_id',
-          label: 'Assigned House',
-          icon: Icons.home_work_outlined,
-        ),
-        _FieldSpec(
-          key: 'collection_date',
-          label: 'Collection Date',
-          icon: Icons.event_outlined,
-          type: _FieldType.date,
-        ),
-      ],
-      toRow: (payload) {
-        final crates = _numPayload(payload, 'crates_collected');
-        final unusable =
-            (_numPayload(payload, 'dirty_count') +
-                    _numPayload(payload, 'cracked_count'))
-                .round();
-        final eggsCollected = (crates * 30).round();
-        return {
-          'batchId': payload['house_id'],
-          'eggsCollected': eggsCollected,
-          'cratesCollected': crates,
-          'eggsRemaining': eggsCollected,
-          'unusableCount': unusable,
-          'largeCount': eggsCollected,
-          'mediumCount': 0,
-          'smallCount': 0,
-          'isSorted': false,
-          'logDate': payload['collection_date'],
-          'createdAt': DateTime.now().toIso8601String(),
-          'is_deleted': false,
-        };
-      },
+      fields: const [],
+      toRow: (payload) => payload,
     ),
     _HatchModuleConfig(
       title: 'Feeding',
       shortLabel: 'Feeding',
       subtitle: 'Feed stock depletion and usage history',
-      formSubtitle: 'Log sacks used, feed variant, and feed timestamp.',
+      formSubtitle: 'Log batch, feed source, bags consumed, and log date.',
       table: 'daily_feeding_logs',
       orderBy: 'log_date',
       tenantColumn: 'farmId',
@@ -3424,62 +3099,67 @@ List<_HatchModuleConfig> _buildModules() {
       icon: Icons.inventory_2_outlined,
       color: const Color(0xff7a5c1f),
       emptyText: 'Add feed usage records to monitor depletion.',
-      summaryTitle: 'Feed Sacks Used',
+      summaryTitle: 'Feed Bags Used',
       successMessage: 'Feed log saved successfully!',
       summaryValue: (rows) => _sumDouble(rows, const [
-        'sacks_used',
         'amount_consumed',
+        'sacks_used',
       ]).toStringAsFixed(1),
-      progress: (row) {
-        final remaining = _double(row, const ['sacks_remaining', 'stock_left']);
-        final used = _double(row, const ['sacks_used', 'amount_consumed']);
-        final total = remaining + used;
-        if (total <= 0) {
-          return null;
-        }
-        return remaining / total;
-      },
       record: (row) {
         return _RecordVm(
-          title: _text(row, const ['feed_variant', 'feed_brand'], 'Feed log'),
+          title: _text(row, const [
+            'feed_type_label',
+            'feed_type',
+            'feed_variant',
+          ], 'Feed log'),
           subtitle:
-              '${_dateText(_first(row, const ['log_date', 'logged_at', 'created_at']))} | Batch ${_text(row, const ['batch_id', 'batchId'], 'Unassigned')}',
+              '${_dateText(_first(row, const ['log_date', 'logged_at', 'created_at']))} | ${batchLabel(row)}',
           metric:
-              '${_double(row, const ['sacks_used', 'amount_consumed']).toStringAsFixed(1)} sacks',
-          status: _text(row, const ['sacks_remaining', 'stock_left'], ''),
+              '${_double(row, const ['amount_consumed', 'sacks_used']).toStringAsFixed(1)} bags',
+          status: _text(row, const ['note', 'notes'], ''),
         );
       },
       fields: const [
         _FieldSpec(
-          key: 'sacks_used',
-          label: 'Sacks Used',
-          icon: Icons.remove_circle_outline,
+          key: 'batch_id',
+          label: 'Batch',
+          icon: Icons.groups_outlined,
+          type: _FieldType.dropdown,
+        ),
+        _FieldSpec(
+          key: 'feed_source',
+          label: 'Feed Type',
+          icon: Icons.inventory_2_outlined,
+          type: _FieldType.dropdown,
+        ),
+        _FieldSpec(
+          key: 'amount_consumed',
+          label: 'Amount Consumed (Bags)',
+          icon: Icons.scale_outlined,
           type: _FieldType.number,
         ),
         _FieldSpec(
-          key: 'feed_variant',
-          label: 'Feed Variant',
-          icon: Icons.category_outlined,
-          type: _FieldType.dropdown,
-          options: ['Starter', 'Grower', 'Layer Mash', 'Finisher'],
-        ),
-        _FieldSpec(
-          key: 'house_id',
-          label: 'Assigned House',
-          icon: Icons.home_work_outlined,
-        ),
-        _FieldSpec(
-          key: 'logged_at',
-          label: 'Timestamp',
+          key: 'log_date',
+          label: 'Log Date',
           icon: Icons.event_outlined,
           type: _FieldType.date,
         ),
       ],
-      toRow: (payload) => {
-        'batch_id': payload['house_id'],
-        'amount_consumed': payload['sacks_used'],
-        'log_date': payload['logged_at'],
-        'is_deleted': false,
+      toRow: (payload) {
+        final feedSource = parseFeedSource(
+          payload['feed_source']?.toString() ?? '',
+          label: payload['feed_source_label']?.toString(),
+        );
+        return {
+          'batch_id': payload['batch_id'],
+          'feed_type_id': feedSource.feedTypeId,
+          'formulation_id': feedSource.formulationId,
+          'feed_type_label': feedSource.label,
+          'feed_type': feedSource.label,
+          'amount_consumed': payload['amount_consumed'],
+          'log_date': payload['log_date'],
+          'is_deleted': false,
+        };
       },
     ),
     _HatchModuleConfig(
@@ -3507,7 +3187,7 @@ List<_HatchModuleConfig> _buildModules() {
               '${_int(row, const ['dead_count', 'quantity', 'count'])} bird losses',
           subtitle:
               '${_text(row, const ['suspected_cause', 'reason', 'cause'], 'No cause logged')} | ${_dateText(_first(row, const ['logDate', 'loss_date', 'createdAt', 'created_at']))}',
-          metric: 'Batch ${_text(row, const ['batchId', 'batch_id'], '-')}',
+          metric: batchLabel(row),
           status: _text(row, const ['observations', 'notes'], ''),
         );
       },
@@ -3519,8 +3199,8 @@ List<_HatchModuleConfig> _buildModules() {
           type: _FieldType.number,
         ),
         _FieldSpec(
-          key: 'house_id',
-          label: 'House Origin',
+          key: 'batch_id',
+          label: 'Batch ID',
           icon: Icons.home_work_outlined,
         ),
         _FieldSpec(
@@ -3543,11 +3223,15 @@ List<_HatchModuleConfig> _buildModules() {
         ),
       ],
       toRow: (payload) => {
-        'batchId': payload['house_id'],
+        'batch_id': payload['batch_id'],
+        'batchId': payload['batch_id'],
         'count': payload['dead_count'],
-        'reason': payload['suspected_cause'],
-        'logDate': payload['loss_date'],
         'type': 'DEAD',
+        'category': payload['category'] ?? 'Unknown',
+        'sub_category':
+            payload['sub_category'] ?? payload['suspected_cause'] ?? 'Unknown cause yet',
+        'reason': payload['observations'] ?? payload['suspected_cause'],
+        'logDate': payload['loss_date'],
         'createdAt': DateTime.now().toIso8601String(),
         'is_deleted': false,
       },
@@ -3626,13 +3310,17 @@ List<_HatchModuleConfig> _buildModules() {
         ),
       ],
       toRow: (payload) => {
+        'batch_id': payload['batch_id'],
         'batchId': payload['batch_id'],
         'count': payload['isolated_count'],
-        'reason': payload['symptoms'],
-        'category': payload['progress_update'],
-        'sub_category': (payload['treatment_checklist'] as List).join(', '),
-        'logDate': payload['isolation_date'],
         'type': 'SICK',
+        'category': payload['category'] ?? payload['progress_update'] ?? 'Disease',
+        'sub_category': payload['sub_category'] ??
+            ((payload['treatment_checklist'] as List?)?.join(', ') ??
+                payload['symptoms']),
+        'reason': payload['symptoms'],
+        'isolation_room_id': payload['isolation_room_id'],
+        'logDate': payload['isolation_date'],
         'createdAt': DateTime.now().toIso8601String(),
         'is_deleted': false,
       },
@@ -3712,17 +3400,23 @@ List<_HatchModuleConfig> _buildModules() {
         final unitPrice = _numPayload(payload, 'unit_price');
         final total = quantity * unitPrice;
         final received = _numPayload(payload, 'amount_received');
+        final outstanding = (total - received).clamp(0, double.infinity);
+        final now = DateTime.now().toIso8601String();
         return {
-          'type': 'sale',
+          'type': 'REVENUE',
           'category': 'SALES',
           'amount': total,
-          'payment_status': received >= total ? 'PAID' : 'PARTIALLY_PAID',
+          'payment_status': received >= total
+              ? 'PAID'
+              : (received > 0 ? 'PARTIALLY_PAID' : 'UNPAID'),
           'payment_method': payload['payment_method'],
           'reference_num': _newTextId('sale_ref'),
-          'transaction_date': DateTime.now().toIso8601String(),
-          'created_at': DateTime.now().toIso8601String(),
-          'updated_at': DateTime.now().toIso8601String(),
+          'transaction_date': now,
+          'created_at': now,
+          'updated_at': now,
           'is_deleted': false,
+          'deposit_amount': received,
+          'outstanding_credit': outstanding,
           'description':
               '${payload['quantity']} x ${payload['item']} to ${payload['customer_name']}',
         };
@@ -3888,30 +3582,77 @@ List<_HatchModuleConfig> _buildModules() {
       title: 'Finance Control',
       shortLabel: 'Finance',
       subtitle: 'Expense ledgers and payment controls',
-      formSubtitle: 'Create expenses, deposits, credits, and finance notes.',
-      table: 'expenses',
-      orderBy: 'expense_date',
-      tenantColumn: 'farmId',
+      formSubtitle: 'Record manual ledger entries with payment status.',
+      table: 'financial_transactions',
+      orderBy: 'transaction_date',
+      tenantColumn: 'farm_id',
       creatorColumn: 'user_id',
       viewPermissionKey: 'can_view_finance',
       editPermissionKey: 'can_edit_finance',
       icon: Icons.account_balance_wallet_outlined,
       color: const Color(0xff27364a),
       emptyText: 'Add finance entries to monitor expenses and cash flow.',
-      summaryTitle: 'Expense Outlay',
+      summaryTitle: 'Net Position',
       successMessage: 'Finance entry saved successfully!',
-      summaryValue: (rows) =>
-          _money(_sumDouble(rows, const ['amount', 'expense_outlay'])),
+      summaryValue: (rows) {
+        final revenue = _sumDouble(
+          rows
+              .where(
+                (row) =>
+                    _text(row, const ['type'], '').toUpperCase() == 'REVENUE',
+              )
+              .toList(),
+          const ['amount'],
+        );
+        final expense = _sumDouble(
+          rows
+              .where(
+                (row) =>
+                    _text(row, const ['type'], '').toUpperCase() == 'EXPENSE',
+              )
+              .toList(),
+          const ['amount'],
+        );
+        return _money(revenue - expense);
+      },
       record: (row) {
+        final type = _text(row, const ['type'], 'EXPENSE').toUpperCase();
         return _RecordVm(
-          title: _text(row, const ['category', 'type'], 'Finance entry'),
+          title: _text(row, const ['category'], 'Finance entry'),
           subtitle:
-              '${_text(row, const ['description'], 'No description')} | ${_dateText(_first(row, const ['expense_date', 'transaction_date', 'created_at']))}',
-          metric: _money(_double(row, const ['amount', 'expense_outlay'])),
-          status: _text(row, const ['payment_status', 'status'], ''),
+              '${_text(row, const ['description'], 'No description')} | ${_dateText(_first(row, const ['transaction_date', 'created_at']))}',
+          metric: '${type == 'REVENUE' ? '+' : '-'}${_money(_double(row, const ['amount']))}',
+          status: _text(row, const ['payment_status'], 'PAID'),
         );
       },
       fields: const [
+        _FieldSpec(
+          key: 'type',
+          label: 'Ledger Type',
+          icon: Icons.swap_vert_outlined,
+          type: _FieldType.dropdown,
+          options: ['REVENUE', 'EXPENSE'],
+        ),
+        _FieldSpec(
+          key: 'category',
+          label: 'Category',
+          icon: Icons.category_outlined,
+          type: _FieldType.dropdown,
+          options: [
+            'Feed Purchases',
+            'Flock Vaccines & Medication',
+            'Day-Old Chicks Purchase',
+            'Labor & Salaries',
+            'Utilities',
+            'Transport',
+            'Equipment & Maintenance',
+            'Other OpEx',
+            'Egg Wholesale Revenue',
+            'Broiler Sales',
+            'Manure Sales',
+            'Other Revenue',
+          ],
+        ),
         _FieldSpec(
           key: 'amount',
           label: 'Amount',
@@ -3919,25 +3660,18 @@ List<_HatchModuleConfig> _buildModules() {
           type: _FieldType.money,
         ),
         _FieldSpec(
-          key: 'category',
-          label: 'Category',
-          icon: Icons.category_outlined,
-          type: _FieldType.dropdown,
-          options: ['Feed', 'Medication', 'Payroll', 'Utilities', 'Transport'],
-        ),
-        _FieldSpec(
-          key: 'type',
-          label: 'Ledger Type',
-          icon: Icons.swap_vert_outlined,
-          type: _FieldType.dropdown,
-          options: ['EXPENSE', 'REVENUE', 'CREDIT', 'DEPOSIT'],
-        ),
-        _FieldSpec(
           key: 'payment_status',
           label: 'Payment Status',
           icon: Icons.fact_check_outlined,
           type: _FieldType.dropdown,
-          options: ['PAID', 'PENDING', 'PARTIALLY_PAID'],
+          options: ['PAID', 'UNPAID', 'PARTIALLY_PAID'],
+        ),
+        _FieldSpec(
+          key: 'payment_method',
+          label: 'Payment Method',
+          icon: Icons.point_of_sale_outlined,
+          type: _FieldType.dropdown,
+          options: ['Cash', 'Mobile Money', 'Bank Transfer', 'Card'],
         ),
         _FieldSpec(
           key: 'description',
@@ -3954,14 +3688,22 @@ List<_HatchModuleConfig> _buildModules() {
       ],
       toRow: (payload) {
         final now = DateTime.now().toIso8601String();
+        final type = (payload['type']?.toString() ?? 'EXPENSE').toUpperCase();
         return {
-          'amount': payload['amount'],
+          'type': type,
           'category': payload['category'],
+          'amount': payload['amount'],
+          'payment_status': payload['payment_status'] ?? 'PAID',
+          'payment_method': payload['payment_method'] ?? 'Cash',
+          'reference_num': _newTextId('fin_ref'),
+          'transaction_date': payload['transaction_date'] ?? now,
           'description': payload['description'],
-          'expense_date': payload['transaction_date'],
+          'deposit_amount': 0,
+          'outstanding_credit': 0,
+          'expense_outlay': 0,
+          'is_deleted': false,
           'created_at': now,
           'updated_at': now,
-          'is_deleted': false,
         };
       },
     ),
@@ -3983,7 +3725,11 @@ List<_HatchModuleConfig> _buildModules() {
       successMessage: 'Order saved successfully!',
       summaryValue: (rows) => _money(_sumDouble(rows, const ['totalAmount'])),
       record: (row) => _RecordVm(
-        title: _text(row, const ['customerId'], 'Walk-in customer'),
+        title: _text(
+          row,
+          const ['customerName', 'customer_name', 'name'],
+          'Walk-in customer',
+        ),
         subtitle:
             '${_text(row, const ['status'], 'Pending')} | ${_dateText(row['order_date'])}',
         metric: _money(_double(row, const ['totalAmount'])),
@@ -4241,7 +3987,7 @@ List<_HatchModuleConfig> _buildModules() {
             .toStringAsFixed(2);
       },
       record: (row) => _RecordVm(
-        title: 'Batch ${_text(row, const ['batchId'], '-')}',
+        title: batchLabel(row),
         subtitle: _dateText(row['logDate']),
         metric:
             '${_double(row, const ['averageWeight']).toStringAsFixed(2)} kg',
@@ -4291,7 +4037,7 @@ List<_HatchModuleConfig> _buildModules() {
       record: (row) => _RecordVm(
         title: _text(row, const ['vaccineName'], 'Vaccine'),
         subtitle:
-            'Batch ${_text(row, const ['batchId'], '-')} | ${_dateText(row['scheduledDate'])}',
+            '${batchLabel(row)} | ${_dateText(row['scheduledDate'])}',
         metric: _text(row, const ['status'], 'PENDING'),
         status: _text(row, const ['notes'], ''),
       ),
@@ -4317,7 +4063,7 @@ List<_HatchModuleConfig> _buildModules() {
           label: 'Status',
           icon: Icons.fact_check_outlined,
           type: _FieldType.dropdown,
-          options: ['PENDING', 'COMPLETED', 'DONE', 'MISSED'],
+          options: ['PENDING', 'COMPLETED', 'CANCELLED'],
         ),
         _FieldSpec(
           key: 'notes',
@@ -4353,7 +4099,7 @@ List<_HatchModuleConfig> _buildModules() {
       record: (row) => _RecordVm(
         title: _text(row, const ['medicationName'], 'Medication'),
         subtitle:
-            'Batch ${_text(row, const ['batchId'], '-')} | ${_dateText(row['scheduledDate'])}',
+            '${batchLabel(row)} | ${_dateText(row['scheduledDate'])}',
         metric: _text(row, const ['status'], 'PENDING'),
         status: _text(row, const ['notes'], ''),
       ),
@@ -4379,7 +4125,7 @@ List<_HatchModuleConfig> _buildModules() {
           label: 'Status',
           icon: Icons.fact_check_outlined,
           type: _FieldType.dropdown,
-          options: ['PENDING', 'COMPLETED', 'DONE', 'MISSED'],
+          options: ['PENDING', 'COMPLETED', 'CANCELLED'],
         ),
         _FieldSpec(
           key: 'notes',
@@ -4436,6 +4182,25 @@ Object? _first(Map<String, dynamic> row, List<String> keys) {
   return null;
 }
 
+String _batchLabelForRow(
+  Map<String, dynamic> row,
+  Map<String, String> batchNames,
+) {
+  final inline = _text(row, const ['batch_name', 'batchName']);
+  if (inline.isNotEmpty) {
+    return inline;
+  }
+  final batchId = _text(row, const ['batch_id', 'batchId']);
+  if (batchId.isEmpty) {
+    return 'Unassigned';
+  }
+  final mapped = batchNames[batchId]?.trim();
+  if (mapped != null && mapped.isNotEmpty) {
+    return mapped;
+  }
+  return 'Batch';
+}
+
 String _text(
   Map<String, dynamic> row,
   List<String> keys, [
@@ -4482,6 +4247,40 @@ double _double(Map<String, dynamic> row, List<String> keys) {
   return double.tryParse(value?.toString() ?? '') ?? 0;
 }
 
+double? _nullableDouble(Map<String, dynamic> row, List<String> keys) {
+  final value = _first(row, keys);
+  return _nullablePayloadDouble(value);
+}
+
+double? _nullablePayloadDouble(Object? value) {
+  if (value == null) {
+    return null;
+  }
+  if (value is double) {
+    return value;
+  }
+  if (value is num) {
+    return value.toDouble();
+  }
+  final text = value.toString().trim();
+  if (text.isEmpty) {
+    return null;
+  }
+  return double.tryParse(text);
+}
+
+bool _bool(Map<String, dynamic> row, List<String> keys) {
+  final value = _first(row, keys);
+  if (value is bool) {
+    return value;
+  }
+  if (value is num) {
+    return value != 0;
+  }
+  final text = value?.toString().trim().toLowerCase() ?? '';
+  return text == 'true' || text == '1' || text == 'yes';
+}
+
 int _sumInt(List<Map<String, dynamic>> rows, List<String> keys) {
   return rows.fold(0, (sum, row) => sum + _int(row, keys));
 }
@@ -4524,6 +4323,17 @@ int _objectInt(Object? value) {
     return value.round();
   }
   return int.tryParse(value?.toString() ?? '') ?? 0;
+}
+
+bool _objectBool(Object? value) {
+  if (value is bool) {
+    return value;
+  }
+  if (value is num) {
+    return value != 0;
+  }
+  final normalized = value?.toString().trim().toLowerCase();
+  return normalized == '1' || normalized == 'true';
 }
 
 double _objectDouble(Object? value) {

@@ -8,6 +8,11 @@ import '../../core/models/app_user.dart';
 import '../../features/management/data/invoice_pdf_service.dart';
 import '../../features/management/data/management_models.dart';
 import '../../features/management/data/management_repository.dart';
+import '../../features/partners/partner_statement_screen.dart';
+import '../../services/local_partner_service.dart';
+import '../../services/missing_finance_setup_service.dart';
+import '../profile/profile_screen.dart';
+import '../settings/settings_hub_screen.dart';
 import '../shared/session_mode_badge.dart';
 
 class ManagementDashboard extends StatefulWidget {
@@ -75,7 +80,10 @@ class _ManagementDashboardState extends State<ManagementDashboard> {
   void _switchFarm(FarmOption farm) {
     HapticFeedback.lightImpact();
     setState(() {
-      _activeUser = _activeUser.copyWith(activeFarmId: farm.id);
+      _activeUser = _activeUser.copyWith(
+        activeFarmId: farm.id,
+        activeFarmName: farm.name,
+      );
       _snapshotStream = widget.repository.watchSnapshot(_activeUser);
       _selectedIndex = 0;
     });
@@ -202,6 +210,14 @@ class _ManagementDashboardState extends State<ManagementDashboard> {
           records: snapshot.feedingRecords,
           emptyLabel: 'No feeding rows are cached locally yet.',
         );
+      case ManagementSection.health:
+        return _HubModuleSection(
+          title: 'Vaccination & Medication',
+          subtitle: 'Scheduled vaccines, medications, and completion state.',
+          icon: Icons.vaccines_outlined,
+          records: snapshot.healthRecords,
+          emptyLabel: 'No health schedules are cached locally yet.',
+        );
       case ManagementSection.mortality:
         return _HubModuleSection(
           title: 'Mortality Register',
@@ -236,7 +252,11 @@ class _ManagementDashboardState extends State<ManagementDashboard> {
           emptyLabel: 'No inventory rows are cached locally yet.',
         );
       case ManagementSection.customers:
-        return _StakeholderSection(snapshot: snapshot);
+        return _StakeholderSection(
+          snapshot: snapshot,
+          currentUser: _activeUser,
+          partnerService: widget.repository.partnerService,
+        );
       case ManagementSection.financeControl:
         return _ExpenseLedgerSection(
           currentUser: _activeUser,
@@ -246,14 +266,16 @@ class _ManagementDashboardState extends State<ManagementDashboard> {
           onSaved: _refresh,
         );
       case ManagementSection.profile:
-        return _ProfileSection(currentUser: _activeUser, snapshot: snapshot);
-      case ManagementSection.settings:
-        return _SettingsSection(
+        return ProfileScreen(
           currentUser: _activeUser,
-          permissions: _permissions,
-          repository: widget.repository,
-          snapshot: snapshot,
-          onSaved: _refresh,
+          localDatabase: widget.repository.localDatabase,
+          onProfileUpdated: (user) => setState(() => _activeUser = user),
+        );
+      case ManagementSection.settings:
+        return SettingsHubScreen(
+          currentUser: _activeUser,
+          localDatabase: widget.repository.localDatabase,
+          onOpenProfile: () => _selectSection(ManagementSection.profile),
         );
     }
   }
@@ -286,6 +308,7 @@ class _ManagementDrawer extends StatelessWidget {
       ManagementSection.houses,
       ManagementSection.eggs,
       ManagementSection.feeding,
+      ManagementSection.health,
       ManagementSection.mortality,
       ManagementSection.quarantine,
     ];
@@ -327,7 +350,9 @@ class _ManagementDrawer extends StatelessWidget {
                   Text(
                     currentUser.activeFarmId.isEmpty
                         ? 'No farm selected'
-                        : 'Farm ${currentUser.activeFarmId}',
+                        : currentUser.activeFarmName.trim().isNotEmpty
+                        ? currentUser.activeFarmName
+                        : 'Farm',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
@@ -755,6 +780,7 @@ class _HubModuleSection extends StatelessWidget {
     required this.records,
     required this.emptyLabel,
     this.alert = false,
+    this.onRecordTap,
   });
 
   final String title;
@@ -763,6 +789,7 @@ class _HubModuleSection extends StatelessWidget {
   final List<HubModuleRecord> records;
   final String emptyLabel;
   final bool alert;
+  final ValueChanged<HubModuleRecord>? onRecordTap;
 
   @override
   Widget build(BuildContext context) {
@@ -810,7 +837,11 @@ class _HubModuleSection extends StatelessWidget {
           for (final record in records)
             Padding(
               padding: const EdgeInsets.only(bottom: 10),
-              child: _HubRecordTile(record: record, accentColor: color),
+              child: _HubRecordTile(
+                record: record,
+                accentColor: color,
+                onTap: onRecordTap == null ? null : () => onRecordTap!(record),
+              ),
             ),
       ],
     );
@@ -818,9 +849,32 @@ class _HubModuleSection extends StatelessWidget {
 }
 
 class _StakeholderSection extends StatelessWidget {
-  const _StakeholderSection({required this.snapshot});
+  const _StakeholderSection({
+    required this.snapshot,
+    required this.currentUser,
+    required this.partnerService,
+  });
 
   final ManagementSnapshot snapshot;
+  final AppUser currentUser;
+  final LocalPartnerService partnerService;
+
+  void _openStatement(BuildContext context, HubModuleRecord record) {
+    final kind = record.status == 'SUPPLIER'
+        ? PartnerKind.supplier
+        : PartnerKind.customer;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PartnerStatementScreen(
+          currentUser: currentUser,
+          partnerService: partnerService,
+          partnerId: record.id,
+          kind: kind,
+          partnerName: record.title,
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -831,142 +885,38 @@ class _StakeholderSection extends StatelessWidget {
       icon: Icons.contacts_outlined,
       records: records,
       emptyLabel: 'No customer or supplier profiles are cached locally yet.',
-    );
-  }
-}
-
-class _ProfileSection extends StatelessWidget {
-  const _ProfileSection({required this.currentUser, required this.snapshot});
-
-  final AppUser currentUser;
-  final ManagementSnapshot snapshot;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        const _SectionHeader(
-          title: 'Profile',
-          subtitle: 'Current mobile identity and farm context.',
-        ),
-        const SizedBox(height: 14),
-        Container(
-          padding: const EdgeInsets.all(16),
-          decoration: _panelDecoration(),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                currentUser.displayName,
-                style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                  color: _MgmtColors.ink,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              const SizedBox(height: 8),
-              _ProfileRow(label: 'Role', value: currentUser.role.label),
-              _ProfileRow(
-                label: 'Farm',
-                value: currentUser.activeFarmId.isEmpty
-                    ? 'No farm selected'
-                    : currentUser.activeFarmId,
-              ),
-              _ProfileRow(
-                label: 'Cached Farms',
-                value: '${snapshot.farms.length}',
-              ),
-              _ProfileRow(
-                label: 'Pending Sync',
-                value: '${snapshot.pendingSyncCount}',
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _SettingsSection extends StatelessWidget {
-  const _SettingsSection({
-    required this.currentUser,
-    required this.permissions,
-    required this.repository,
-    required this.snapshot,
-    required this.onSaved,
-  });
-
-  final AppUser currentUser;
-  final ManagementPermissions permissions;
-  final ManagementDataSource repository;
-  final ManagementSnapshot snapshot;
-  final VoidCallback onSaved;
-
-  @override
-  Widget build(BuildContext context) {
-    return _TeamSection(
-      currentUser: currentUser,
-      permissions: permissions,
-      repository: repository,
-      snapshot: snapshot,
-      onSaved: onSaved,
-    );
-  }
-}
-
-class _ProfileRow extends StatelessWidget {
-  const _ProfileRow({required this.label, required this.value});
-
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 110,
-            child: Text(
-              label,
-              style: const TextStyle(
-                color: _MgmtColors.muted,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
-          Expanded(
-            child: Text(
-              value,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: _MgmtColors.ink,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
-          ),
-        ],
-      ),
+      onRecordTap: (record) {
+        if (record.status == 'CUSTOMER' || record.status == 'SUPPLIER') {
+          _openStatement(context, record);
+        }
+      },
     );
   }
 }
 
 class _HubRecordTile extends StatelessWidget {
-  const _HubRecordTile({required this.record, required this.accentColor});
+  const _HubRecordTile({
+    required this.record,
+    required this.accentColor,
+    this.onTap,
+  });
 
   final HubModuleRecord record;
   final Color accentColor;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: _panelDecoration(),
-      child: Row(
-        children: [
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: _panelDecoration(),
+          child: Row(
+            children: [
           Container(
             width: 8,
             height: 52,
@@ -1027,7 +977,9 @@ class _HubRecordTile extends StatelessWidget {
               ],
             ),
           ],
-        ],
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1137,6 +1089,36 @@ class _ExpenseLedgerSectionState extends State<_ExpenseLedgerSection> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        if (widget.permissions.canEditFinance)
+          FutureBuilder<List<MissingCostBatch>>(
+            future: widget.repository.loadBatchesMissingCost(widget.currentUser),
+            builder: (context, batchSnap) {
+              if (!batchSnap.hasData || batchSnap.data!.isEmpty) {
+                return FutureBuilder<List<MissingCostHealthItem>>(
+                  future: widget.repository.loadHealthItemsMissingCost(
+                    widget.currentUser,
+                  ),
+                  builder: (context, healthSnap) {
+                    if (!healthSnap.hasData || healthSnap.data!.isEmpty) {
+                      return const SizedBox.shrink();
+                    }
+                    final item = healthSnap.data!.first;
+                    return _MissingFinanceBanner(
+                      title: 'Health stock missing cost',
+                      detail:
+                          '${item.itemName} needs a unit cost for accurate P&L.',
+                    );
+                  },
+                );
+              }
+              final batch = batchSnap.data!.first;
+              return _MissingFinanceBanner(
+                title: 'Batch missing initial cost',
+                detail:
+                    '${batch.batchName} (${batch.initialCount} birds) needs purchase cost data.',
+              );
+            },
+          ),
         _SectionHeader(
           title: 'Batch Costing Ledger',
           subtitle: widget.permissions.canEditFinance
@@ -1166,8 +1148,9 @@ class _ExpenseLedgerSectionState extends State<_ExpenseLedgerSection> {
                           const [
                                 'FEED',
                                 'MEDICATION',
-                                'UTILITIES',
+                                'LIVESTOCK_PURCHASE',
                                 'SALARY',
+                                'UTILITIES',
                                 'TRANSPORT',
                                 'EQUIPMENT',
                                 'MAINTENANCE',
@@ -1712,8 +1695,10 @@ class _TeamSectionState extends State<_TeamSection> {
                       items:
                           const [
                                 UserRole.worker,
+                                UserRole.cashier,
                                 UserRole.manager,
                                 UserRole.accountant,
+                                UserRole.financeOfficer,
                               ]
                               .map(
                                 (role) => DropdownMenuItem(
@@ -1903,6 +1888,8 @@ IconData _iconFor(ManagementSection section) {
       return Icons.egg_alt_outlined;
     case ManagementSection.feeding:
       return Icons.inventory_2_outlined;
+    case ManagementSection.health:
+      return Icons.vaccines_outlined;
     case ManagementSection.mortality:
       return Icons.warning_amber_rounded;
     case ManagementSection.quarantine:
@@ -1934,6 +1921,8 @@ String _labelFor(ManagementSection section) {
       return 'Eggs';
     case ManagementSection.feeding:
       return 'Feeding';
+    case ManagementSection.health:
+      return 'Health';
     case ManagementSection.mortality:
       return 'Mortality';
     case ManagementSection.quarantine:
@@ -1965,6 +1954,8 @@ String _descriptionFor(ManagementSection section) {
       return 'Collection and grading ledger';
     case ManagementSection.feeding:
       return 'Feed usage and sack counts';
+    case ManagementSection.health:
+      return 'Vaccination and medication schedules';
     case ManagementSection.mortality:
       return 'Bird deaths only';
     case ManagementSection.quarantine:
@@ -1985,6 +1976,55 @@ String _descriptionFor(ManagementSection section) {
 }
 
 String _money(double value) => 'GHS ${value.toStringAsFixed(2)}';
+
+class _MissingFinanceBanner extends StatelessWidget {
+  const _MissingFinanceBanner({
+    required this.title,
+    required this.detail,
+  });
+
+  final String title;
+  final String detail;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xfffff7ed),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xfff59e0b)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.warning_amber_rounded, color: Color(0xfff59e0b)),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(fontWeight: FontWeight.w900),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  detail,
+                  style: const TextStyle(
+                    color: Color(0xff667085),
+                    fontSize: 13,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 class _MgmtColors {
   static const background = Color(0xfff7f9fb);

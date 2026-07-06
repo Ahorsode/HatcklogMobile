@@ -2,6 +2,8 @@ enum UserRole {
   worker,
   manager,
   accountant,
+  cashier,
+  financeOfficer,
   owner,
   admin,
   unknown;
@@ -19,6 +21,10 @@ enum UserRole {
       case 'finance':
       case 'bookkeeper':
         return UserRole.accountant;
+      case 'cashier':
+        return UserRole.cashier;
+      case 'financeofficer':
+        return UserRole.financeOfficer;
       case 'owner':
       case 'owners':
       case 'farmowner':
@@ -59,6 +65,10 @@ enum UserRole {
         return 'Manager';
       case UserRole.accountant:
         return 'Accountant';
+      case UserRole.cashier:
+        return 'Cashier';
+      case UserRole.financeOfficer:
+        return 'Finance Officer';
       case UserRole.owner:
         return 'Owner';
       case UserRole.admin:
@@ -68,8 +78,31 @@ enum UserRole {
     }
   }
 
+  String get apiRole {
+    switch (this) {
+      case UserRole.financeOfficer:
+        return 'FINANCE_OFFICER';
+      case UserRole.cashier:
+        return 'CASHIER';
+      case UserRole.worker:
+        return 'WORKER';
+      case UserRole.manager:
+        return 'MANAGER';
+      case UserRole.accountant:
+        return 'ACCOUNTANT';
+      case UserRole.owner:
+        return 'OWNER';
+      case UserRole.admin:
+        return 'ADMIN';
+      case UserRole.unknown:
+        return 'WORKER';
+    }
+  }
+
   bool get hasUniversalAccess {
-    return this == UserRole.owner || this == UserRole.admin;
+    return this == UserRole.owner ||
+        this == UserRole.admin ||
+        this == UserRole.manager;
   }
 
   bool get hasMobileDashboardAccess {
@@ -77,6 +110,8 @@ enum UserRole {
       case UserRole.worker:
       case UserRole.manager:
       case UserRole.accountant:
+      case UserRole.cashier:
+      case UserRole.financeOfficer:
       case UserRole.owner:
       case UserRole.admin:
         return true;
@@ -93,9 +128,12 @@ class AppUser {
     required this.role,
     this.email = '',
     this.firstName = '',
+    this.middleName = '',
     this.lastName = '',
     this.activeFarmId = '',
+    this.activeFarmName = '',
     this.activeBatchId = '',
+    this.activeBatchName = '',
     this.requiresInitialSetup = false,
     this.authenticatedOffline = false,
   });
@@ -105,18 +143,44 @@ class AppUser {
   final String email;
   final UserRole role;
   final String firstName;
+  final String middleName;
   final String lastName;
   final String activeFarmId;
+  final String activeFarmName;
   final String activeBatchId;
+  final String activeBatchName;
   final bool requiresInitialSetup;
   final bool authenticatedOffline;
 
+  String get farmLabel {
+    final name = activeFarmName.trim();
+    if (name.isNotEmpty) {
+      return name;
+    }
+    return activeFarmId.trim().isEmpty ? 'Active Farm Monitor' : 'Active Farm Monitor';
+  }
+
+  String get farmDisplayLabel {
+    final name = activeFarmName.trim();
+    if (name.isNotEmpty) {
+      return 'Active Farm Monitor - $name';
+    }
+    return 'Active Farm Monitor';
+  }
+
   String get batchLabel {
-    return activeBatchId.trim().isEmpty ? 'Unassigned Batch' : activeBatchId;
+    final name = activeBatchName.trim();
+    if (name.isNotEmpty) {
+      return name;
+    }
+    return activeBatchId.trim().isEmpty ? 'Unassigned Batch' : 'Batch';
   }
 
   String get displayName {
-    final fullName = '$firstName $lastName'.trim();
+    final middle = middleName.trim();
+    final fullName = middle.isEmpty
+        ? '$firstName $lastName'.trim()
+        : '$firstName $middle $lastName'.trim();
     if (fullName.isNotEmpty) {
       return fullName;
     }
@@ -140,9 +204,12 @@ class AppUser {
     String? email,
     UserRole? role,
     String? firstName,
+    String? middleName,
     String? lastName,
     String? activeFarmId,
+    String? activeFarmName,
     String? activeBatchId,
+    String? activeBatchName,
     bool? requiresInitialSetup,
     bool? authenticatedOffline,
   }) {
@@ -152,9 +219,12 @@ class AppUser {
       email: email ?? this.email,
       role: role ?? this.role,
       firstName: firstName ?? this.firstName,
+      middleName: middleName ?? this.middleName,
       lastName: lastName ?? this.lastName,
       activeFarmId: activeFarmId ?? this.activeFarmId,
+      activeFarmName: activeFarmName ?? this.activeFarmName,
       activeBatchId: activeBatchId ?? this.activeBatchId,
+      activeBatchName: activeBatchName ?? this.activeBatchName,
       requiresInitialSetup: requiresInitialSetup ?? this.requiresInitialSetup,
       authenticatedOffline: authenticatedOffline ?? this.authenticatedOffline,
     );
@@ -167,6 +237,7 @@ class AppUser {
       'email': email,
       'role': role.name,
       'first_name': firstName,
+      'middle_name': middleName,
       'last_name': lastName,
       'active_farm_id': activeFarmId,
       'active_batch_id': activeBatchId,
@@ -181,6 +252,7 @@ class AppUser {
       email: (map['email'] as String?) ?? '',
       role: UserRole.fromString(map['role'] as String?),
       firstName: (map['first_name'] as String?) ?? '',
+      middleName: (map['middle_name'] as String?) ?? '',
       lastName: (map['last_name'] as String?) ?? '',
       activeFarmId: (map['active_farm_id'] as String?) ?? '',
       activeBatchId: (map['active_batch_id'] as String?) ?? '',

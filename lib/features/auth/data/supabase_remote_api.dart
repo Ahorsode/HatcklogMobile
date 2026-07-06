@@ -3,7 +3,11 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/config/supabase_config.dart';
 import '../../../core/models/app_user.dart';
+import '../../../core/permissions/farm_permissions.dart';
+import '../../../core/permissions/navigation_permissions.dart';
+import '../../../core/permissions/staff_permission_defaults.dart';
 import '../../../core/storage/local_database.dart';
+import '../../../utils/house_climate_utils.dart';
 
 class MobileGoogleAuthResult {
   const MobileGoogleAuthResult({
@@ -120,7 +124,15 @@ class SupabaseRemoteApi {
       return null;
     }
 
-    final authUser = client.auth.currentUser;
+    var authUser = client.auth.currentUser;
+    if (authUser == null) {
+      try {
+        final response = await client.auth.refreshSession();
+        authUser = response.session?.user ?? client.auth.currentUser;
+      } on Object {
+        return null;
+      }
+    }
     if (authUser == null) {
       return null;
     }
@@ -243,9 +255,51 @@ class SupabaseRemoteApi {
           'first_name': firstName,
           'last_name': lastName,
           'onboarding_completed': true,
+          'onboarding_status': 'active',
         },
       ),
     );
+
+    final phoneNumber = user.phoneNumber.trim();
+    if (phoneNumber.isNotEmpty) {
+      try {
+        await client.rpc(
+          'complete_worker_activation',
+          params: {
+            'p_phone_number': phoneNumber,
+            'p_first_name': firstName,
+            'p_last_name': lastName,
+          },
+        );
+        return user.copyWith(
+          firstName: firstName,
+          lastName: lastName,
+          requiresInitialSetup: false,
+          authenticatedOffline: false,
+        );
+      } on Object catch (error) {
+        debugPrint(
+          'HatchLog Auth Engine: complete_worker_activation skipped -> $error',
+        );
+      }
+
+      final accepted = await _acceptPendingInvitation(
+        userId: user.id,
+        phoneNumber: phoneNumber,
+      );
+      if (accepted != null) {
+        final farmId = _asString(accepted['farm_id']);
+        final farmName = farmId.isEmpty ? '' : await _readFarmName(farmId);
+        return user.copyWith(
+          firstName: firstName,
+          lastName: lastName,
+          activeFarmId: farmId,
+          activeFarmName: farmName,
+          requiresInitialSetup: false,
+          authenticatedOffline: false,
+        );
+      }
+    }
 
     await _updateWebUserProfile(user.id, firstName, lastName);
 
@@ -275,8 +329,20 @@ class SupabaseRemoteApi {
         await _pushFarmGateSale(input);
       case 'role_promotion':
         await _pushRolePromotion(input);
+      case 'team_permission_update':
+        await _pushTeamPermissionUpdate(input);
       case 'restore_record':
         await _pushRestoreRecord(input);
+      case 'farm_settings_update':
+        await _pushFarmSettingsUpdate(input);
+      case 'inventory_reorder_update':
+        await _pushInventoryReorderUpdate(input);
+      case 'profile_update':
+        await _pushProfileUpdate(input);
+      case 'worker_log_update':
+        await _pushWorkerLogUpdate(input);
+      case 'worker_log_delete':
+        await _pushWorkerLogDelete(input);
       default:
         throw StateError('Unsupported worker input type: ${input.inputType}');
     }
@@ -298,6 +364,29 @@ class SupabaseRemoteApi {
     );
   }
 
+  Future<void> updateWorkerPermissions({
+    required String farmId,
+    required String targetUserId,
+    required FarmPermissions permissions,
+  }) async {
+    final client = _requireClient();
+    final map = permissions.toMap();
+    await client.from('user_permissions').upsert({
+      'id': _stableJoinId('permission', farmId, targetUserId),
+      'user_id': targetUserId,
+      'farm_id': farmId,
+      for (final entry in map.entries) entry.key: entry.value,
+    });
+    try {
+      await client.rpc(
+        'invalidate_user_sessions',
+        params: {'p_user_id': targetUserId},
+      );
+    } on Object catch (error) {
+      debugPrint('Session invalidation RPC failed: $error');
+    }
+  }
+
   Future<void> signOut() async {
     final client = _client;
     if (client != null) {
@@ -308,8 +397,10 @@ class SupabaseRemoteApi {
   Future<CloudSyncSnapshot> fetchOperationalSnapshot({
     required AppUser user,
     DateTime? modifiedAfter,
+    String? farmIdOverride,
   }) async {
-    final farmId = user.activeFarmId;
+    final override = farmIdOverride?.trim() ?? '';
+    final farmId = override.isNotEmpty ? override : user.activeFarmId;
     if (farmId.isEmpty) {
       return CloudSyncSnapshot(
         pulledAt: DateTime.now().toUtc(),
@@ -323,7 +414,7 @@ class SupabaseRemoteApi {
       bucket.addAll(rows);
     }
 
-    final farms = await _selectFarmRows(
+    final farms = await _selectFarmRowsSafe(
       'farms',
       farmId,
       farmColumn: 'id',
@@ -332,7 +423,7 @@ class SupabaseRemoteApi {
     );
     addRows('farms', farms.map(_mapFarm));
 
-    final farmMembers = await _selectFarmRows(
+    final farmMembers = await _selectFarmRowsSafe(
       'farm_members',
       farmId,
       farmColumn: 'farmId',
@@ -348,121 +439,125 @@ class SupabaseRemoteApi {
         userIds.add(memberUserId);
       }
     }
-    final users = await _selectRowsByIds('users', 'id', userIds);
+    final users = await _selectRowsByIdsSafe('users', 'id', userIds);
     addRows('local_users', users.map((row) => _mapUser(row, user)));
 
     final farmScopedQueries = await Future.wait([
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'user_permissions',
         farmId,
         farmColumn: 'farm_id',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'farm_settings',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'updatedAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'houses',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'updatedAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'batches',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'updatedAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'inventory',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'updatedAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'egg_production',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'createdAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'daily_feeding_logs',
         farmId,
         farmColumn: 'farmId',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'mortality',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'createdAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'expenses',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'updated_at',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'financial_transactions',
         farmId,
         farmColumn: 'farm_id',
         updatedColumn: 'updated_at',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'sales',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'createdAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows('sale_items', farmId, farmColumn: 'farmId'),
-      _selectFarmRows('customers', farmId, farmColumn: 'farmId'),
-      _selectFarmRows(
+      _selectFarmRowsSafe('sale_items', farmId, farmColumn: 'farmId'),
+      _selectFarmRowsSafe('customers', farmId, farmColumn: 'farmId'),
+      _selectFarmRowsSafe(
         'orders',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'updated_at',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows('health_records', farmId, farmColumn: 'farmId'),
-      _selectFarmRows(
+      _selectFarmRowsSafe('health_records', farmId, farmColumn: 'farmId'),
+      _selectFarmRowsSafe(
         'weight_records',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'createdAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows('vaccination_schedules', farmId, farmColumn: 'farmId'),
-      _selectFarmRows('medication_schedules', farmId, farmColumn: 'farmId'),
-      _selectFarmRows('suppliers', farmId, farmColumn: 'farmId'),
-      _selectFarmRows('egg_categories', farmId, farmColumn: 'farmId'),
-      _selectFarmRows(
+      _selectFarmRowsSafe('vaccination_schedules', farmId, farmColumn: 'farmId'),
+      _selectFarmRowsSafe('medication_schedules', farmId, farmColumn: 'farmId'),
+      _selectFarmRowsSafe('suppliers', farmId, farmColumn: 'farmId'),
+      _selectFarmRowsSafe('egg_categories', farmId, farmColumn: 'farmId'),
+      _selectFarmRowsSafe(
         'feed_formulations',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'updatedAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows(
+      _selectFarmRowsSafe(
         'isolation_rooms',
         farmId,
         farmColumn: 'farmId',
         updatedColumn: 'updatedAt',
         modifiedAfter: modifiedAfter,
       ),
-      _selectFarmRows('expense_allocations', farmId, farmColumn: 'farmId'),
+      _selectFarmRowsSafe(
+        'expense_allocations',
+        farmId,
+        farmColumn: 'farm_id',
+      ),
     ]);
 
     final userPermissions = farmScopedQueries[0];
@@ -523,14 +618,14 @@ class SupabaseRemoteApi {
     addRows('feed_formulations', feedFormulations.map(_mapFeedFormulation));
     addRows('isolation_rooms', isolationRooms.map(_mapIsolationRoom));
 
-    final orderItems = await _selectRowsByIds(
+    final orderItems = await _selectRowsByIdsSafe(
       'order_items',
       'orderId',
       orders.map((row) => _asString(row['id'])).where((id) => id.isNotEmpty),
     );
     addRows('order_items', orderItems.map(_mapOrderItem));
 
-    final formulationIngredients = await _selectRowsByIds(
+    final formulationIngredients = await _selectRowsByIdsSafe(
       'feed_formulation_ingredients',
       'formulationId',
       feedFormulations
@@ -574,6 +669,291 @@ class SupabaseRemoteApi {
     }
     final response = await query.limit(1000);
     return _asRows(response);
+  }
+
+  Future<List<Map<String, dynamic>>> _selectFarmRowsSafe(
+    String table,
+    String farmId, {
+    required String farmColumn,
+    String? updatedColumn,
+    DateTime? modifiedAfter,
+  }) async {
+    try {
+      return await _selectFarmRows(
+        table,
+        farmId,
+        farmColumn: farmColumn,
+        updatedColumn: updatedColumn,
+        modifiedAfter: modifiedAfter,
+      );
+    } on Object catch (error) {
+      debugPrint(
+        'WARN: Cloud pull skipped table $table for farm $farmId: $error',
+      );
+      return const [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _selectRowsByIdsSafe(
+    String table,
+    String idColumn,
+    Iterable<String> ids,
+  ) async {
+    try {
+      return await _selectRowsByIds(table, idColumn, ids);
+    } on Object catch (error) {
+      debugPrint('WARN: Cloud pull skipped table $table by ids: $error');
+      return const [];
+    }
+  }
+
+  /// Same livestock source used by the Livestock tab Supabase stream.
+  Future<List<Map<String, Object?>>> fetchLivestockBatchesForFarm(
+    String farmId,
+  ) async {
+    if (farmId.isEmpty) {
+      return const [];
+    }
+    final response = await _requireClient()
+        .from('batches')
+        .select()
+        .eq('farmId', farmId)
+        .order('createdAt', ascending: false)
+        .limit(250);
+    final rows = _asRows(response);
+    return rows
+        .map(_mapBatch)
+        .where((row) => _boolInt(row['is_deleted']) == 0)
+        .toList(growable: false);
+  }
+
+  Future<void> createLivestockBatch({
+    required String id,
+    required String farmId,
+    required String userId,
+    required String batchName,
+    required String breedType,
+    required String type,
+    required String houseId,
+    required int initialCount,
+    required DateTime arrivalDate,
+  }) async {
+    final now = DateTime.now().toUtc().toIso8601String();
+    await _upsertBatchOnCloud(
+      {
+        'id': id,
+        'farmId': farmId,
+        'userId': userId,
+        'batchName': batchName,
+        'breedType': breedType,
+        'type': type,
+        'houseId': houseId,
+        'initialCount': initialCount,
+        'currentCount': initialCount,
+        'isolationCount': 0,
+        'arrivalDate': arrivalDate.toUtc().toIso8601String(),
+        'status': 'active',
+        'is_deleted': false,
+        'createdAt': now,
+        'updatedAt': now,
+      },
+      batchId: id,
+    );
+  }
+
+  Future<void> updateLivestockBatch({
+    required String id,
+    required String farmId,
+    required String batchName,
+    required String breedType,
+    required String type,
+    required String houseId,
+    required int initialCount,
+    required DateTime arrivalDate,
+    required String status,
+    String growthTargetOverride = '',
+  }) async {
+    final client = _requireClient();
+    final existing = await client
+        .from('batches')
+        .select('initialCount, currentCount')
+        .eq('id', id)
+        .eq('farmId', farmId)
+        .maybeSingle();
+    if (existing == null) {
+      throw StateError('Batch not found');
+    }
+
+    final existingInitial = _asInt(existing['initialCount']);
+    final existingCurrent = _asInt(existing['currentCount']);
+    var nextCurrent = existingCurrent;
+    if (initialCount != existingInitial) {
+      nextCurrent = existingCurrent + (initialCount - existingInitial);
+      if (nextCurrent < 0) {
+        nextCurrent = 0;
+      }
+    }
+
+    await client.from('batches').update({
+      'batchName': batchName,
+      'breedType': breedType,
+      'type': type,
+      'houseId': houseId,
+      'initialCount': initialCount,
+      'currentCount': nextCurrent,
+      'arrivalDate': arrivalDate.toUtc().toIso8601String(),
+      'status': status,
+      if (growthTargetOverride.isNotEmpty)
+        'growthTargetOverride': growthTargetOverride,
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', id).eq('farmId', farmId);
+  }
+
+  Future<void> deleteLivestockBatch({
+    required String id,
+    required String farmId,
+    required String reason,
+  }) async {
+    await _requireClient().from('batches').update({
+      'is_deleted': true,
+      'deleted_at': DateTime.now().toUtc().toIso8601String(),
+      'status': 'deleted',
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', id).eq('farmId', farmId);
+  }
+
+  Future<void> updateLivestockBatchFinancials({
+    required String batchId,
+    required String farmId,
+    required String userId,
+    required double actualCost,
+    required double carriageInward,
+    required List<Map<String, Object>> otherExpenses,
+  }) async {
+    await _requireClient().from('batches').update({
+      'initialCostActual': actualCost,
+      'initialCostCarriage': carriageInward,
+      'initialCostOther': otherExpenses,
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', batchId).eq('farmId', farmId);
+
+    final expenses = <Map<String, Object>>[
+      if (actualCost > 0)
+        {
+          'farmId': farmId,
+          'userId': userId,
+          'amount': actualCost,
+          'category': 'EQUIPMENT',
+          'description': 'Initial livestock purchase cost',
+          'batch_id': batchId,
+          'expenseDate': DateTime.now().toUtc().toIso8601String(),
+          'is_deleted': false,
+        },
+      if (carriageInward > 0)
+        {
+          'farmId': farmId,
+          'userId': userId,
+          'amount': carriageInward,
+          'category': 'MAINTENANCE',
+          'description': 'Livestock carriage inward',
+          'batch_id': batchId,
+          'expenseDate': DateTime.now().toUtc().toIso8601String(),
+          'is_deleted': false,
+        },
+      for (final item in otherExpenses)
+        if (_asDouble(item['amount']) > 0)
+          {
+            'farmId': farmId,
+            'userId': userId,
+            'amount': _asDouble(item['amount']),
+            'category': 'OTHER',
+            'description': _asString(item['label']).isEmpty
+                ? 'Other initial livestock cost'
+                : _asString(item['label']),
+            'batch_id': batchId,
+            'expenseDate': DateTime.now().toUtc().toIso8601String(),
+            'is_deleted': false,
+          },
+    ];
+
+    for (final expense in expenses) {
+      await _verifiedUpsert('expenses', {
+        'id': 'mobile_exp_${batchId}_${expense['category']}_${DateTime.now().microsecondsSinceEpoch}',
+        ...expense,
+        'createdAt': DateTime.now().toUtc().toIso8601String(),
+        'updatedAt': DateTime.now().toUtc().toIso8601String(),
+      });
+    }
+  }
+
+  Future<void> returnLivestockFromIsolation({
+    required String batchId,
+    required String farmId,
+    required int count,
+  }) async {
+    final client = _requireClient();
+    final batch = await client
+        .from('batches')
+        .select('isolationCount, currentCount')
+        .eq('id', batchId)
+        .eq('farmId', farmId)
+        .maybeSingle();
+    if (batch == null) {
+      throw StateError('Batch not found');
+    }
+    final isolation = _asInt(batch['isolationCount']);
+    if (isolation < count) {
+      throw StateError('Not enough birds in isolation to recover');
+    }
+    await client.from('batches').update({
+      'isolationCount': isolation - count,
+      'currentCount': _asInt(batch['currentCount']) + count,
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', batchId).eq('farmId', farmId);
+  }
+
+  Future<void> logLivestockMortalityInIsolation({
+    required String batchId,
+    required String farmId,
+    required String userId,
+    required int count,
+    required String reason,
+  }) async {
+    final client = _requireClient();
+    final batch = await client
+        .from('batches')
+        .select('isolationCount')
+        .eq('id', batchId)
+        .eq('farmId', farmId)
+        .maybeSingle();
+    if (batch == null) {
+      throw StateError('Batch not found');
+    }
+    final isolation = _asInt(batch['isolationCount']);
+    if (isolation < count) {
+      throw StateError('Not enough birds in isolation');
+    }
+
+    final now = DateTime.now().toUtc().toIso8601String();
+    await _verifiedUpsert('mortality', {
+      'id': 'mobile_iso_mort_${batchId}_${DateTime.now().microsecondsSinceEpoch}',
+      'batchId': batchId,
+      'farmId': farmId,
+      'userId': userId,
+      'count': count,
+      'type': 'DEAD',
+      'category': 'Health',
+      'subCategory': 'Isolation Mortality',
+      'reason': reason,
+      'logDate': now,
+      'createdAt': now,
+      'is_deleted': false,
+    });
+
+    await client.from('batches').update({
+      'isolationCount': isolation - count,
+      'updatedAt': now,
+    }).eq('id', batchId).eq('farmId', farmId);
   }
 
   Future<List<Map<String, dynamic>>> _selectRowsByIds(
@@ -666,6 +1046,8 @@ class SupabaseRemoteApi {
       'can_edit_mortality': _boolInt(row['can_edit_mortality']),
       'can_view_quarantine': _boolInt(row['can_view_quarantine']),
       'can_edit_quarantine': _boolInt(row['can_edit_quarantine']),
+      'can_view_health': _boolInt(row['can_view_health']),
+      'can_edit_health': _boolInt(row['can_edit_health']),
       'can_view_customers': _boolInt(row['can_view_customers']),
       'can_edit_customers': _boolInt(row['can_edit_customers']),
       'can_view_team': _boolInt(row['can_view_team']),
@@ -697,6 +1079,8 @@ class SupabaseRemoteApi {
       'last_environment_log_at': _timestamp(row['updatedAt']),
       'created_at': _timestamp(row['createdAt']),
       'updated_at': _timestamp(row['updatedAt']),
+      'is_deleted': 0,
+      'is_synced': 1,
     };
   }
 
@@ -721,30 +1105,37 @@ class SupabaseRemoteApi {
     final arrivalDate = row['arrivalDate'];
     final status = _asString(row['status']);
     final breedType = _asString(row['breedType']);
+    final batchName = _asString(row['batchName']);
+    final batchType = _asString(row['type']);
     return {
       'id': _asString(row['id']),
       'farm_id': _asString(row['farmId']),
-      'house_id': _asString(row['houseId']),
+      'house_id': _asString(row['houseId']).isEmpty
+          ? 'unassigned'
+          : _asString(row['houseId']),
       'user_id': _asString(row['userId']),
-      'batch_name': _asString(row['batchName']),
+      'batch_name': batchName.isEmpty ? 'New Batch' : batchName,
       'breed_type': breedType,
       'bird_strain': breedType,
       'age_days': _ageDays(arrivalDate),
-      'type': _asString(row['type']),
-      'status': status,
-      'active_state': status,
+      'type': batchType.isEmpty ? 'POULTRY_BROILER' : batchType,
+      'status': status.isEmpty ? 'active' : status,
+      'active_state': status.isEmpty ? 'active' : status,
       'current_count': _asInt(row['currentCount']),
       'initial_count': _asInt(row['initialCount']),
       'isolation_count': _asInt(row['isolationCount']),
+      'growth_target_override': _asString(row['growthTargetOverride']),
       'initial_cost_actual': _asDouble(row['initialCostActual']),
       'initial_cost_carriage': _asDouble(row['initialCostCarriage']),
       'initial_cost_other': _asDouble(row['initialCostOther']),
-      'arrival_date': _timestamp(arrivalDate),
-      'local_batch_id': row['local_batch_id'],
-      'is_deleted': _boolInt(row['is_deleted']),
+      'arrival_date':
+          _timestamp(arrivalDate) ?? DateTime.now().toUtc().toIso8601String(),
+      'local_batch_id': row['localBatchId'] ?? row['local_batch_id'],
+      'is_deleted': _boolInt(row['isDeleted'] ?? row['is_deleted']),
       'created_at': _timestamp(row['createdAt']),
       'deleted_at': _timestamp(row['deleted_at']),
       'updated_at': _timestamp(row['updatedAt']),
+      'is_synced': 1,
     };
   }
 
@@ -1046,7 +1437,10 @@ class SupabaseRemoteApi {
       'notes': _asString(row['notes']),
       'inventory_id': _asString(row['inventoryId']),
       'quantity': _asDouble(row['quantity'], fallback: 1),
+      'usage_type': _asString(row['usageType']),
+      'unit': _asString(row['unit']),
       'farm_id': _asString(row['farmId']),
+      'is_synced': 1,
     };
   }
 
@@ -1060,7 +1454,10 @@ class SupabaseRemoteApi {
       'notes': _asString(row['notes']),
       'inventory_id': _asString(row['inventoryId']),
       'quantity': _asDouble(row['quantity'], fallback: 1),
+      'usage_type': _asString(row['usageType']),
+      'unit': _asString(row['unit']),
       'farm_id': _asString(row['farmId']),
+      'is_synced': 1,
     };
   }
 
@@ -1154,18 +1551,19 @@ class SupabaseRemoteApi {
   }
 
   String _environmentState(Map<String, dynamic> row) {
-    final temperature = _asDouble(row['currentTemperature']);
-    final humidity = _asDouble(row['currentHumidity']);
-    if (temperature <= 0 && humidity <= 0) {
-      return '';
-    }
-    if (temperature > 35 || humidity > 80) {
-      return 'ALERT';
-    }
-    if (temperature < 18 || humidity < 35) {
-      return 'WATCH';
-    }
-    return 'NORMAL';
+    final temperature = _nullableDouble(row['currentTemperature']);
+    final humidity = _nullableDouble(row['currentHumidity']);
+    return environmentalStateLabel(
+      temperature: temperature,
+      humidity: humidity,
+    );
+  }
+
+  double? _nullableDouble(Object? value) {
+    if (value == null) return null;
+    if (value is double) return value;
+    if (value is num) return value.toDouble();
+    return double.tryParse(value.toString());
   }
 
   String _inventoryGroup(String category) {
@@ -1307,7 +1705,7 @@ class SupabaseRemoteApi {
       'id': _stableJoinId('permission', assignedFarmId, authUser.id),
       'user_id': authUser.id,
       'farm_id': assignedFarmId,
-      ..._defaultPermissionsForRole(discoveredRole),
+      ...defaultPermissionsForRole(discoveredRole).toMap(),
     });
 
     final inviteId = invite['id']?.toString().trim() ?? '';
@@ -1358,6 +1756,70 @@ class SupabaseRemoteApi {
     }
   }
 
+  Future<Map<String, dynamic>?> _readPendingInvitationByPhone(
+    String phoneNumber,
+  ) async {
+    for (final candidate in _phoneLookupCandidates(phoneNumber)) {
+      try {
+        final client = _requireClient();
+        final rows = await client
+            .from('invitations')
+            .select(
+              'id, email, role, status, farm_id, phone_number, updated_at',
+            )
+            .eq('phone_number', candidate)
+            .inFilter('status', const ['pending', 'PENDING'])
+            .order('updated_at', ascending: false)
+            .limit(1);
+        final mappedRows = _asRows(rows);
+        if (mappedRows.isNotEmpty) {
+          return mappedRows.first;
+        }
+      } on Object catch (error) {
+        debugPrint(
+          'HatchLog Auth Engine: Invitation lookup failed for $candidate -> $error',
+        );
+      }
+    }
+    return null;
+  }
+
+  Future<Map<String, dynamic>?> _acceptPendingInvitation({
+    required String userId,
+    String? phoneNumber,
+    String? email,
+  }) async {
+    if (userId.trim().isEmpty) {
+      return null;
+    }
+    try {
+      final client = _requireClient();
+      final response = await client.rpc(
+        'accept_pending_invitation',
+        params: {
+          'p_user_id': userId,
+          'p_phone_number': phoneNumber?.trim() ?? '',
+          'p_email': email?.trim().toLowerCase() ?? '',
+        },
+      );
+      if (response == null) {
+        return null;
+      }
+      if (response is Map<String, dynamic>) {
+        return response;
+      }
+      if (response is Map) {
+        return Map<String, dynamic>.from(response);
+      }
+      return null;
+    } on Object catch (error) {
+      debugPrint(
+        'HatchLog Auth Engine: accept_pending_invitation failed -> $error',
+      );
+      return null;
+    }
+  }
+
   Future<Map<String, dynamic>?> _readPendingInvitationByEmail(
     String email,
   ) async {
@@ -1378,36 +1840,6 @@ class SupabaseRemoteApi {
       );
       return null;
     }
-  }
-
-  Map<String, bool> _defaultPermissionsForRole(String role) {
-    final normalized = role.trim().toLowerCase();
-    final isManager = normalized == 'manager' || normalized == 'owner';
-    final isAccountant = normalized == 'accountant' || normalized == 'finance';
-    final isWorker = normalized == 'worker' || normalized == 'staff';
-
-    return {
-      'can_view_finance': isManager || isAccountant,
-      'can_edit_finance': isManager || isAccountant,
-      'can_view_inventory': isManager || isAccountant || isWorker,
-      'can_edit_inventory': isManager,
-      'can_view_batches': isManager || isWorker,
-      'can_edit_batches': isManager,
-      'can_view_sales': isManager || isAccountant,
-      'can_edit_sales': isManager || isAccountant,
-      'can_view_eggs': isManager || isWorker,
-      'can_edit_eggs': isManager || isWorker,
-      'can_view_feeding': isManager || isWorker,
-      'can_edit_feeding': isManager || isWorker,
-      'can_view_houses': isManager || isWorker,
-      'can_edit_houses': isManager,
-      'can_view_mortality': isManager || isWorker,
-      'can_edit_mortality': isManager || isWorker,
-      'can_view_customers': isManager || isAccountant,
-      'can_edit_customers': isManager || isAccountant,
-      'can_view_team': isManager,
-      'can_edit_team': isManager,
-    };
   }
 
   String _stableJoinId(String prefix, String farmId, String userId) {
@@ -1431,6 +1863,11 @@ class SupabaseRemoteApi {
     final email = authEmail.isEmpty ? fallbackEmail : authEmail;
     final phone = authPhone.isEmpty ? fallbackPhone : authPhone;
 
+    final provisionedProfile = await _safeReadProvisionedProfile(
+      authUserId: authUser.id,
+      phoneNumber: phone.isNotEmpty ? phone : fallbackPhone,
+    );
+
     final profile =
         preferredProfile ??
         (email.isEmpty ? null : await _safeReadWebUserProfileByEmail(email)) ??
@@ -1443,42 +1880,118 @@ class SupabaseRemoteApi {
         ? authMetadataRole
         : userMetadataRole.isNotEmpty
         ? userMetadataRole
-        : profile?['role'];
+        : profile?['role'] ?? provisionedProfile?['role'];
     final profileRole = UserRole.fromString(_asString(roleValue));
     final webUserId = _asString(profile?['id']);
-    final activeFarm = webUserId.isEmpty
+    final resolvedUserId = webUserId.isEmpty ? authUser.id : webUserId;
+    var activeFarm = webUserId.isEmpty
         ? null
         : await _readActiveFarmForUser(webUserId);
-    final activeFarmId = _asString(activeFarm?['farm_id']);
+    if (activeFarm == null && resolvedUserId != authUser.id) {
+      activeFarm = await _readActiveFarmForUser(authUser.id);
+    }
+    var activeFarmId = _asString(activeFarm?['farm_id']);
+    if (activeFarmId.isEmpty && provisionedProfile != null) {
+      activeFarmId = _asString(
+        provisionedProfile['farmId'] ?? provisionedProfile['farm_id'],
+      );
+    }
+    if (activeFarmId.isEmpty && resolvedUserId.isNotEmpty) {
+      final accepted = await _acceptPendingInvitation(
+        userId: resolvedUserId,
+        phoneNumber: phone.isNotEmpty ? phone : fallbackPhone,
+        email: email,
+      );
+      if (accepted != null) {
+        activeFarmId = _asString(accepted['farm_id']);
+        activeFarm = {
+          'farm_id': activeFarmId,
+          'role': _asString(accepted['role']),
+          'farm_owner_id': await _readFarmOwnerId(activeFarmId),
+        };
+        debugPrint(
+          'HatchLog Auth Engine: Accepted pending invitation for farm=$activeFarmId',
+        );
+      }
+    }
+    if (activeFarmId.isEmpty) {
+      Map<String, dynamic>? pendingInvitation;
+      if (phone.isNotEmpty) {
+        pendingInvitation = await _readPendingInvitationByPhone(phone);
+      }
+      pendingInvitation ??= email.isNotEmpty
+          ? await _readPendingInvitationByEmail(email)
+          : null;
+      activeFarmId = _asString(pendingInvitation?['farm_id']);
+      if (activeFarmId.isNotEmpty && activeFarm == null) {
+        activeFarm = {
+          'farm_id': activeFarmId,
+          'role': _asString(pendingInvitation?['role']),
+          'farm_owner_id': await _readFarmOwnerId(activeFarmId),
+        };
+      }
+    }
+    final farmOwnerId = _asString(activeFarm?['farm_owner_id']);
     final membershipRole = UserRole.fromString(_asString(activeFarm?['role']));
-    final effectiveRole = profileRole.hasUniversalAccess
-        ? profileRole
-        : membershipRole == UserRole.unknown
-        ? profileRole
-        : membershipRole;
+    final effectiveRole = activeFarmId.isEmpty
+        ? (profileRole == UserRole.unknown ? UserRole.worker : profileRole)
+        : resolveEffectiveFarmRole(
+            farmOwnerId: farmOwnerId,
+            userId: resolvedUserId,
+            membershipRole: membershipRole,
+          );
     final String userRole = effectiveRole.name.toLowerCase().trim();
-    debugPrint('HatchLog Auth Engine: Authenticated user role is -> $userRole');
+    debugPrint(
+      'HatchLog Auth Engine: Authenticated user role is -> $userRole '
+      '(farm=$activeFarmId membership=${membershipRole.name} owner=$farmOwnerId)',
+    );
     final activeBatchId = activeFarmId.isEmpty
         ? ''
         : await _readActiveBatchId(activeFarmId);
-    final profilePhone = _asString(profile?['phone_number']);
+    final activeBatchName = activeBatchId.isEmpty
+        ? ''
+        : await _readBatchName(activeFarmId, activeBatchId);
+    final activeFarmName = activeFarmId.isEmpty
+        ? ''
+        : await _readFarmName(activeFarmId);
+    final profilePhone = _asString(
+      profile?['phone_number'] ??
+          provisionedProfile?['phoneNumber'] ??
+          provisionedProfile?['phone_number'],
+    );
     final profileEmail = _asString(profile?['email']).trim().toLowerCase();
     final resolvedEmail = profileEmail.isEmpty ? email : profileEmail;
     final resolvedPhone = profilePhone.isEmpty ? phone : profilePhone;
     final primaryIdentifier = resolvedPhone.isEmpty
         ? resolvedEmail
         : resolvedPhone;
+    final provisionedStatus = _asString(
+      provisionedProfile?['status'],
+    ).toUpperCase();
 
     return AppUser(
       id: webUserId.isEmpty ? authUser.id : webUserId,
       phoneNumber: primaryIdentifier,
       email: resolvedEmail,
       role: effectiveRole,
-      firstName: _asString(profile?['first_name'] ?? profile?['firstname']),
-      lastName: _asString(profile?['last_name'] ?? profile?['surname']),
+      firstName: _asString(
+        profile?['first_name'] ??
+            profile?['firstname'] ??
+            provisionedProfile?['firstName'] ??
+            provisionedProfile?['first_name'],
+      ),
+      lastName: _asString(
+        profile?['last_name'] ??
+            profile?['surname'] ??
+            provisionedProfile?['lastName'] ??
+            provisionedProfile?['last_name'],
+      ),
       activeFarmId: activeFarmId,
+      activeFarmName: activeFarmName,
       activeBatchId: activeBatchId,
+      activeBatchName: activeBatchName,
       requiresInitialSetup:
+          provisionedStatus == 'PENDING' ||
           profile?['onboarding_completed'] == false ||
           profile?['must_change_password'] == true,
     );
@@ -1511,6 +2024,64 @@ class SupabaseRemoteApi {
   ) async {
     for (final candidate in _phoneLookupCandidates(phoneNumber)) {
       final profile = await _readWebUserProfileByPhone(candidate);
+      if (profile != null) {
+        return profile;
+      }
+    }
+    return null;
+  }
+
+  Future<Map<String, dynamic>?> _readProvisionedProfileByAuthUserId(
+    String authUserId,
+  ) async {
+    try {
+      final client = _requireClient();
+      return await client
+          .from('profiles')
+          .select(
+            'id, farmId, authUserId, phoneNumber, role, firstName, lastName, status, customPermissionsJson',
+          )
+          .eq('authUserId', authUserId)
+          .maybeSingle();
+    } on Object {
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>?> _readProvisionedProfileByPhone(
+    String phoneNumber,
+  ) async {
+    try {
+      final client = _requireClient();
+      return await client
+          .from('profiles')
+          .select(
+            'id, farmId, authUserId, phoneNumber, role, firstName, lastName, status, customPermissionsJson',
+          )
+          .eq('phoneNumber', phoneNumber)
+          .maybeSingle();
+    } on Object {
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>?> _safeReadProvisionedProfile({
+    required String authUserId,
+    required String phoneNumber,
+  }) async {
+    if (authUserId.isNotEmpty) {
+      final byAuth = await _readProvisionedProfileByAuthUserId(authUserId);
+      if (byAuth != null) {
+        return byAuth;
+      }
+    }
+
+    if (phoneNumber.isEmpty) {
+      return null;
+    }
+
+    for (final candidate in _phoneLookupCandidates(phoneNumber)) {
+      final profile = await _readProvisionedProfileByPhone(candidate);
       if (profile != null) {
         return profile;
       }
@@ -1551,6 +2122,26 @@ class SupabaseRemoteApi {
     return _asString(profile['role']);
   }
 
+  /// Farm-scoped role used for session refresh — mirrors web dashboard routing.
+  Future<UserRole> fetchEffectiveFarmRole({
+    required String userId,
+    required String farmId,
+  }) async {
+    if (userId.isEmpty || farmId.isEmpty) {
+      return UserRole.unknown;
+    }
+    final farmOwnerId = await _readFarmOwnerId(farmId);
+    final membershipRole = await _readFarmMembershipRole(
+      userId: userId,
+      farmId: farmId,
+    );
+    return resolveEffectiveFarmRole(
+      farmOwnerId: farmOwnerId,
+      userId: userId,
+      membershipRole: membershipRole,
+    );
+  }
+
   Future<Map<String, dynamic>?> _readActiveFarmForUser(String userId) async {
     final client = _requireClient();
     final Map<String, dynamic>? membership;
@@ -1566,14 +2157,20 @@ class SupabaseRemoteApi {
     }
 
     if (membership != null) {
-      return {'farm_id': membership['farmId'], 'role': membership['role']};
+      final farmId = _asString(membership['farmId']);
+      final farmOwnerId = await _readFarmOwnerId(farmId);
+      return {
+        'farm_id': farmId,
+        'role': membership['role'],
+        'farm_owner_id': farmOwnerId,
+      };
     }
 
     final Map<String, dynamic>? ownedFarm;
     try {
       ownedFarm = await client
           .from('farms')
-          .select('id')
+          .select('id, userId')
           .eq('userId', userId)
           .limit(1)
           .maybeSingle();
@@ -1585,7 +2182,63 @@ class SupabaseRemoteApi {
       return null;
     }
 
-    return {'farm_id': ownedFarm['id'], 'role': 'OWNER'};
+    return {
+      'farm_id': ownedFarm['id'],
+      'role': 'OWNER',
+      'farm_owner_id': _asString(ownedFarm['userId']),
+    };
+  }
+
+  Future<String> _readFarmName(String farmId) async {
+    if (farmId.isEmpty) {
+      return '';
+    }
+    try {
+      final client = _requireClient();
+      final farm = await client
+          .from('farms')
+          .select('name')
+          .eq('id', farmId)
+          .maybeSingle();
+      return _asString(farm?['name']);
+    } on Object {
+      return '';
+    }
+  }
+
+  Future<String> _readFarmOwnerId(String farmId) async {
+    if (farmId.isEmpty) {
+      return '';
+    }
+    try {
+      final client = _requireClient();
+      final farm = await client
+          .from('farms')
+          .select('userId')
+          .eq('id', farmId)
+          .maybeSingle();
+      return _asString(farm?['userId']);
+    } on Object {
+      return '';
+    }
+  }
+
+  Future<UserRole> _readFarmMembershipRole({
+    required String userId,
+    required String farmId,
+  }) async {
+    try {
+      final client = _requireClient();
+      final membership = await client
+          .from('farm_members')
+          .select('role')
+          .eq('userId', userId)
+          .eq('farmId', farmId)
+          .maybeSingle();
+      return UserRole.fromString(_asString(membership?['role']));
+    } on Object {
+      return UserRole.unknown;
+    }
   }
 
   Future<String> _readActiveBatchId(String farmId) async {
@@ -1601,6 +2254,27 @@ class SupabaseRemoteApi {
           .limit(1)
           .maybeSingle();
       return _asString(batch?['id']);
+    } on Object {
+      return '';
+    }
+  }
+
+  Future<String> _readBatchName(String farmId, String batchId) async {
+    if (farmId.isEmpty || batchId.isEmpty) {
+      return '';
+    }
+    try {
+      final client = _requireClient();
+      final batch = await client
+          .from('batches')
+          .select('batchName, batch_name')
+          .eq('farmId', farmId)
+          .eq('id', batchId)
+          .maybeSingle();
+      final name = _asString(batch?['batchName']).trim().isNotEmpty
+          ? _asString(batch?['batchName']).trim()
+          : _asString(batch?['batch_name']).trim();
+      return name;
     } on Object {
       return '';
     }
@@ -1757,9 +2431,7 @@ class SupabaseRemoteApi {
       'egg_production',
       'daily_feeding_logs',
       'mortality',
-      'quarantine',
       'expenses',
-      'financial_transactions',
       'sales',
       'orders',
     };
@@ -1771,6 +2443,86 @@ class SupabaseRemoteApi {
         .from(table)
         .update({'is_deleted': false, 'deleted_at': null})
         .eq('id', recordId);
+  }
+
+  Future<void> _pushWorkerLogDelete(PendingSyncInput input) async {
+    final payload = input.payload;
+    final table = _requiredString(payload, 'table');
+    final recordId = _requiredString(payload, 'record_id');
+    const allowedTables = {
+      'egg_production',
+      'daily_feeding_logs',
+      'mortality',
+    };
+    if (!allowedTables.contains(table)) {
+      throw StateError('Unsupported worker log delete table: $table');
+    }
+    final client = _requireClient();
+    await client.from(table).update({
+      'is_deleted': true,
+      'deleted_at': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', recordId);
+  }
+
+  Future<void> _pushWorkerLogUpdate(PendingSyncInput input) async {
+    final recordType = _requiredString(input.payload, 'record_type');
+    switch (recordType) {
+      case 'egg_collection':
+        await _pushEggCollection(input);
+      case 'feed_usage':
+        await _pushFeedUsage(input);
+      case 'mortality':
+        await _pushMortality(input);
+      default:
+        throw StateError('Unsupported worker log update type: $recordType');
+    }
+  }
+
+  Future<void> _pushFarmSettingsUpdate(PendingSyncInput input) async {
+    final payload = input.payload;
+    final farmId = _requiredString(payload, 'farm_id');
+    final client = _requireClient();
+
+    await client.from('farms').update({
+      'name': _requiredString(payload, 'name'),
+      'location': _optionalString(payload, 'location'),
+      'capacity': _asInt(payload['capacity']),
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', farmId);
+
+    await client.from('farm_settings').upsert({
+      'farmId': farmId,
+      'currency': _asString(payload['currency']),
+      'eggsPerCrate': _asInt(payload['eggs_per_crate'], fallback: 30),
+      'eggRecordReminderTime': _optionalString(payload, 'egg_record_reminder_time'),
+      'feedRecordReminderTime': _optionalString(payload, 'feed_record_reminder_time'),
+      if (payload['growth_target_standard'] != null)
+        'growth_target_standard': _asInt(payload['growth_target_standard']),
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    });
+  }
+
+  Future<void> _pushInventoryReorderUpdate(PendingSyncInput input) async {
+    final payload = input.payload;
+    final inventoryId = _requiredString(payload, 'inventory_id');
+    final client = _requireClient();
+    await client.from('inventory').update({
+      'reorderLevel': _asDouble(payload['reorder_level']),
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', inventoryId);
+  }
+
+  Future<void> _pushProfileUpdate(PendingSyncInput input) async {
+    final payload = input.payload;
+    final userId = _requiredString(payload, 'user_id');
+    final client = _requireClient();
+    await client.from('users').update({
+      'firstname': _requiredString(payload, 'firstname'),
+      'middleName': _optionalString(payload, 'middle_name'),
+      'surname': _requiredString(payload, 'surname'),
+      'name': _requiredString(payload, 'name'),
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', userId);
   }
 
   Future<void> _pushExpenseAllocation(PendingSyncInput input) async {
@@ -1992,6 +2744,22 @@ class SupabaseRemoteApi {
     );
   }
 
+  Future<void> _pushTeamPermissionUpdate(PendingSyncInput input) async {
+    final payload = input.payload;
+    final permissionMap = Map<String, dynamic>.from(
+      payload['permissions'] as Map? ?? const {},
+    );
+    await updateWorkerPermissions(
+      farmId: _requiredString(payload, 'farm_id'),
+      targetUserId: _requiredString(payload, 'target_user_id'),
+      permissions: FarmPermissions.fromToggleMap(
+        permissionMap.map(
+          (key, value) => MapEntry(key, value == true || value == 1),
+        ),
+      ),
+    );
+  }
+
   String _requiredString(Map<String, dynamic> payload, String key) {
     final value = _optionalString(payload, key);
     if (value.isEmpty) {
@@ -2061,6 +2829,44 @@ class SupabaseRemoteApi {
     return value.trim().contains('@');
   }
 
+  Future<AuthResponse> _signInViaLegacyMobilePasswordFunction(
+    SupabaseClient client,
+    String phoneNumber,
+    String password,
+  ) async {
+    final response = await client.functions.invoke(
+      'mobile-password-sign-in',
+      body: {
+        'phoneNumber': phoneNumber,
+        'password': password,
+      },
+    );
+
+    if (response.status != 200) {
+      final data = response.data;
+      var message = _phoneCredentialFailureMessage;
+      if (data is Map) {
+        final error = _asString(data['error']).trim();
+        if (error.isNotEmpty) {
+          message = error;
+        }
+      }
+      throw AuthException(message);
+    }
+
+    final data = response.data;
+    if (data is! Map) {
+      throw const AuthException(_phoneCredentialFailureMessage);
+    }
+
+    final refreshToken = _asString(data['refresh_token']);
+    if (refreshToken.isEmpty) {
+      throw const AuthException(_phoneCredentialFailureMessage);
+    }
+
+    return client.auth.setSession(refreshToken);
+  }
+
   Future<AuthResponse> _signInWithCredentialCandidates(
     SupabaseClient client,
     _CredentialParts credential,
@@ -2078,6 +2884,34 @@ class SupabaseRemoteApi {
           rethrow;
         }
         invalidPhoneAttempt = error;
+      }
+    }
+
+    if (credential.isPhoneMask) {
+      for (final phone in _phoneLookupCandidates(credential.fallbackIdentifier)) {
+        try {
+          return await client.auth.signInWithPassword(
+            phone: phone,
+            password: password,
+          );
+        } on AuthException catch (error) {
+          if (!_isInvalidCredentialError(error)) {
+            rethrow;
+          }
+          invalidPhoneAttempt = error;
+        }
+      }
+
+      try {
+        return await _signInViaLegacyMobilePasswordFunction(
+          client,
+          credential.fallbackIdentifier,
+          password,
+        );
+      } on AuthException catch (error) {
+        invalidPhoneAttempt = error;
+      } on Object {
+        // Edge function may not be deployed yet; keep the auth error below.
       }
     }
 
@@ -2182,6 +3016,275 @@ class SupabaseRemoteApi {
     return message.contains('invalid login credentials') ||
         message.contains('invalid credentials') ||
         message.contains('invalid password');
+  }
+
+  Future<void> pushUnsyncedHealthSchedules({
+    required String farmId,
+    required Iterable<Map<String, Object?>> vaccinations,
+    required Iterable<Map<String, Object?>> medications,
+  }) async {
+    final client = _requireClient();
+    for (final row in vaccinations) {
+      final id = _asString(row['id']);
+      if (id.isEmpty) {
+        continue;
+      }
+      final payload = {
+        'id': id,
+        'farmId': farmId,
+        'batchId': _asString(row['batch_id']),
+        'vaccineName': _asString(row['vaccine_name']),
+        'scheduledDate': _asString(row['scheduled_date']),
+        'status': _asString(row['status']).isEmpty
+            ? 'PENDING'
+            : _asString(row['status']),
+        'notes': row['notes'],
+        'quantity': _asDouble(row['quantity'], fallback: 1),
+        'usageType': row['usage_type'],
+        'unit': row['unit'],
+      };
+      await client.from('vaccination_schedules').upsert(payload);
+    }
+
+    for (final row in medications) {
+      final id = _asString(row['id']);
+      if (id.isEmpty) {
+        continue;
+      }
+      final payload = {
+        'id': id,
+        'farmId': farmId,
+        'batchId': _asString(row['batch_id']),
+        'medicationName': _asString(row['medication_name']),
+        'scheduledDate': _asString(row['scheduled_date']),
+        'status': _asString(row['status']).isEmpty
+            ? 'PENDING'
+            : _asString(row['status']),
+        'notes': row['notes'],
+        'quantity': _asDouble(row['quantity'], fallback: 1),
+        'usageType': row['usage_type'],
+        'unit': row['unit'],
+      };
+      await client.from('medication_schedules').upsert(payload);
+    }
+  }
+
+  Future<Set<String>> pushUnsyncedBatches({
+    required String farmId,
+    required Iterable<Map<String, Object?>> batches,
+  }) async {
+    final synced = <String>{};
+    for (final row in batches) {
+      final id = _asString(row['id']);
+      if (id.isEmpty) {
+        continue;
+      }
+      final now = DateTime.now().toUtc().toIso8601String();
+      final createdAt = _asString(row['created_at']);
+      final payload = {
+        'id': id,
+        'farmId': farmId,
+        'userId': _asString(row['user_id']),
+        'batchName': _asString(row['batch_name']),
+        'breedType': _asString(row['breed_type']),
+        'type': _asString(row['type']).isEmpty
+            ? 'POULTRY_BROILER'
+            : _asString(row['type']),
+        'houseId': _asString(row['house_id']),
+        'initialCount': _asInt(row['initial_count']),
+        'currentCount': _asInt(row['current_count']),
+        'isolationCount': _asInt(row['isolation_count']),
+        'arrivalDate': _asString(row['arrival_date']).isEmpty
+            ? now
+            : _asString(row['arrival_date']),
+        'status': _asString(row['status']).isEmpty
+            ? 'active'
+            : _asString(row['status']),
+        'is_deleted': _boolInt(row['is_deleted']) == 1,
+        'createdAt': createdAt.isEmpty ? now : createdAt,
+        'updatedAt': now,
+      };
+      try {
+        await _upsertBatchOnCloud(payload, batchId: id);
+        synced.add(id);
+      } on Object catch (error) {
+        debugPrint('[Sync] Batch push error for $id: $error');
+      }
+    }
+    return synced;
+  }
+
+  Future<Set<String>> pushUnsyncedHouses({
+    required String farmId,
+    required Iterable<Map<String, Object?>> houses,
+  }) async {
+    final synced = <String>{};
+    for (final row in houses) {
+      final id = _asString(row['id']);
+      if (id.isEmpty) {
+        continue;
+      }
+      final now = DateTime.now().toUtc().toIso8601String();
+      final payload = buildHouseCloudPayload(
+        id: id,
+        farmId: farmId,
+        userId: _asString(row['user_id']),
+        name: _asString(row['name']),
+        capacity: _asInt(row['capacity']),
+        isIsolation: _boolInt(row['is_isolation']) == 1,
+        currentTemperature: _nullableDouble(row['current_temperature']),
+        currentHumidity: _nullableDouble(row['current_humidity']),
+        updatedAt: now,
+        createdAt: _asString(row['created_at']).isEmpty
+            ? now
+            : _asString(row['created_at']),
+      );
+      try {
+        await _upsertHouseOnCloud(payload, houseId: id);
+        synced.add(id);
+      } on Object catch (error) {
+        debugPrint('[Sync] House push error for $id: $error');
+      }
+    }
+    return synced;
+  }
+
+  Future<void> _upsertBatchOnCloud(
+    Map<String, dynamic> payload, {
+    required String batchId,
+  }) async {
+    final client = _requireClient();
+    try {
+      final result = await client.rpc(
+        'upsert_farm_batch',
+        params: {'p_payload': payload},
+      );
+      final data = _rpcResultMap(result);
+      if (data?['success'] == true) {
+        return;
+      }
+      throw StateError(
+        data?['error']?.toString() ?? 'upsert_farm_batch failed',
+      );
+    } on PostgrestException catch (error) {
+      if (!_isMissingRpcError(error)) {
+        rethrow;
+      }
+      debugPrint(
+        '[Sync] upsert_farm_batch RPC unavailable for $batchId, '
+        'falling back to direct upsert: $error',
+      );
+      await client.from('batches').upsert(payload);
+    }
+  }
+
+  Future<void> _upsertHouseOnCloud(
+    Map<String, dynamic> payload, {
+    required String houseId,
+  }) async {
+    final client = _requireClient();
+    try {
+      final result = await client.rpc(
+        'upsert_farm_house',
+        params: {'p_payload': payload},
+      );
+      final data = _rpcResultMap(result);
+      if (data?['success'] == true) {
+        return;
+      }
+      throw StateError(
+        data?['error']?.toString() ?? 'upsert_farm_house failed',
+      );
+    } on PostgrestException catch (error) {
+      if (!_isMissingRpcError(error)) {
+        rethrow;
+      }
+      debugPrint(
+        '[Sync] upsert_farm_house RPC unavailable for $houseId, '
+        'falling back to direct upsert: $error',
+      );
+      await client.from('houses').upsert(payload);
+    }
+  }
+
+  bool _isMissingRpcError(PostgrestException error) {
+    final message = error.message.toLowerCase();
+    return error.code == '42883' ||
+        message.contains('could not find the function') ||
+        message.contains('does not exist');
+  }
+
+  Map<String, dynamic>? _rpcResultMap(Object? result) {
+    if (result is Map<String, dynamic>) {
+      return result;
+    }
+    if (result is Map) {
+      return result.map(
+        (key, value) => MapEntry(key.toString(), value),
+      );
+    }
+    return null;
+  }
+
+  Future<void> pushUnsyncedPartnerSettlements({
+    required String farmId,
+    required Iterable<Map<String, Object?>> expenses,
+    required Iterable<Map<String, Object?>> suppliers,
+    required Iterable<Map<String, Object?>> customers,
+  }) async {
+    final client = _requireClient();
+
+    for (final row in suppliers) {
+      final id = _asString(row['id']);
+      if (id.isEmpty) {
+        continue;
+      }
+      await client.from('suppliers').upsert({
+        'id': id,
+        'farmId': farmId,
+        'name': _asString(row['name']),
+        'phone': row['phone'],
+        'email': row['email'],
+        'address': row['address'],
+        'balanceOwed': _asDouble(row['balance_owed']),
+        'updatedAt': DateTime.now().toUtc().toIso8601String(),
+      });
+    }
+
+    for (final row in customers) {
+      final id = _asString(row['id']);
+      if (id.isEmpty) {
+        continue;
+      }
+      await client.from('customers').upsert({
+        'id': id,
+        'farmId': farmId,
+        'name': _asString(row['name']),
+        'phone': row['phone'],
+        'email': row['email'],
+        'address': row['address'],
+        'balanceOwed': _asDouble(row['balance_owed']),
+        'updatedAt': DateTime.now().toUtc().toIso8601String(),
+      });
+    }
+
+    for (final row in expenses) {
+      final id = _asString(row['id']);
+      if (id.isEmpty) {
+        continue;
+      }
+      await client.from('expenses').upsert({
+        'id': id,
+        'farmId': farmId,
+        'user_id': _asString(row['user_id']),
+        'supplierId': _nullIfEmpty(_asString(row['supplier_id'])),
+        'category': _asString(row['category']).toUpperCase(),
+        'amount': _asDouble(row['amount']),
+        'description': row['description'],
+        'expense_date': _asString(row['expense_date']),
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      });
+    }
   }
 }
 

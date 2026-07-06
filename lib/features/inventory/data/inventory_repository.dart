@@ -207,7 +207,7 @@ class InventoryRepository {
         whereArgs: [farmId],
       );
       for (final schedule in schedules) {
-        if (!_isCompleted(schedule)) {
+        if (_isCancelled(schedule['status']?.toString() ?? '')) {
           continue;
         }
         final matches =
@@ -253,6 +253,10 @@ class InventoryRepository {
       return batchId;
     }
     return rows.first['batch_name']?.toString() ?? batchId;
+  }
+
+  bool _isCancelled(String status) {
+    return status.toUpperCase() == 'CANCELLED';
   }
 
   bool _isCompleted(Map<String, Object?> schedule) {

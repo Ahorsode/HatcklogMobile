@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import '../core/storage/local_database.dart';
 
 class BatchFinanceBreakdown {
@@ -27,11 +29,6 @@ class BatchFinanceService {
   BatchFinanceService(this._db);
 
   final LocalDatabase _db;
-
-  static const _consumptionPrefixes = [
-    'Inventory Purchase:',
-    'Health stock cost:',
-  ];
 
   Future<List<BatchFinanceBreakdown>> computeFarmBreakdown(String farmId) async {
     final batches = await _loadActiveBatches(farmId);
@@ -74,6 +71,11 @@ class BatchFinanceService {
       where: 'farm_id = ?',
       whereArgs: [farmId],
     );
+    final orders = await _db.queryLocalRecords(
+      'orders',
+      where: 'farm_id = ? and is_deleted = 0',
+      whereArgs: [farmId],
+    );
 
     final batchIds = batches.map((b) => b['id'] as String).toSet();
     final totals = {
@@ -92,10 +94,24 @@ class BatchFinanceService {
         .where((id) => id.isNotEmpty)
         .toSet();
 
+    final cancelledOrderIds = orders
+        .where(
+          (order) =>
+              order['status']?.toString().toUpperCase() == 'CANCELLED',
+        )
+        .map((order) => order['id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toSet();
+
     for (final expense in expenses) {
       final expenseId = expense['id']?.toString() ?? '';
       final amount = _double(expense['amount']);
       if (amount <= 0 || expenseId.isEmpty) {
+        continue;
+      }
+
+      final description = expense['description']?.toString() ?? '';
+      if (_isBatchInitialExpense(description)) {
         continue;
       }
 
@@ -109,14 +125,14 @@ class BatchFinanceService {
         continue;
       }
 
-      final description = expense['description']?.toString() ?? '';
-      if (_isConsumptionExpense(description)) {
+      if (_isConsumptionBasedExpense(expense)) {
         _allocateConsumptionExpense(
           expense: expense,
           inventory: inventory,
           feedingLogs: feedingLogs,
           vaccinations: vaccinations,
           medications: medications,
+          batches: batches,
           batchIds: batchIds,
           totals: totals,
         );
@@ -148,14 +164,19 @@ class BatchFinanceService {
           break;
         }
       }
-      if (expense == null) {
+      if (expense == null || _isBatchInitialExpense(expense['description']?.toString())) {
         continue;
       }
       final pct = _double(allocation['allocation_percentage']);
       totals[batchId]!.operating += _double(expense['amount']) * (pct / 100);
     }
 
-    _allocateRevenue(batches, saleItems, totals);
+    _allocateRevenue(
+      batches,
+      saleItems,
+      cancelledOrderIds,
+      totals,
+    );
 
     return totals.values
         .map(
@@ -187,13 +208,12 @@ class BatchFinanceService {
   }
 
   Future<List<Map<String, Object?>>> _loadActiveBatches(String farmId) async {
-    final rows = await _db.queryLocalRecords(
+    return _db.queryLocalRecords(
       'batches',
       where: "farm_id = ? and is_deleted = 0 and upper(status) = 'ACTIVE'",
       whereArgs: [farmId],
       orderBy: 'batch_name asc',
     );
-    return rows;
   }
 
   void _allocateConsumptionExpense({
@@ -202,22 +222,24 @@ class BatchFinanceService {
     required List<Map<String, Object?>> feedingLogs,
     required List<Map<String, Object?>> vaccinations,
     required List<Map<String, Object?>> medications,
+    required List<Map<String, Object?>> batches,
     required Set<String> batchIds,
     required Map<String, _BatchAccumulator> totals,
   }) {
     final amount = _double(expense['amount']);
     final description = expense['description']?.toString() ?? '';
-    final item = _resolveInventoryItem(description, inventory);
-    if (item == null) {
-      return;
-    }
+    final category = expense['category']?.toString().toUpperCase() ?? '';
+    final inventoryPurchase = _parseInventoryPurchaseExpense(description);
+    final healthStock = _parseHealthStockExpense(description);
+    final itemName = inventoryPurchase?.itemName ?? healthStock?.itemName;
 
-    final itemId = item['id']?.toString() ?? '';
     final usageByBatch = <String, double>{};
 
-    if (description.startsWith('Inventory Purchase:')) {
+    if (inventoryPurchase != null && category == 'FEED') {
+      final inventoryId = _inventoryIdForName(itemName, inventory);
       for (final log in feedingLogs) {
-        if (log['feed_type_id']?.toString() != itemId) {
+        if (inventoryId != null &&
+            log['feed_type_id']?.toString() != inventoryId) {
           continue;
         }
         final batchId = log['batch_id']?.toString() ?? '';
@@ -227,17 +249,23 @@ class BatchFinanceService {
         usageByBatch[batchId] =
             (usageByBatch[batchId] ?? 0) + _double(log['amount_consumed']);
       }
-    } else {
+    } else if ((inventoryPurchase != null && category == 'MEDICATION') ||
+        healthStock != null) {
+      final normalizedName = _normalizeName(itemName ?? '');
       for (final schedule in [...vaccinations, ...medications]) {
         if (!_isCompletedSchedule(schedule)) {
           continue;
         }
-        final matchesItem =
-            schedule['inventory_id']?.toString() == itemId ||
-            _namesMatch(
-              schedule['vaccine_name'] ?? schedule['medication_name'],
-              item['item_name'],
-            );
+        final scheduleName = _normalizeName(
+          (schedule['vaccine_name'] ??
+                  schedule['medication_name'] ??
+                  schedule['name'])
+              ?.toString() ??
+              '',
+        );
+        final matchesItem = scheduleName == normalizedName ||
+            schedule['inventory_id']?.toString() ==
+                _inventoryIdForName(itemName, inventory);
         if (!matchesItem) {
           continue;
         }
@@ -252,6 +280,9 @@ class BatchFinanceService {
 
     final totalUsage = usageByBatch.values.fold<double>(0, (sum, v) => sum + v);
     if (totalUsage <= 0) {
+      _splitByHeadcount(batches, amount, (id, share) {
+        totals[id]!.consumption += share;
+      });
       return;
     }
 
@@ -263,12 +294,16 @@ class BatchFinanceService {
   void _allocateRevenue(
     List<Map<String, Object?>> batches,
     List<Map<String, Object?>> saleItems,
+    Set<String> cancelledOrderIds,
     Map<String, _BatchAccumulator> totals,
   ) {
     final linked = <String, double>{};
     var unlinked = 0.0;
 
     for (final item in saleItems) {
+      if (cancelledOrderIds.contains(item['order_id']?.toString())) {
+        continue;
+      }
       final total = _double(item['total_price']);
       final batchId = item['livestock_id']?.toString() ?? '';
       if (batchId.isNotEmpty && totals.containsKey(batchId)) {
@@ -313,44 +348,102 @@ class BatchFinanceService {
     }
   }
 
-  Map<String, Object?>? _resolveInventoryItem(
+  bool _isBatchInitialExpense(String? description) {
+    final text = description ?? '';
+    return RegExp(r'^Initial cost for ', caseSensitive: false).hasMatch(text) ||
+        RegExp(r'^Carriage for ', caseSensitive: false).hasMatch(text) ||
+        RegExp(r'\(Initial for ', caseSensitive: false).hasMatch(text);
+  }
+
+  bool _isConsumptionBasedExpense(Map<String, Object?> expense) {
+    final category = expense['category']?.toString().toUpperCase() ?? '';
+    final description = expense['description']?.toString() ?? '';
+    if (_parseInventoryPurchaseExpense(description) != null) {
+      return category == 'FEED' || category == 'MEDICATION';
+    }
+    if (_parseHealthStockExpense(description) != null) {
+      return category == 'MEDICATION';
+    }
+    return false;
+  }
+
+  ({String itemName, double purchasedQty})? _parseInventoryPurchaseExpense(
     String description,
-    List<Map<String, Object?>> inventory,
   ) {
-    final marker = _consumptionPrefixes.firstWhere(
-      description.startsWith,
-      orElse: () => '',
-    );
-    if (marker.isEmpty) {
+    final match = RegExp(
+      r'^Inventory Purchase:\s*(.+?)\s*\(([0-9.]+)\s',
+      caseSensitive: false,
+    ).firstMatch(description);
+    if (match == null) {
       return null;
     }
-    final itemName = description.substring(marker.length).trim();
+    return (
+      itemName: match.group(1)!.trim(),
+      purchasedQty: double.tryParse(match.group(2)!) ?? 0,
+    );
+  }
+
+  ({String itemName, double stockQty})? _parseHealthStockExpense(
+    String description,
+  ) {
+    final match = RegExp(
+      r'^Health stock cost:\s*(.+?)\s*\(([0-9.]+)\s',
+      caseSensitive: false,
+    ).firstMatch(description);
+    if (match == null) {
+      return null;
+    }
+    return (
+      itemName: match.group(1)!.trim(),
+      stockQty: double.tryParse(match.group(2)!) ?? 0,
+    );
+  }
+
+  String? _inventoryIdForName(
+    String? itemName,
+    List<Map<String, Object?>> inventory,
+  ) {
+    if (itemName == null || itemName.isEmpty) {
+      return null;
+    }
+    final normalized = _normalizeName(itemName);
     for (final item in inventory) {
-      if (_namesMatch(item['item_name'], itemName)) {
-        return item;
+      if (_normalizeName(item['item_name']?.toString() ?? '') == normalized) {
+        return item['id']?.toString();
       }
     }
     return null;
   }
 
-  bool _isConsumptionExpense(String description) {
-    return _consumptionPrefixes.any(description.startsWith);
-  }
+  String _normalizeName(String value) => value.trim().toLowerCase();
 
   bool _isCompletedSchedule(Map<String, Object?> schedule) {
     final status = schedule['status']?.toString().toUpperCase() ?? '';
     return status == 'COMPLETED' || status == 'DONE';
   }
 
-  bool _namesMatch(Object? left, Object? right) {
-    return left?.toString().trim().toLowerCase() ==
-        right?.toString().trim().toLowerCase();
-  }
-
   double _initialInvestment(Map<String, Object?> batch) {
-    return _double(batch['initial_cost_actual']) +
-        _double(batch['initial_cost_carriage']) +
-        _double(batch['initial_cost_other']);
+    final actual = _double(batch['initial_cost_actual']);
+    final carriage = _double(batch['initial_cost_carriage']);
+    final otherRaw = batch['initial_cost_other'];
+    var other = 0.0;
+    if (otherRaw is String && otherRaw.trim().startsWith('[')) {
+      try {
+        final decoded = jsonDecode(otherRaw);
+        if (decoded is List) {
+          for (final entry in decoded) {
+            if (entry is Map && entry['amount'] != null) {
+              other += _double(entry['amount']);
+            }
+          }
+        }
+      } catch (_) {
+        other = _double(otherRaw);
+      }
+    } else {
+      other = _double(otherRaw);
+    }
+    return actual + carriage + other;
   }
 
   String _batchLabel(Map<String, Object?> batch) {

@@ -5,6 +5,8 @@ import '../../core/models/app_user.dart';
 import '../../core/models/worker_input_type.dart';
 import '../../core/storage/local_database.dart';
 import '../../features/sync/data/worker_input_sink.dart';
+import '../../features/sync/data/worker_log_mutator.dart';
+import '../../utils/feed_source_utils.dart';
 import '../worker/widgets/quick_add_batch_grid.dart';
 
 class FeedingQuickAddSheet extends StatefulWidget {
@@ -16,6 +18,8 @@ class FeedingQuickAddSheet extends StatefulWidget {
     required this.localDatabase,
     this.onOpenInventory,
     this.onCreateFormulation,
+    this.editConfig,
+    this.initialRow,
   });
 
   final AppUser currentUser;
@@ -24,6 +28,8 @@ class FeedingQuickAddSheet extends StatefulWidget {
   final LocalDatabase localDatabase;
   final VoidCallback? onOpenInventory;
   final VoidCallback? onCreateFormulation;
+  final WorkerLogEditConfig? editConfig;
+  final Map<String, Object?>? initialRow;
 
   @override
   State<FeedingQuickAddSheet> createState() => _FeedingQuickAddSheetState();
@@ -98,37 +104,74 @@ class _FeedingQuickAddSheetState extends State<FeedingQuickAddSheet> {
     }
     setState(() {
       _options = options;
-      _selectedValue = options.isEmpty ? null : options.first.value;
+      if (widget.initialRow != null) {
+        final feedTypeId = widget.initialRow!['feed_type_id']?.toString() ?? '';
+        final formulationId =
+            widget.initialRow!['formulation_id']?.toString() ?? '';
+        if (feedTypeId.isNotEmpty) {
+          _selectedValue = 'inv_$feedTypeId';
+        } else if (formulationId.isNotEmpty) {
+          _selectedValue = 'form_$formulationId';
+        } else {
+          _selectedValue = options.isEmpty ? null : options.first.value;
+        }
+        final amount = widget.initialRow!['amount_consumed'];
+        if (amount != null) {
+          _amountController.text = amount.toString();
+        }
+        final logDate = DateTime.tryParse(
+          widget.initialRow!['log_date']?.toString() ?? '',
+        );
+        if (logDate != null) {
+          _logDate = logDate;
+        }
+      } else {
+        _selectedValue = options.isEmpty ? null : options.first.value;
+      }
       _loading = false;
     });
   }
 
   Future<void> _save() async {
+    if (!_canSubmit || _selectedValue == null) {
+      return;
+    }
     final selected = _options
         .where((option) => option.value == _selectedValue)
         .firstOrNull;
-    if (!_canSubmit || selected == null) {
+    if (selected == null) {
       return;
     }
+    final feedSource = parseFeedSource(
+      selected.value,
+      label: selected.label,
+    );
     setState(() => _isSaving = true);
     try {
-      await widget.inputSink.enqueueWorkerInput(
-        user: widget.currentUser,
-        type: WorkerInputType.feedUsage,
-        payload: {
-          'batch_id': widget.batch.id,
-          'feed_type_id': selected.kind == _FeedOptionKind.inventory
-              ? selected.id
-              : null,
-          'formulation_id': selected.kind == _FeedOptionKind.formulation
-              ? selected.id
-              : null,
-          'feed_type': selected.label,
-          'amount_consumed': _amount,
-          'bags': _amount,
-          'log_date': _logDate.toIso8601String(),
-        },
-      );
+      final payload = {
+        'batch_id': widget.batch.id,
+        'feed_type_id': feedSource.feedTypeId,
+        'formulation_id': feedSource.formulationId,
+        'feed_type': feedSource.label,
+        'amount_consumed': _amount,
+        'bags': _amount,
+        'log_date': _logDate.toIso8601String(),
+      };
+      final editConfig = widget.editConfig;
+      if (editConfig != null) {
+        await editConfig.mutator.updateWorkerLog(
+          user: widget.currentUser,
+          module: editConfig.module,
+          recordId: editConfig.recordId,
+          payload: payload,
+        );
+      } else {
+        await widget.inputSink.enqueueWorkerInput(
+          user: widget.currentUser,
+          type: WorkerInputType.feedUsage,
+          payload: payload,
+        );
+      }
       if (mounted) {
         Navigator.of(context).pop(true);
       }

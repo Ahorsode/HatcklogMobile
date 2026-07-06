@@ -2,6 +2,9 @@ import '../../../core/models/app_user.dart';
 import '../../../core/storage/local_database.dart';
 import '../../../presentation/analytics/analytics_models.dart';
 import '../../../services/batch_finance_service.dart';
+import '../../../services/finance_ledger_service.dart';
+import '../../../services/local_partner_service.dart';
+import '../../../services/missing_finance_setup_service.dart';
 import '../../auth/data/supabase_remote_api.dart';
 import 'management_models.dart';
 
@@ -24,6 +27,14 @@ abstract class ManagementDataSource {
     required TeamMemberRecord member,
     required UserRole targetRole,
   });
+
+  Future<List<MissingCostBatch>> loadBatchesMissingCost(AppUser user);
+
+  Future<List<MissingCostHealthItem>> loadHealthItemsMissingCost(AppUser user);
+
+  LocalPartnerService get partnerService;
+
+  LocalDatabase get localDatabase;
 }
 
 class ManagementRepository implements ManagementDataSource {
@@ -35,6 +46,12 @@ class ManagementRepository implements ManagementDataSource {
 
   final LocalDatabase _localDatabase;
   final SupabaseRemoteApi _remoteApi;
+
+  @override
+  LocalPartnerService get partnerService => LocalPartnerService(_localDatabase);
+
+  @override
+  LocalDatabase get localDatabase => _localDatabase;
 
   static const _snapshotTables = [
     'farms',
@@ -65,6 +82,7 @@ class ManagementRepository implements ManagementDataSource {
     final houseRecords = await _loadHouseRecords(farmId);
     final eggRecords = await _loadEggRecords(farmId);
     final feedingRecords = await _loadFeedingRecords(farmId);
+    final healthRecords = await _loadHealthRecords(farmId);
     final mortalityRecords = await _loadMortalityRecords(farmId);
     final quarantineRecords = await _loadQuarantineRecords(farmId);
     final salesRecords = await _loadSalesRecords(farmId);
@@ -103,6 +121,7 @@ class ManagementRepository implements ManagementDataSource {
       houseRecords: houseRecords,
       eggRecords: eggRecords,
       feedingRecords: feedingRecords,
+      healthRecords: healthRecords,
       mortalityRecords: mortalityRecords,
       quarantineRecords: quarantineRecords,
       salesRecords: salesRecords,
@@ -142,18 +161,56 @@ class ManagementRepository implements ManagementDataSource {
       [farmId, sevenDayStart.toIso8601String()],
     );
     final revenueRows = await _localDatabase.rawLocalQuery(
-      'select date(transaction_date) as day, coalesce(sum(amount), 0) as total '
-      'from financial_transactions '
-      "where farm_id = ? and date(transaction_date) >= date(?) and is_deleted = 0 and upper(type) = 'REVENUE' "
-      'group by date(transaction_date) order by day asc',
-      [farmId, fourteenDayStart.toIso8601String()],
+      '''
+      select day, sum(total) as total from (
+        select date(sale_date) as day, coalesce(sum(total_amount), 0) as total
+        from sales
+        where farm_id = ? and is_deleted = 0 and date(sale_date) >= date(?)
+        group by date(sale_date)
+        union all
+        select date(order_date) as day, coalesce(sum(total_amount), 0) as total
+        from orders
+        where farm_id = ? and is_deleted = 0 and date(order_date) >= date(?)
+          and upper(status) != 'CANCELLED'
+        group by date(order_date)
+        union all
+        select date(transaction_date) as day, coalesce(sum(amount), 0) as total
+        from financial_transactions
+        where farm_id = ? and is_deleted = 0 and date(transaction_date) >= date(?)
+          and upper(type) = 'REVENUE'
+        group by date(transaction_date)
+      ) group by day order by day asc
+      ''',
+      [
+        farmId,
+        fourteenDayStart.toIso8601String(),
+        farmId,
+        fourteenDayStart.toIso8601String(),
+        farmId,
+        fourteenDayStart.toIso8601String(),
+      ],
     );
     final expenseRows = await _localDatabase.rawLocalQuery(
-      'select date(transaction_date) as day, coalesce(sum(amount), 0) as total '
-      'from financial_transactions '
-      "where farm_id = ? and date(transaction_date) >= date(?) and is_deleted = 0 and upper(type) = 'EXPENSE' "
-      'group by date(transaction_date) order by day asc',
-      [farmId, fourteenDayStart.toIso8601String()],
+      '''
+      select day, sum(total) as total from (
+        select date(expense_date) as day, coalesce(sum(amount), 0) as total
+        from expenses
+        where farm_id = ? and is_deleted = 0 and date(expense_date) >= date(?)
+        group by date(expense_date)
+        union all
+        select date(transaction_date) as day, coalesce(sum(amount), 0) as total
+        from financial_transactions
+        where farm_id = ? and is_deleted = 0 and date(transaction_date) >= date(?)
+          and upper(type) = 'EXPENSE'
+        group by date(transaction_date)
+      ) group by day order by day asc
+      ''',
+      [
+        farmId,
+        fourteenDayStart.toIso8601String(),
+        farmId,
+        fourteenDayStart.toIso8601String(),
+      ],
     );
 
     final eggPoints = _pointsForWindow(eggRows, sevenDayStart, 7);
@@ -360,7 +417,7 @@ class ManagementRepository implements ManagementDataSource {
           'farm_id': owner.activeFarmId,
           'target_user_id': member.userId,
           'membership_id': member.membershipId,
-          'new_role': targetRole.name.toUpperCase(),
+          'new_role': targetRole.apiRole,
         },
         createdAt: DateTime.now(),
       ),
@@ -368,7 +425,7 @@ class ManagementRepository implements ManagementDataSource {
 
     await _localDatabase.updateLocalRecord(
       'farm_members',
-      {'role': targetRole.name.toUpperCase()},
+      {'role': targetRole.apiRole},
       where: 'id = ?',
       whereArgs: [member.membershipId],
     );
@@ -380,6 +437,22 @@ class ManagementRepository implements ManagementDataSource {
         newRole: targetRole.name.toUpperCase(),
       );
     }
+  }
+
+  @override
+  Future<List<MissingCostBatch>> loadBatchesMissingCost(AppUser user) {
+    return MissingFinanceSetupService(
+      _localDatabase,
+    ).loadBatchesMissingCost(user.activeFarmId);
+  }
+
+  @override
+  Future<List<MissingCostHealthItem>> loadHealthItemsMissingCost(
+    AppUser user,
+  ) {
+    return MissingFinanceSetupService(
+      _localDatabase,
+    ).loadHealthItemsMissingCost(user.activeFarmId);
   }
 
   Future<List<BatchOption>> _loadBatches(String farmId) async {
@@ -409,8 +482,12 @@ class ManagementRepository implements ManagementDataSource {
     );
 
     if (rows.isEmpty && user.activeFarmId.isNotEmpty) {
+      final fallbackName = user.activeFarmName.trim();
       return [
-        FarmOption(id: user.activeFarmId, name: 'Farm ${user.activeFarmId}'),
+        FarmOption(
+          id: user.activeFarmId,
+          name: fallbackName.isNotEmpty ? fallbackName : 'Farm',
+        ),
       ];
     }
 
@@ -493,6 +570,49 @@ class ManagementRepository implements ManagementDataSource {
         status: _bool(row['is_synced']) ? 'SYNCED' : 'LOCAL',
       );
     }).toList();
+  }
+
+  Future<List<HubModuleRecord>> _loadHealthRecords(String farmId) async {
+    final vaccinations = await _localDatabase.queryLocalRecords(
+      'vaccination_schedules',
+      where: 'farm_id = ?',
+      whereArgs: [farmId],
+      orderBy: 'scheduled_date desc',
+      limit: 25,
+    );
+    final medications = await _localDatabase.queryLocalRecords(
+      'medication_schedules',
+      where: 'farm_id = ?',
+      whereArgs: [farmId],
+      orderBy: 'scheduled_date desc',
+      limit: 25,
+    );
+
+    final records = <HubModuleRecord>[];
+    for (final row in vaccinations) {
+      records.add(
+        HubModuleRecord(
+          id: _string(row['id']),
+          title: _string(row['vaccine_name'], fallback: 'Vaccine'),
+          subtitle: 'Vaccination | ${_dateText(row['scheduled_date'])}',
+          metric: _string(row['status'], fallback: 'PENDING'),
+          status: _bool(row['is_synced']) ? 'SYNCED' : 'LOCAL',
+        ),
+      );
+    }
+    for (final row in medications) {
+      records.add(
+        HubModuleRecord(
+          id: _string(row['id']),
+          title: _string(row['medication_name'], fallback: 'Medication'),
+          subtitle: 'Medication | ${_dateText(row['scheduled_date'])}',
+          metric: _string(row['status'], fallback: 'PENDING'),
+          status: _bool(row['is_synced']) ? 'SYNCED' : 'LOCAL',
+        ),
+      );
+    }
+    records.sort((a, b) => b.subtitle.compareTo(a.subtitle));
+    return records.take(50).toList();
   }
 
   Future<List<HubModuleRecord>> _loadMortalityRecords(String farmId) async {
@@ -627,21 +747,18 @@ class ManagementRepository implements ManagementDataSource {
   }
 
   Future<List<HubModuleRecord>> _loadFinanceRecords(String farmId) async {
-    final rows = await _localDatabase.queryLocalRecords(
-      'financial_transactions',
-      where: 'farm_id = ? and is_deleted = 0',
-      whereArgs: [farmId],
-      orderBy: 'transaction_date desc',
-      limit: 80,
-    );
-    return rows.map((row) {
+    final entries = await FinanceLedgerService(
+      _localDatabase,
+    ).loadTransactions(farmId);
+    return entries.take(80).map((entry) {
+      final autoTag = entry.isAutoLogged ? 'Auto-Logged' : entry.paymentStatus;
       return HubModuleRecord(
-        id: _string(row['id']),
-        title: _string(row['category'], fallback: 'Transaction'),
+        id: entry.id,
+        title: entry.category,
         subtitle:
-            '${_string(row['payment_status'])} | ${_dateText(row['transaction_date'])}',
-        metric: _moneyText(_double(row['amount'])),
-        status: _string(row['type']),
+            '$autoTag | ${_dateText(entry.transactionDate.toIso8601String())}',
+        metric: _moneyText(entry.amount),
+        status: entry.type,
       );
     }).toList();
   }

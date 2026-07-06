@@ -1,5 +1,8 @@
+import 'package:flutter/foundation.dart';
+
 import '../core/permissions/farm_permissions.dart';
 import '../core/storage/local_database.dart';
+import '../features/auth/data/supabase_remote_api.dart';
 
 enum StrategicPriorityType { finance, stock, performance }
 
@@ -62,9 +65,10 @@ class ExecutiveDashboardSnapshot {
 }
 
 class ExecutiveMetricsService {
-  ExecutiveMetricsService(this._db);
+  ExecutiveMetricsService(this._db, [this._remoteApi]);
 
   final LocalDatabase _db;
+  final SupabaseRemoteApi? _remoteApi;
 
   static const _feedCategories = {
     'feed',
@@ -109,7 +113,7 @@ class ExecutiveMetricsService {
     final currentExpenses = await _sumExpenses(farmId, windowStart, today);
     final totalProfit = currentRevenue - currentExpenses;
     final profitTrend = previousRevenue <= 0
-        ? 0
+        ? (currentRevenue > 0 ? 100.0 : 0.0)
         : ((currentRevenue - previousRevenue) / previousRevenue) * 100;
 
     final supplierDebt = permissions.canViewFinance
@@ -124,7 +128,7 @@ class ExecutiveMetricsService {
       0,
       (sum, batch) => sum + _int(batch['current_count']),
     );
-    final mortalityRate = await _farmMortalityRate(farmId, batches);
+    final mortalityRatePercent = await _farmMortalityRate(farmId, batches);
     final globalFcr = permissions.canViewBatches
         ? await _globalFcr(farmId, batches)
         : 0;
@@ -162,9 +166,9 @@ class ExecutiveMetricsService {
         supplierDebt: supplierDebt.toDouble(),
         customerDebt: customerDebt.toDouble(),
         activeLivestock: activeLivestock,
-        mortalityRate: mortalityRate.toDouble(),
+        mortalityRate: (mortalityRatePercent * 100).toDouble(),
       ),
-      strategicPriorities: priorities,
+      strategicPriorities: priorities.take(3).toList(growable: false),
       revenueVelocityData: revenueVelocity,
     );
   }
@@ -176,7 +180,7 @@ class ExecutiveMetricsService {
   ) async {
     final sales = await _db.rawLocalQuery(
       'select coalesce(sum(total_amount), 0) as total from sales '
-      'where farm_id = ? and is_deleted = 0 and date(created_at) between date(?) and date(?)',
+      'where farm_id = ? and is_deleted = 0 and date(sale_date) between date(?) and date(?)',
       [farmId, start.toIso8601String(), end.toIso8601String()],
     );
     final orders = await _db.rawLocalQuery(
@@ -213,11 +217,59 @@ class ExecutiveMetricsService {
   }
 
   Future<List<Map<String, Object?>>> _loadActiveBatches(String farmId) async {
-    return _db.queryLocalRecords(
+    var rows = await _loadLocalBatchRows(farmId);
+    if (rows.isEmpty) {
+      rows = await _hydrateBatchesFromCloud(farmId);
+    }
+    return rows;
+  }
+
+  Future<List<Map<String, Object?>>> _loadLocalBatchRows(String farmId) async {
+    final activeRows = await _db.queryLocalRecords(
       'batches',
-      where: "farm_id = ? and is_deleted = 0 and upper(status) = 'ACTIVE'",
+      where: "farm_id = ? and is_deleted = 0 and lower(status) = 'active'",
       whereArgs: [farmId],
     );
+    if (activeRows.isNotEmpty) {
+      return activeRows;
+    }
+
+    return _db.queryLocalRecords(
+      'batches',
+      where: 'farm_id = ? and is_deleted = 0',
+      whereArgs: [farmId],
+      orderBy: 'batch_name asc',
+    );
+  }
+
+  Future<List<Map<String, Object?>>> _hydrateBatchesFromCloud(
+    String farmId,
+  ) async {
+    final remoteApi = _remoteApi;
+    if (remoteApi == null || !remoteApi.isConfigured || farmId.isEmpty) {
+      return const [];
+    }
+
+    List<Map<String, Object?>> cloudRows;
+    try {
+      cloudRows = await remoteApi.fetchLivestockBatchesForFarm(farmId);
+    } on Object catch (error) {
+      debugPrint('WARN: Executive livestock cloud fetch failed: $error');
+      return const [];
+    }
+
+    if (cloudRows.isEmpty) {
+      return const [];
+    }
+
+    try {
+      await _db.upsertCloudRecords({'batches': cloudRows});
+    } on Object catch (error) {
+      debugPrint('WARN: Executive batch local mirror failed: $error');
+    }
+
+    final localRows = await _loadLocalBatchRows(farmId);
+    return localRows.isNotEmpty ? localRows : cloudRows;
   }
 
   Future<double> _farmMortalityRate(
@@ -367,10 +419,13 @@ class ExecutiveMetricsService {
     }
     candidates.sort((a, b) => a.reserveHours.compareTo(b.reserveHours));
     final worst = candidates.first;
+    final reserveLabel = worst.reserveHours > 0
+        ? 'below ${worst.reserveHours.round() < 1 ? 1 : worst.reserveHours.round()}-hour reserve'
+        : 'below 48-hour reserve';
     return StrategicPriority(
       title: 'Inventory Shortfall',
       detail:
-          '${worst.item['item_name']} below reserve (${worst.reserveHours.toStringAsFixed(0)}h left)',
+          '${worst.item['item_name']} $reserveLabel (${worst.item['stock_level']} ${worst.item['unit'] ?? 'units'} left)',
       type: StrategicPriorityType.stock,
     );
   }
@@ -420,9 +475,9 @@ class ExecutiveMetricsService {
     }
 
     final sales = await _db.rawLocalQuery(
-      'select date(created_at) as day, coalesce(sum(total_amount), 0) as total '
+      'select date(sale_date) as day, coalesce(sum(total_amount), 0) as total '
       'from sales where farm_id = ? and is_deleted = 0 '
-      'and date(created_at) between date(?) and date(?) group by date(created_at)',
+      'and date(sale_date) between date(?) and date(?) group by date(sale_date)',
       [farmId, start.toIso8601String(), end.toIso8601String()],
     );
     for (final row in sales) {

@@ -332,29 +332,36 @@ class _LogExpenseSheetState extends State<LogExpenseSheet> {
                     fillColor: Colors.white,
                   ),
                   items: const [
-                    DropdownMenuItem(value: 'FEED', child: Text('FEED')),
+                    DropdownMenuItem(value: 'FEED', child: Text('Feed Purchases')),
                     DropdownMenuItem(
                       value: 'MEDICATION',
-                      child: Text('MEDICATION'),
+                      child: Text('Flock Vaccines & Medication'),
                     ),
                     DropdownMenuItem(
-                      value: 'EQUIPMENT',
-                      child: Text('EQUIPMENT'),
+                      value: 'LIVESTOCK_PURCHASE',
+                      child: Text('Day-Old Chicks Purchase'),
                     ),
-                    DropdownMenuItem(value: 'LABOR', child: Text('LABOR')),
+                    DropdownMenuItem(
+                      value: 'SALARY',
+                      child: Text('Labor & Salaries'),
+                    ),
                     DropdownMenuItem(
                       value: 'UTILITIES',
-                      child: Text('UTILITIES'),
+                      child: Text('Utilities'),
                     ),
                     DropdownMenuItem(
                       value: 'TRANSPORT',
-                      child: Text('TRANSPORT'),
+                      child: Text('Transport'),
+                    ),
+                    DropdownMenuItem(
+                      value: 'EQUIPMENT',
+                      child: Text('Equipment & Maintenance'),
                     ),
                     DropdownMenuItem(
                       value: 'MAINTENANCE',
-                      child: Text('MAINTENANCE'),
+                      child: Text('Maintenance'),
                     ),
-                    DropdownMenuItem(value: 'OTHER', child: Text('OTHER')),
+                    DropdownMenuItem(value: 'OTHER', child: Text('Other OpEx')),
                   ],
                   onChanged: (value) {
                     if (value != null) {

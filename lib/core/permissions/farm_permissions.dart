@@ -18,6 +18,8 @@ class FarmPermissions {
     this.canEditHouses = false,
     this.canViewMortality = false,
     this.canEditMortality = false,
+    this.canViewHealth = false,
+    this.canEditHealth = false,
     this.canViewCustomers = false,
     this.canEditCustomers = false,
     this.canViewTeam = false,
@@ -40,6 +42,8 @@ class FarmPermissions {
   final bool canEditHouses;
   final bool canViewMortality;
   final bool canEditMortality;
+  final bool canViewHealth;
+  final bool canEditHealth;
   final bool canViewCustomers;
   final bool canEditCustomers;
   final bool canViewTeam;
@@ -62,6 +66,8 @@ class FarmPermissions {
     canEditHouses: true,
     canViewMortality: true,
     canEditMortality: true,
+    canViewHealth: true,
+    canEditHealth: true,
     canViewCustomers: true,
     canEditCustomers: true,
     canViewTeam: true,
@@ -93,6 +99,71 @@ class FarmPermissions {
     );
   }
 
+  factory FarmPermissions.fromToggleMap(Map<String, bool> map) {
+    return FarmPermissions(
+      canViewFinance: map['can_view_finance'] ?? false,
+      canEditFinance: map['can_edit_finance'] ?? false,
+      canViewInventory: map['can_view_inventory'] ?? false,
+      canEditInventory: map['can_edit_inventory'] ?? false,
+      canViewBatches: map['can_view_batches'] ?? false,
+      canEditBatches: map['can_edit_batches'] ?? false,
+      canViewSales: map['can_view_sales'] ?? false,
+      canEditSales: map['can_edit_sales'] ?? false,
+      canViewEggs: map['can_view_eggs'] ?? false,
+      canEditEggs: map['can_edit_eggs'] ?? false,
+      canViewFeeding: map['can_view_feeding'] ?? false,
+      canEditFeeding: map['can_edit_feeding'] ?? false,
+      canViewHouses: map['can_view_houses'] ?? false,
+      canEditHouses: map['can_edit_houses'] ?? false,
+      canViewMortality: map['can_view_mortality'] ?? false,
+      canEditMortality: map['can_edit_mortality'] ?? false,
+      canViewHealth: map['can_view_health'] ?? false,
+      canEditHealth: map['can_edit_health'] ?? false,
+      canViewCustomers: map['can_view_customers'] ?? false,
+      canEditCustomers: map['can_edit_customers'] ?? false,
+      canViewTeam: map['can_view_team'] ?? false,
+      canEditTeam: map['can_edit_team'] ?? false,
+    );
+  }
+
+  Map<String, Object?> toDbRow({
+    required String id,
+    required String userId,
+    required String farmId,
+  }) {
+    int intFlag(bool value) => value ? 1 : 0;
+
+    return {
+      'id': id,
+      'user_id': userId,
+      'farm_id': farmId,
+      'can_view_finance': intFlag(canViewFinance),
+      'can_edit_finance': intFlag(canEditFinance),
+      'can_view_inventory': intFlag(canViewInventory),
+      'can_edit_inventory': intFlag(canEditInventory),
+      'can_view_batches': intFlag(canViewBatches),
+      'can_edit_batches': intFlag(canEditBatches),
+      'can_view_sales': intFlag(canViewSales),
+      'can_edit_sales': intFlag(canEditSales),
+      'can_view_eggs': intFlag(canViewEggs),
+      'can_edit_eggs': intFlag(canEditEggs),
+      'can_view_feeding': intFlag(canViewFeeding),
+      'can_edit_feeding': intFlag(canEditFeeding),
+      'can_view_houses': intFlag(canViewHouses),
+      'can_edit_houses': intFlag(canEditHouses),
+      'can_view_mortality': intFlag(canViewMortality),
+      'can_edit_mortality': intFlag(canEditMortality),
+      'can_view_quarantine': intFlag(canViewMortality),
+      'can_edit_quarantine': intFlag(canEditMortality),
+      'can_view_health': intFlag(canViewHealth),
+      'can_edit_health': intFlag(canEditHealth),
+      'can_view_customers': intFlag(canViewCustomers),
+      'can_edit_customers': intFlag(canEditCustomers),
+      'can_view_team': intFlag(canViewTeam),
+      'can_edit_team': intFlag(canEditTeam),
+    };
+  }
+
   bool canViewPermission(String key) {
     return switch (key) {
       'can_view_finance' => canViewFinance,
@@ -103,6 +174,7 @@ class FarmPermissions {
       'can_view_feeding' => canViewFeeding,
       'can_view_houses' => canViewHouses,
       'can_view_mortality' || 'can_view_quarantine' => canViewMortality,
+      'can_view_health' => canViewHealth,
       'can_view_customers' => canViewCustomers,
       'can_view_team' => canViewTeam,
       _ => false,
@@ -119,6 +191,7 @@ class FarmPermissions {
       'can_edit_feeding' => canEditFeeding,
       'can_edit_houses' => canEditHouses,
       'can_edit_mortality' || 'can_edit_quarantine' => canEditMortality,
+      'can_edit_health' => canEditHealth,
       'can_edit_customers' => canEditCustomers,
       'can_edit_team' => canEditTeam,
       _ => false,
@@ -147,6 +220,8 @@ class FarmPermissions {
       'can_edit_mortality': canEditMortality,
       'can_view_quarantine': canViewMortality,
       'can_edit_quarantine': canEditMortality,
+      'can_view_health': canViewHealth,
+      'can_edit_health': canEditHealth,
       'can_view_customers': canViewCustomers,
       'can_edit_customers': canEditCustomers,
       'can_view_team': canViewTeam,
@@ -159,6 +234,20 @@ class FarmPermissions {
       return FarmPermissions.fullAccess();
     }
     return const FarmPermissions();
+  }
+
+  /// Backfills health flags when mortality is granted but health was never set
+  /// (legacy rows synced before health permission columns existed).
+  FarmPermissions withLegacyHealthBackfill() {
+    if (canViewHealth || canEditHealth || !canViewMortality) {
+      return this;
+    }
+    final map = toMap();
+    map['can_view_health'] = true;
+    if (canEditMortality) {
+      map['can_edit_health'] = true;
+    }
+    return FarmPermissions.fromToggleMap(map);
   }
 
   static bool _truthy(Object? value) {
@@ -192,6 +281,8 @@ class FarmPermissions {
             other.canEditHouses == canEditHouses &&
             other.canViewMortality == canViewMortality &&
             other.canEditMortality == canEditMortality &&
+            other.canViewHealth == canViewHealth &&
+            other.canEditHealth == canEditHealth &&
             other.canViewCustomers == canViewCustomers &&
             other.canEditCustomers == canEditCustomers &&
             other.canViewTeam == canViewTeam &&

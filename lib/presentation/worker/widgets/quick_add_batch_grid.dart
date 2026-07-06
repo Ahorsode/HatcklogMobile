@@ -41,6 +41,7 @@ class QuickAddBatchGrid extends StatelessWidget {
     required this.icon,
     required this.onTapAdd,
     required this.emptyMessage,
+    this.onLongPress,
   });
 
   final List<BatchSummary> batches;
@@ -48,6 +49,7 @@ class QuickAddBatchGrid extends StatelessWidget {
   final IconData icon;
   final void Function(BatchSummary batch) onTapAdd;
   final String emptyMessage;
+  final void Function(BatchSummary batch)? onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -86,6 +88,8 @@ class QuickAddBatchGrid extends StatelessWidget {
           child: InkWell(
             borderRadius: BorderRadius.circular(8),
             onTap: () => onTapAdd(batch),
+            onLongPress:
+                onLongPress == null ? null : () => onLongPress!(batch),
             child: Padding(
               padding: const EdgeInsets.all(12),
               child: Column(

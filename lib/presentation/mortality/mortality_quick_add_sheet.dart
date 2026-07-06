@@ -5,6 +5,8 @@ import '../../core/models/app_user.dart';
 import '../../core/models/worker_input_type.dart';
 import '../../core/storage/local_database.dart';
 import '../../features/sync/data/worker_input_sink.dart';
+import '../../features/sync/data/worker_log_mutator.dart';
+import '../../utils/mortality_log_utils.dart';
 import '../worker/widgets/quick_add_batch_grid.dart';
 
 enum MortalityHealthType {
@@ -18,49 +20,6 @@ enum MortalityHealthType {
   final IconData icon;
 }
 
-const Map<String, List<String>> mortalityReasons = {
-  'Disease': [
-    'Newcastle disease',
-    'Avian influenza',
-    'Gumboro',
-    "Marek's disease",
-    'Salmonellosis',
-    'Fowl cholera',
-    'Colibacillosis',
-    'Coccidiosis',
-    'Worm infestation',
-  ],
-  'Environmental': [
-    'Heat stress',
-    'Cold stress',
-    'Poor ventilation',
-    'High ammonia',
-    'Overcrowding',
-  ],
-  'Nutrition': [
-    'Malnutrition',
-    'Vitamin deficiency',
-    'Moldy feed',
-    'Poor-quality feed',
-  ],
-  'Water Issues': ['Dirty water', 'Dehydration', 'Water system failure'],
-  'Parasites': ['Mites', 'Lice', 'Ticks', 'Worms'],
-  'Management Error': [
-    'Poor vaccination',
-    'Mixing age groups',
-    'Rough handling',
-    'Poor biosecurity',
-  ],
-  'Toxicity': ['Aflatoxin', 'Chemical poisoning', 'Drug overdose'],
-  'Predators': ['Dog attack', 'Snake attack', 'Bird attack'],
-  'Stress': ['Transport stress', 'Noise stress', 'Environmental change'],
-  'Brooding': ['Wrong temperature', 'Weak chicks', 'Poor brooding care'],
-  'Genetic': ['Weak breed', 'Birth defect'],
-  'Injury/Accident': ['Cannibalism', 'Trampling', 'Equipment injury'],
-  'Unknown': ['Unknown cause yet'],
-  'Other': ['Other'],
-};
-
 class MortalityQuickAddSheet extends StatefulWidget {
   const MortalityQuickAddSheet({
     super.key,
@@ -69,6 +28,8 @@ class MortalityQuickAddSheet extends StatefulWidget {
     required this.inputSink,
     required this.localDatabase,
     this.defaultHealthType,
+    this.editConfig,
+    this.initialRow,
   });
 
   final AppUser currentUser;
@@ -76,6 +37,8 @@ class MortalityQuickAddSheet extends StatefulWidget {
   final WorkerInputSink inputSink;
   final LocalDatabase localDatabase;
   final MortalityHealthType? defaultHealthType;
+  final WorkerLogEditConfig? editConfig;
+  final Map<String, Object?>? initialRow;
 
   @override
   State<MortalityQuickAddSheet> createState() => _MortalityQuickAddSheetState();
@@ -98,29 +61,33 @@ class _MortalityQuickAddSheetState extends State<MortalityQuickAddSheet> {
   List<_IsolationRoomOption> _rooms = const [];
 
   int get _count => int.tryParse(_countController.text.trim()) ?? 0;
-  bool get _isLocked => widget.defaultHealthType != null;
+  bool get _isLocked =>
+      widget.defaultHealthType != null && widget.editConfig == null;
   bool get _isAddingRoom =>
       _healthType == MortalityHealthType.sick &&
       _selectedRoomId == _addRoomValue;
+  int get _effectiveCurrentCount {
+    final row = widget.initialRow;
+    if (row == null) {
+      return widget.batch.currentCount;
+    }
+    final oldCount = int.tryParse(row['count']?.toString() ?? '') ?? 0;
+    final oldType = resolveHealthType(row['type']?.toString());
+    final deltas = healthLogBatchDeltas(healthType: oldType, count: oldCount);
+    return widget.batch.currentCount - deltas.currentCountDelta;
+  }
 
   String? get _validationError {
-    if (_count <= 0) {
-      return 'Count is required.';
-    }
-    if (_count > widget.batch.currentCount) {
-      return 'Cannot exceed current bird count';
-    }
-    if (_isAddingRoom) {
-      if (_newRoomNameController.text.trim().isEmpty) {
-        return 'New room name is required.';
-      }
-      final capacity =
-          int.tryParse(_newRoomCapacityController.text.trim()) ?? 0;
-      if (capacity <= 0) {
-        return 'New room capacity is required.';
-      }
-    }
-    return null;
+    return validateHealthLog(
+      count: _count,
+      currentCount: _effectiveCurrentCount,
+      healthType: _healthType.storageValue,
+      requireIsolationRoom: _healthType == MortalityHealthType.sick,
+      isolationRoomId: _selectedRoomId,
+      isAddingRoom: _isAddingRoom,
+      newRoomName: _newRoomNameController.text,
+      newRoomCapacity: int.tryParse(_newRoomCapacityController.text.trim()) ?? 0,
+    );
   }
 
   bool get _canSubmit =>
@@ -130,7 +97,33 @@ class _MortalityQuickAddSheetState extends State<MortalityQuickAddSheet> {
   void initState() {
     super.initState();
     _healthType = widget.defaultHealthType ?? MortalityHealthType.dead;
+    _hydrateFromInitialRow();
     _loadRooms();
+  }
+
+  void _hydrateFromInitialRow() {
+    final row = widget.initialRow;
+    if (row == null) {
+      return;
+    }
+    final type = resolveHealthType(row['type']?.toString());
+    _healthType = type == 'SICK'
+        ? MortalityHealthType.sick
+        : MortalityHealthType.dead;
+    _countController.text = row['count']?.toString() ?? '';
+    final category = row['category']?.toString();
+    if (category != null && mortalityReasons.containsKey(category)) {
+      _category = category;
+    }
+    final subCategory = row['sub_category']?.toString();
+    if (subCategory != null && subCategory.isNotEmpty) {
+      _specificCause = subCategory;
+    }
+    _selectedRoomId = row['isolation_room_id']?.toString();
+    final logDate = DateTime.tryParse(row['log_date']?.toString() ?? '');
+    if (logDate != null) {
+      _logDate = logDate;
+    }
   }
 
   @override
@@ -194,20 +187,30 @@ class _MortalityQuickAddSheetState extends State<MortalityQuickAddSheet> {
       final isolationRoomId = _healthType == MortalityHealthType.sick
           ? await _createRoomIfNeeded()
           : null;
-      await widget.inputSink.enqueueWorkerInput(
-        user: widget.currentUser,
-        type: WorkerInputType.mortality,
-        payload: {
-          'batch_id': widget.batch.id,
-          'count': _count,
-          'health_type': _healthType.storageValue,
-          'category': _category,
-          'sub_category': _specificCause,
-          'reason': _specificCause,
-          'isolation_room_id': isolationRoomId,
-          'log_date': _logDate.toIso8601String(),
-        },
+      final payload = buildHealthLogPayload(
+        batchId: widget.batch.id,
+        count: _count,
+        healthType: _healthType.storageValue,
+        category: _category,
+        subCategory: _specificCause,
+        isolationRoomId: isolationRoomId,
+        logDate: _logDate,
       );
+      final editConfig = widget.editConfig;
+      if (editConfig != null) {
+        await editConfig.mutator.updateWorkerLog(
+          user: widget.currentUser,
+          module: editConfig.module,
+          recordId: editConfig.recordId,
+          payload: payload,
+        );
+      } else {
+        await widget.inputSink.enqueueWorkerInput(
+          user: widget.currentUser,
+          type: WorkerInputType.mortality,
+          payload: payload,
+        );
+      }
       if (mounted) {
         Navigator.of(context).pop(true);
       }

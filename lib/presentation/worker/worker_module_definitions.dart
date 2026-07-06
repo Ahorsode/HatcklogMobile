@@ -6,6 +6,8 @@ enum WorkerModule {
   eggs,
   feeding,
   mortality,
+  health,
+  reports,
   houses,
   sales,
   inventory,
@@ -52,6 +54,25 @@ List<WorkerModuleDef> buildVisibleModules(FarmPermissions permissions) {
       icon: Icons.healing_outlined,
       canView: permissions.canViewMortality,
       canEdit: permissions.canEditMortality,
+    ),
+    WorkerModuleDef(
+      module: WorkerModule.health,
+      label: 'Health',
+      icon: Icons.vaccines_outlined,
+      canView: permissions.canViewHealth,
+      canEdit: permissions.canEditHealth,
+    ),
+    WorkerModuleDef(
+      module: WorkerModule.reports,
+      label: 'Reports',
+      icon: Icons.description_outlined,
+      canView: permissions.canViewEggs ||
+          permissions.canViewFeeding ||
+          permissions.canViewMortality ||
+          permissions.canViewHealth ||
+          permissions.canViewFinance ||
+          permissions.canViewSales,
+      canEdit: false,
     ),
     WorkerModuleDef(
       module: WorkerModule.houses,

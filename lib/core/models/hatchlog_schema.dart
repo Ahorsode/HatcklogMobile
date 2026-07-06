@@ -111,17 +111,26 @@ class FarmSettingsCacheRecord {
     required this.farmId,
     required this.eggsPerCrate,
     required this.currency,
+    this.eggRecordReminderTime,
+    this.feedRecordReminderTime,
+    this.growthTargetStandard,
   });
 
   final String farmId;
   final int eggsPerCrate;
   final String currency;
+  final String? eggRecordReminderTime;
+  final String? feedRecordReminderTime;
+  final int? growthTargetStandard;
 
   Map<String, Object?> toMap() {
     return {
       'farm_id': farmId,
       'eggs_per_crate': eggsPerCrate,
       'currency': currency,
+      'egg_record_reminder_time': eggRecordReminderTime,
+      'feed_record_reminder_time': feedRecordReminderTime,
+      'growth_target_standard': growthTargetStandard,
     };
   }
 }

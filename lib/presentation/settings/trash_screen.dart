@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../../core/models/app_user.dart';
+import '../../core/settings/settings_profile_contract.dart';
 import '../../core/storage/local_database.dart';
 
 class TrashScreen extends StatefulWidget {
@@ -21,28 +22,20 @@ class TrashScreen extends StatefulWidget {
 
 class _TrashScreenState extends State<TrashScreen> {
   StreamSubscription<void>? _subscription;
+  String _activeTab = SettingsProfileContract.trashTabs.first.key;
+  String _search = '';
   List<_TrashRecord> _records = const [];
   bool _loading = true;
-
-  static const _tables = <_TrashTable>[
-    _TrashTable('batches', 'Livestock', 'batch_name'),
-    _TrashTable('inventory', 'Inventory', 'item_name'),
-    _TrashTable('egg_production', 'Eggs', 'log_date'),
-    _TrashTable('daily_feeding_logs', 'Feeding', 'log_date'),
-    _TrashTable('mortality', 'Mortality', 'log_date'),
-    _TrashTable('quarantine', 'Quarantine', 'log_date'),
-    _TrashTable('expenses', 'Expenses', 'category'),
-    _TrashTable('financial_transactions', 'Finance', 'category'),
-    _TrashTable('sales', 'Sales', 'sale_date'),
-    _TrashTable('orders', 'Orders', 'order_date'),
-  ];
 
   @override
   void initState() {
     super.initState();
-    _subscription = widget.localDatabase
-        .watchTables(_tables.map((table) => table.name))
-        .listen((_) => _loadTrash());
+    final tables = SettingsProfileContract.trashTabs
+        .map((tab) => tab.localTable)
+        .toSet();
+    _subscription = widget.localDatabase.watchTables(tables).listen((_) {
+      _loadTrash();
+    });
     _loadTrash();
   }
 
@@ -54,24 +47,23 @@ class _TrashScreenState extends State<TrashScreen> {
 
   Future<void> _loadTrash() async {
     final records = <_TrashRecord>[];
+    final farmId = widget.currentUser.activeFarmId;
     try {
-      for (final table in _tables) {
+      for (final tab in SettingsProfileContract.trashTabs) {
         final rows = await widget.localDatabase.queryLocalRecords(
-          table.name,
+          tab.localTable,
           where: 'farm_id = ? and is_deleted = 1',
-          whereArgs: [widget.currentUser.activeFarmId],
+          whereArgs: [farmId],
           orderBy: 'deleted_at desc',
         );
         for (final row in rows) {
-          records.add(_TrashRecord(table: table, row: row));
+          records.add(_TrashRecord(tab: tab, row: row));
         }
       }
     } on StateError {
       records.clear();
     }
-    if (!mounted) {
-      return;
-    }
+    if (!mounted) return;
     setState(() {
       _records = records;
       _loading = false;
@@ -79,12 +71,12 @@ class _TrashScreenState extends State<TrashScreen> {
   }
 
   Future<void> _restore(_TrashRecord record) async {
+    if (!record.tab.restoreAllowed) return;
     final id = record.id;
-    if (id.isEmpty) {
-      return;
-    }
+    if (id.isEmpty) return;
+
     await widget.localDatabase.updateLocalRecord(
-      record.table.name,
+      record.tab.localTable,
       {'is_deleted': 0, 'deleted_at': null},
       where: 'id = ?',
       whereArgs: [id],
@@ -95,88 +87,130 @@ class _TrashScreenState extends State<TrashScreen> {
         inputType: 'restore_record',
         payload: {
           'farm_id': widget.currentUser.activeFarmId,
-          'table': record.table.name,
+          'table': record.tab.localTable,
           'record_id': id,
         },
         createdAt: DateTime.now(),
       ),
     );
-    if (!mounted) {
-      return;
-    }
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('${record.table.label} restored.'),
+        content: Text('${record.tab.label} restored.'),
         behavior: SnackBarBehavior.floating,
       ),
     );
     _loadTrash();
   }
 
+  List<_TrashRecord> get _filteredRecords {
+    final query = _search.trim().toLowerCase();
+    return _records.where((record) {
+      if (record.tab.key != _activeTab) return false;
+      if (query.isEmpty) return true;
+      return record.title.toLowerCase().contains(query) ||
+          record.subtitle.toLowerCase().contains(query);
+    }).toList();
+  }
+
+  int _countForTab(String key) =>
+      _records.where((record) => record.tab.key == key).length;
+
   @override
   Widget build(BuildContext context) {
-    final grouped = <String, List<_TrashRecord>>{};
-    for (final record in _records) {
-      grouped.putIfAbsent(record.table.label, () => []).add(record);
-    }
+    final filtered = _filteredRecords;
+    final activeTab = SettingsProfileContract.tabByKey(_activeTab)!;
+
     return Scaffold(
       backgroundColor: const Color(0xfff8faf7),
       appBar: AppBar(
         backgroundColor: Colors.white,
         surfaceTintColor: Colors.white,
-        title: const Text('Data Recovery'),
+        title: const Text('Data Recovery Center'),
       ),
       body: SafeArea(
         child: _loading
             ? const Center(child: CircularProgressIndicator())
-            : _records.isEmpty
-            ? const Center(
-                child: Text(
-                  'Trash is empty.',
-                  style: TextStyle(
-                    color: Color(0xff66736c),
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              )
-            : ListView(
-                padding: const EdgeInsets.fromLTRB(16, 16, 16, 28),
+            : Column(
                 children: [
-                  for (final entry in grouped.entries) ...[
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8, top: 6),
-                      child: Text(
-                        entry.key,
-                        style: Theme.of(context).textTheme.titleMedium
-                            ?.copyWith(
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: 0,
-                            ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                    child: TextField(
+                      decoration: const InputDecoration(
+                        prefixIcon: Icon(Icons.search),
+                        hintText: 'Search records…',
+                        border: OutlineInputBorder(),
                       ),
+                      onChanged: (value) => setState(() => _search = value),
                     ),
-                    for (final record in entry.value)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 10),
-                        child: ListTile(
-                          tileColor: Colors.white,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(8),
-                            side: const BorderSide(color: Color(0xffe1e7e3)),
+                  ),
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Row(
+                      children: SettingsProfileContract.trashTabs.map((tab) {
+                        final count = _countForTab(tab.key);
+                        final selected = tab.key == _activeTab;
+                        return Padding(
+                          padding: const EdgeInsets.only(right: 8, bottom: 8),
+                          child: FilterChip(
+                            label: Text('${tab.label}${count > 0 ? ' ($count)' : ''}'),
+                            selected: selected,
+                            onSelected: (_) => setState(() => _activeTab = tab.key),
                           ),
-                          title: Text(
-                            record.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w900),
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                  Expanded(
+                    child: filtered.isEmpty
+                        ? Center(
+                            child: Text(
+                              'No deleted ${activeTab.label.toLowerCase()} found.',
+                              style: const TextStyle(
+                                color: Color(0xff66736c),
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          )
+                        : ListView.builder(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 28),
+                            itemCount: filtered.length,
+                            itemBuilder: (context, index) {
+                              final record = filtered[index];
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 10),
+                                child: ListTile(
+                                  tileColor: Colors.white,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(8),
+                                    side: const BorderSide(color: Color(0xffe1e7e3)),
+                                  ),
+                                  title: Text(
+                                    record.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontWeight: FontWeight.w900),
+                                  ),
+                                  subtitle: Text(record.subtitle),
+                                  trailing: record.tab.restoreAllowed
+                                      ? FilledButton(
+                                          onPressed: () => _restore(record),
+                                          child: const Text('Restore'),
+                                        )
+                                      : const Text(
+                                          'Audit only',
+                                          style: TextStyle(
+                                            color: Color(0xff66736c),
+                                            fontStyle: FontStyle.italic,
+                                            fontSize: 12,
+                                          ),
+                                        ),
+                                ),
+                              );
+                            },
                           ),
-                          subtitle: Text(record.subtitle),
-                          trailing: FilledButton(
-                            onPressed: () => _restore(record),
-                            child: const Text('Restore'),
-                          ),
-                        ),
-                      ),
-                  ],
+                  ),
                 ],
               ),
       ),
@@ -184,32 +218,22 @@ class _TrashScreenState extends State<TrashScreen> {
   }
 }
 
-class _TrashTable {
-  const _TrashTable(this.name, this.label, this.titleColumn);
-
-  final String name;
-  final String label;
-  final String titleColumn;
-}
-
 class _TrashRecord {
-  const _TrashRecord({required this.table, required this.row});
+  const _TrashRecord({required this.tab, required this.row});
 
-  final _TrashTable table;
+  final TrashTabDefinition tab;
   final Map<String, Object?> row;
 
   String get id => row['id']?.toString() ?? '';
 
   String get title {
-    final value = row[table.titleColumn]?.toString().trim() ?? '';
-    if (value.isNotEmpty) {
-      return value;
-    }
-    return id.isEmpty ? table.label : id;
+    final value = row[tab.titleColumn]?.toString().trim() ?? '';
+    if (value.isNotEmpty) return value;
+    return id.isEmpty ? tab.label : id;
   }
 
   String get subtitle {
     final deletedAt = row['deleted_at']?.toString() ?? '';
-    return deletedAt.isEmpty ? table.name : '${table.name} | $deletedAt';
+    return deletedAt.isEmpty ? tab.localTable : '${tab.localTable} | $deletedAt';
   }
 }

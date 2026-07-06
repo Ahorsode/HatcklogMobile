@@ -8,7 +8,7 @@ void showHatchLogDetailsPopup(
   String dynamicTitle,
 ) {
   final displayEntries = rawPayload.entries.where(
-    (entry) => !_hiddenDetailKeys.contains(entry.key),
+    (entry) => !_shouldHideDetailKey(entry.key),
   );
 
   showDialog<void>(
@@ -88,12 +88,34 @@ const _hiddenDetailKeys = {
   'tenantId',
   'userId',
   'user_id',
+  'batchId',
+  'batch_id',
+  'houseId',
+  'house_id',
+  'customerId',
+  'customer_id',
+  'authUserId',
+  'profileId',
+  'profile_id',
+  'membershipId',
+  'membership_id',
   'created_by',
   'deletedAt',
   'deleted_at',
   'isDeleted',
   'is_deleted',
 };
+
+bool _shouldHideDetailKey(String key) {
+  if (_hiddenDetailKeys.contains(key)) {
+    return true;
+  }
+  final normalized = key.trim();
+  if (normalized.endsWith('Id') || normalized.endsWith('_id')) {
+    return true;
+  }
+  return false;
+}
 
 String _cleanLabel(String key) {
   final spaced = key
