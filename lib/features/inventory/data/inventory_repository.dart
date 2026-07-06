@@ -36,6 +36,28 @@ class InventoryItemDetail {
   final List<InventoryUsageEvent> usageEvents;
 }
 
+class ActiveBatchEggRow {
+  const ActiveBatchEggRow({
+    required this.batchId,
+    required this.batchName,
+    required this.eggsRemaining,
+  });
+
+  final String batchId;
+  final String batchName;
+  final int eggsRemaining;
+}
+
+class ActiveBatchEggStock {
+  const ActiveBatchEggStock({
+    required this.totalEggs,
+    required this.batches,
+  });
+
+  final int totalEggs;
+  final List<ActiveBatchEggRow> batches;
+}
+
 class InventoryRepository {
   InventoryRepository(this._db);
 
@@ -77,6 +99,41 @@ class InventoryRepository {
       }
     }
     return count;
+  }
+
+  Future<ActiveBatchEggStock> getActiveBatchEggStock(String farmId) async {
+    final rows = await _db.rawLocalQuery(
+      '''
+      SELECT b.id AS batch_id, b.batch_name, SUM(ep.eggs_remaining) AS eggs_remaining
+      FROM egg_production ep
+      INNER JOIN batches b ON b.id = ep.batch_id
+      WHERE ep.farm_id = ?
+        AND coalesce(ep.is_deleted, 0) = 0
+        AND coalesce(b.is_deleted, 0) = 0
+        AND lower(b.status) = 'active'
+        AND b.type = 'POULTRY_LAYER'
+        AND ep.eggs_remaining > 0
+      GROUP BY b.id, b.batch_name
+      ORDER BY b.batch_name ASC
+      ''',
+      [farmId],
+    );
+
+    final batches = rows
+        .map(
+          (row) => ActiveBatchEggRow(
+            batchId: row['batch_id']?.toString() ?? '',
+            batchName: row['batch_name']?.toString() ?? 'Batch',
+            eggsRemaining: _int(row['eggs_remaining']),
+          ),
+        )
+        .where((row) => row.batchId.isNotEmpty)
+        .toList(growable: false);
+    final totalEggs = batches.fold<int>(
+      0,
+      (sum, row) => sum + row.eggsRemaining,
+    );
+    return ActiveBatchEggStock(totalEggs: totalEggs, batches: batches);
   }
 
   Future<List<Map<String, Object?>>> getHealthInventory(String farmId) async {
@@ -277,5 +334,18 @@ class InventoryRepository {
       return value.toDouble();
     }
     return double.tryParse(value.toString()) ?? fallback;
+  }
+
+  int _int(Object? value, {int fallback = 0}) {
+    if (value == null) {
+      return fallback;
+    }
+    if (value is int) {
+      return value;
+    }
+    if (value is num) {
+      return value.toInt();
+    }
+    return int.tryParse(value.toString()) ?? fallback;
   }
 }

@@ -81,8 +81,12 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   List<Map<String, Object?>> _customers = const [];
   List<_ProductOption> _inventoryOptions = const [];
   List<_ProductOption> _livestockOptions = const [];
-  bool _inventoryIsEggCatalog = false;
   final List<_SaleLineState> _lines = [_SaleLineState()];
+
+  bool get _isWalkIn => _customerId == null;
+
+  bool get _cashFieldEditable =>
+      _isWalkIn || widget.canOverridePrices;
 
   @override
   void initState() {
@@ -116,7 +120,17 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         whereArgs: [farmId],
         orderBy: 'item_name asc',
       );
-      final saleInventoryRows = inventoryRowsForSale(inventoryRows);
+      final eggCategoryRows = await widget.localDatabase.queryLocalRecords(
+        'egg_categories',
+        where: 'farm_id = ?',
+        whereArgs: [farmId],
+      );
+      final eggCategoriesById = {
+        for (final row in eggCategoryRows)
+          if ((row['id']?.toString().trim() ?? '').isNotEmpty)
+            row['id']!.toString(): row,
+      };
+      final saleInventoryRows = sellableEggInventoryRows(inventoryRows);
       final batchRows = await widget.localDatabase.queryLocalRecords(
         'batches',
         where:
@@ -129,18 +143,19 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       }
       setState(() {
         _customers = customers;
-        _inventoryIsEggCatalog = inventoryCatalogIsEggFocused(saleInventoryRows);
         _inventoryOptions = saleInventoryRows
             .map(
               (row) {
-                final sellingPrice = _asDouble(row['selling_price']);
-                final costPerUnit = _asDouble(row['cost_per_unit']);
+                final unitPrice = inventorySalePrice(
+                  row,
+                  eggCategoriesById: eggCategoriesById,
+                );
                 final label = formatSaleInventoryLabel(row);
                 return _ProductOption(
                   id: _text(row['id']),
                   label: label,
                   description: label,
-                  unitPrice: sellingPrice > 0 ? sellingPrice : costPerUnit,
+                  unitPrice: unitPrice,
                   available: inventoryStockLevel(row['stock_level']),
                   productType: SaleProductType.inventory,
                 );
@@ -173,7 +188,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
           _autoSelectProduct(line);
         }
       });
-      _syncLockedCashTotal();
+      _syncCashReceived();
     } on StateError {
       if (mounted) {
         setState(() => _loading = false);
@@ -197,13 +212,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
     if (options.isEmpty) {
       return false;
     }
-    if (options.length == 1) {
-      return true;
-    }
-    if (line.productType == SaleProductType.inventory && _inventoryIsEggCatalog) {
-      return true;
-    }
-    return false;
+    return options.length == 1;
   }
 
   void _autoSelectProduct(_SaleLineState line) {
@@ -217,9 +226,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       line.unitPriceController.clear();
       return;
     }
-    final shouldAutoSelect = options.length == 1 ||
-        (line.productType == SaleProductType.inventory && _inventoryIsEggCatalog);
-    if (!shouldAutoSelect) {
+    if (options.length != 1) {
       return;
     }
     final selected = options.first;
@@ -260,7 +267,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         }
       }
       _submitError = null;
-      _syncLockedCashTotal();
+      _syncCashReceived();
     });
   }
 
@@ -319,16 +326,19 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
     if (cash < 0) {
       return false;
     }
+    if (_computedTotal <= 0) {
+      return false;
+    }
+    if (_isWalkIn) {
+      return cash >= 0;
+    }
     if (widget.canOverridePrices) {
-      return cash >= 0 && _computedTotal > 0;
+      return cash >= 0;
     }
     if (cash <= 0) {
       return false;
     }
-    if ((cash - _computedTotal).abs() > 0.01) {
-      return false;
-    }
-    return true;
+    return (cash - _computedTotal).abs() <= 0.01;
   }
 
   _ProductOption _placeholderProduct(_SaleLineState line) {
@@ -342,8 +352,8 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
     );
   }
 
-  void _syncLockedCashTotal() {
-    if (widget.canOverridePrices) {
+  void _syncCashReceived() {
+    if (!_isWalkIn && widget.canOverridePrices) {
       return;
     }
     _cashReceivedController.text = _computedTotal.toStringAsFixed(2);
@@ -405,7 +415,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         customerId: _customerId,
         customerName: customerName,
         discountAmount: widget.canOverridePrices ? _discountAmount : 0,
-        requireExactCashTotal: !widget.canOverridePrices,
+        requireExactCashTotal: !_isWalkIn && !widget.canOverridePrices,
       );
 
       if (!mounted) {
@@ -528,7 +538,10 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                         child: Text(_text(row['name'], 'Customer')),
                       ),
                   ],
-                  onChanged: (value) => setState(() => _customerId = value),
+                  onChanged: (value) => setState(() {
+                    _customerId = value;
+                    _syncCashReceived();
+                  }),
                 ),
                 const SizedBox(height: 12),
                 ListTile(
@@ -547,10 +560,12 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                     line: _lines[index],
                     index: index,
                     canOverridePrices: widget.canOverridePrices,
-                    inventoryTypeLabel:
-                        _inventoryIsEggCatalog ? 'Eggs' : 'Inventory',
+                    inventoryTypeLabel: 'Eggs',
                     options: _optionsFor(_lines[index].productType),
                     hideProductPicker: _shouldHideProductPicker(_lines[index]),
+                    inventoryEmpty: _lines[index].productType ==
+                            SaleProductType.inventory &&
+                        _inventoryOptions.isEmpty,
                     onProductTypeChanged: (type) {
                       setState(() {
                         final line = _lines[index];
@@ -561,7 +576,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                         line.description = '';
                         line.stockError = null;
                         _autoSelectProduct(line);
-                        _syncLockedCashTotal();
+                        _syncCashReceived();
                       });
                     },
                     onChanged: _onFieldChanged,
@@ -571,7 +586,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                             setState(() {
                               _lines[index].dispose();
                               _lines.removeAt(index);
-                              _syncLockedCashTotal();
+                              _syncCashReceived();
                             });
                           },
                   ),
@@ -582,7 +597,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                       final line = _SaleLineState();
                       _lines.add(line);
                       _autoSelectProduct(line);
-                      _syncLockedCashTotal();
+                      _syncCashReceived();
                     });
                   },
                   icon: const Icon(Icons.add),
@@ -642,13 +657,14 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                 const SizedBox(height: 12),
                 TextField(
                   controller: _cashReceivedController,
-                  readOnly: !widget.canOverridePrices,
+                  readOnly: !_cashFieldEditable,
                   keyboardType: const TextInputType.numberWithOptions(
                     decimal: true,
                   ),
                   decoration: InputDecoration(
                     labelText: 'Total Cash Received (GHS)',
-                    errorText: !widget.canOverridePrices &&
+                    errorText: !_isWalkIn &&
+                            !widget.canOverridePrices &&
                             ((double.tryParse(
                                       _cashReceivedController.text.trim(),
                                     ) ??
@@ -659,18 +675,19 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                         ? 'Cash received must equal the locked sale total'
                         : null,
                   ),
-                  onChanged: widget.canOverridePrices
-                      ? (_) => _onFieldChanged()
-                      : null,
+                  onChanged: _cashFieldEditable ? (_) => _onFieldChanged() : null,
                 ),
-                if (!widget.canOverridePrices)
-                  const Padding(
-                    padding: EdgeInsets.only(top: 8),
-                    child: Text(
-                      'Workers cannot edit prices or discounts.',
-                      style: TextStyle(color: Colors.grey),
-                    ),
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text(
+                    _isWalkIn
+                        ? 'Walk-in sale: cash defaults to the sale total and can be adjusted.'
+                        : widget.canOverridePrices
+                            ? 'Credit sale: cash can differ from total for named customers.'
+                            : 'Workers cannot edit prices or discounts for named customers.',
+                    style: const TextStyle(color: Colors.grey),
                   ),
+                ),
                 if (_submitError != null) ...[
                   const SizedBox(height: 12),
                   Text(
@@ -714,6 +731,7 @@ class _LineCard extends StatelessWidget {
     required this.inventoryTypeLabel,
     required this.options,
     required this.hideProductPicker,
+    required this.inventoryEmpty,
     required this.onProductTypeChanged,
     required this.onChanged,
     this.onRemove,
@@ -725,6 +743,7 @@ class _LineCard extends StatelessWidget {
   final String inventoryTypeLabel;
   final List<_ProductOption> options;
   final bool hideProductPicker;
+  final bool inventoryEmpty;
   final ValueChanged<SaleProductType> onProductTypeChanged;
   final ValueChanged<VoidCallback?> onChanged;
   final VoidCallback? onRemove;
@@ -793,7 +812,21 @@ class _LineCard extends StatelessWidget {
                 ),
                 onChanged: (_) => onChanged(null),
               ),
-            ] else if (hideProductPicker && selected != null)
+            ] else if (inventoryEmpty &&
+                line.productType == SaleProductType.inventory)
+              InputDecorator(
+                decoration: const InputDecoration(
+                  labelText: 'Eggs Product',
+                ),
+                child: Text(
+                  'No eggs in stock — log egg production first',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              )
+            else if (hideProductPicker && selected != null)
               InputDecorator(
                 decoration: InputDecoration(
                   labelText: line.productType == SaleProductType.inventory

@@ -46,6 +46,45 @@ List<Map<String, Object?>> inventoryRowsForSale(
   return inStock;
 }
 
+/// Egg-only sellable rows for sales (no feed/medicine fallback).
+List<Map<String, Object?>> sellableEggInventoryRows(
+  List<Map<String, Object?>> rows,
+) {
+  return rows
+      .where(isInStockForSale)
+      .where(isEggInventoryRow)
+      .toList(growable: false);
+}
+
+double inventorySalePrice(
+  Map<String, Object?> row, {
+  Map<String, Map<String, Object?>> eggCategoriesById = const {},
+}) {
+  final rowSellingPrice = _rowDouble(row['selling_price']);
+  if (rowSellingPrice > 0) {
+    return rowSellingPrice;
+  }
+  final categoryId = row['egg_category_id']?.toString().trim() ?? '';
+  if (categoryId.isNotEmpty) {
+    final category = eggCategoriesById[categoryId];
+    final categoryPrice = _rowDouble(category?['selling_price']);
+    if (categoryPrice > 0) {
+      return categoryPrice;
+    }
+  }
+  return _rowDouble(row['cost_per_unit']);
+}
+
+double _rowDouble(Object? value) {
+  if (value is double) {
+    return value;
+  }
+  if (value is num) {
+    return value.toDouble();
+  }
+  return double.tryParse(value?.toString() ?? '') ?? 0;
+}
+
 bool inventoryCatalogIsEggFocused(List<Map<String, Object?>> saleRows) {
   return saleRows.isNotEmpty && saleRows.every(isEggInventoryRow);
 }
