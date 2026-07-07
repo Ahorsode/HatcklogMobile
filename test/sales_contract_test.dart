@@ -69,5 +69,18 @@ void main() {
         isEmpty,
       );
     });
+    test('completion prompt only for credit or partial payment', () {
+      bool needsPrompt({
+        required bool isCredit,
+        required double total,
+        required double cash,
+      }) {
+        return isCredit || (total - cash).abs() > 0.01;
+      }
+
+      expect(needsPrompt(isCredit: false, total: 100, cash: 100), isFalse);
+      expect(needsPrompt(isCredit: false, total: 100, cash: 50), isTrue);
+      expect(needsPrompt(isCredit: true, total: 100, cash: 100), isTrue);
+    });
   });
 }

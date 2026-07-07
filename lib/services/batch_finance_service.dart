@@ -87,6 +87,12 @@ class BatchFinanceService {
             orderIds,
           );
 
+    final batchAllocations = await _db.queryLocalRecords(
+      'order_item_batch_allocations',
+      where: 'farm_id = ?',
+      whereArgs: [farmId],
+    );
+
     final batchIds = batches.map((b) => b['id'] as String).toSet();
     final totals = {
       for (final id in batchIds)
@@ -186,6 +192,7 @@ class BatchFinanceService {
       saleItems,
       cancelledOrderIds,
       totals,
+      batchAllocations: batchAllocations,
     );
     _allocateRevenue(
       batches,
@@ -193,6 +200,7 @@ class BatchFinanceService {
       cancelledOrderIds,
       totals,
       orderIdKey: 'order_id',
+      batchAllocations: batchAllocations,
     );
 
     return totals.values
@@ -314,7 +322,21 @@ class BatchFinanceService {
     Set<String> cancelledOrderIds,
     Map<String, _BatchAccumulator> totals, {
     String orderIdKey = 'order_id',
+    List<Map<String, Object?>> batchAllocations = const [],
   }) {
+    final allocatedItemIds = <String>{};
+    for (final row in batchAllocations) {
+      final batchId = row['batch_id']?.toString() ?? '';
+      if (batchId.isEmpty || !totals.containsKey(batchId)) {
+        continue;
+      }
+      totals[batchId]!.revenue += _double(row['revenue_amount']);
+      final orderItemId = row['order_item_id']?.toString() ?? '';
+      if (orderItemId.isNotEmpty) {
+        allocatedItemIds.add(orderItemId);
+      }
+    }
+
     final linked = <String, double>{};
     var unlinked = 0.0;
 
@@ -323,7 +345,19 @@ class BatchFinanceService {
           cancelledOrderIds.contains(item['sale_id']?.toString())) {
         continue;
       }
+      final itemId = item['id']?.toString() ?? '';
+      if (allocatedItemIds.contains(itemId)) {
+        continue;
+      }
       final total = _double(item['total_price']);
+      final eggMode = item['egg_allocation_mode']?.toString() ?? '';
+      final eggBatchId = item['egg_batch_id']?.toString() ?? '';
+      if (eggMode == 'batch' &&
+          eggBatchId.isNotEmpty &&
+          totals.containsKey(eggBatchId)) {
+        linked[eggBatchId] = (linked[eggBatchId] ?? 0) + total;
+        continue;
+      }
       final batchId = item['livestock_id']?.toString() ?? '';
       if (batchId.isNotEmpty && totals.containsKey(batchId)) {
         linked[batchId] = (linked[batchId] ?? 0) + total;

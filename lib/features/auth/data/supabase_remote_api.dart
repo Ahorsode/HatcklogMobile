@@ -567,6 +567,13 @@ class SupabaseRemoteApi {
         farmId,
         farmColumn: 'farm_id',
       ),
+      _selectFarmRowsSafe(
+        'order_item_batch_allocations',
+        farmId,
+        farmColumn: 'farmId',
+        updatedColumn: 'updatedAt',
+        modifiedAfter: modifiedAfter,
+      ),
     ]);
 
     final userPermissions = farmScopedQueries[0];
@@ -594,6 +601,7 @@ class SupabaseRemoteApi {
     final feedFormulations = farmScopedQueries[20];
     final isolationRooms = farmScopedQueries[21];
     final expenseAllocations = farmScopedQueries[22];
+    final batchAllocations = farmScopedQueries[23];
 
     addRows('user_permissions', userPermissions.map(_mapUserPermission));
     addRows('farm_settings', farmSettings.map(_mapFarmSettings));
@@ -626,6 +634,10 @@ class SupabaseRemoteApi {
     addRows('egg_categories', eggCategories.map(_mapEggCategory));
     addRows('feed_formulations', feedFormulations.map(_mapFeedFormulation));
     addRows('isolation_rooms', isolationRooms.map(_mapIsolationRoom));
+    addRows(
+      'order_item_batch_allocations',
+      batchAllocations.map(_mapOrderItemBatchAllocation),
+    );
 
     final orderItems = await _selectRowsByIdsSafe(
       'order_items',
@@ -1344,6 +1356,7 @@ class SupabaseRemoteApi {
       'transaction_date': _timestamp(row['transaction_date']),
       'description': _asString(row['description']),
       'customer_id': _asString(row['customerId']),
+      'order_id': _asString(row['orderId']),
       'deposit_amount': _asDouble(row['depositAmount']),
       'outstanding_credit': _asDouble(row['outstandingCredit']),
       'expense_outlay': type.toUpperCase() == 'EXPENSE' ? amount : 0,
@@ -1417,6 +1430,7 @@ class SupabaseRemoteApi {
       'subtotal_amount': _asDouble(row['subtotal_amount']),
       'tax_amount': _asDouble(row['tax_amount']),
       'total_amount': _asDouble(row['totalAmount']),
+      'cash_received': _asDouble(row['cashReceived']),
       'currency': _asString(row['currency']),
       'status': _asString(row['status']),
       'discount_amount': _asDouble(row['discountAmount']),
@@ -1430,6 +1444,19 @@ class SupabaseRemoteApi {
       'deleted_at': _timestamp(row['deleted_at']),
       'created_at': _timestamp(row['created_at']),
       'updated_at': _timestamp(row['updated_at']),
+    };
+  }
+
+  Map<String, Object?> _mapOrderItemBatchAllocation(Map<String, dynamic> row) {
+    return {
+      'id': _asString(row['id']),
+      'order_item_id': _asString(row['orderItemId']),
+      'batch_id': _asString(row['batchId']),
+      'farm_id': _asString(row['farmId']),
+      'eggs_used': _asInt(row['eggsUsed']),
+      'revenue_amount': _asDouble(row['revenueAmount']),
+      'created_at': _timestamp(row['createdAt']),
+      'updated_at': _timestamp(row['updatedAt']),
     };
   }
 
@@ -2736,6 +2763,13 @@ class SupabaseRemoteApi {
     final paymentStatus = isPaid
         ? 'PAID'
         : (cashReceived > 0 ? 'PARTIALLY_PAID' : 'UNPAID');
+    final completeNow = payload['complete_now'] == true;
+    final isCreditSale = paymentMethod.toUpperCase() == 'CREDIT';
+    final needsCompletionPrompt = isCreditSale || outstanding > 0.01;
+    final shouldCompleteNow = completeNow || !needsCompletionPrompt;
+    final orderStatus = shouldCompleteNow
+        ? 'COMPLETED'
+        : (isPaid ? 'PAID' : 'PENDING');
 
     await _verifiedUpsert('orders', {
       'id': orderId,
@@ -2745,9 +2779,10 @@ class SupabaseRemoteApi {
       'subtotalAmount': subtotal,
       'taxAmount': 0,
       'totalAmount': computedTotal,
+      'cashReceived': cashReceived,
       'discountAmount': discount,
       'currency': 'GHS',
-      'status': isPaid ? 'PAID' : 'PENDING',
+      'status': orderStatus,
       'paymentMethod': paymentMethod.isEmpty ? 'CASH' : paymentMethod,
       if (paymentReference.isNotEmpty) 'paymentReference': paymentReference,
       if (paymentAccountName.isNotEmpty)
@@ -2797,9 +2832,13 @@ class SupabaseRemoteApi {
       'id': '${orderId}_transaction',
       'farm_id': farmId,
       'user_id': input.userId,
+      'order_id': orderId,
+      'customer_id': customerId.isEmpty ? null : customerId,
       'type': 'REVENUE',
       'category': 'SALES',
       'amount': computedTotal,
+      'deposit_amount': cashReceived,
+      'outstanding_credit': outstanding,
       'payment_status': paymentStatus,
       'payment_method': paymentMethod.isEmpty ? 'CASH' : paymentMethod,
       'reference_num': paymentReference.isNotEmpty
@@ -2811,6 +2850,26 @@ class SupabaseRemoteApi {
           : '${descriptions.join(', ')} to ${customerName.isEmpty ? 'Walk-in Customer' : customerName}',
       if (isPaid) 'settled_at': timestamp,
     });
+
+    if (shouldCompleteNow) {
+      final batchAllocations = payload['batch_allocations'];
+      if (batchAllocations is List) {
+        for (final alloc in batchAllocations) {
+          if (alloc is! Map) {
+            continue;
+          }
+          final allocMap = Map<String, dynamic>.from(alloc);
+          await _verifiedUpsert('order_item_batch_allocations', {
+            'id': _asString(allocMap['id']),
+            'orderItemId': _asString(allocMap['order_item_id']),
+            'batchId': _asString(allocMap['batch_id']),
+            'farmId': farmId,
+            'eggsUsed': _asInt(allocMap['eggs_used']),
+            'revenueAmount': _asDouble(allocMap['revenue_amount']),
+          });
+        }
+      }
+    }
   }
 
   Future<void> _pushRolePromotion(PendingSyncInput input) async {

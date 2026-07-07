@@ -106,6 +106,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   List<_ProductOption> _livestockOptions = const [];
   List<Map<String, Object?>> _eggInventoryRows = const [];
   List<EggBatchStockOption> _eggBatchOptions = const [];
+  int _fifoTotalEggs = 0;
   Map<String, Map<String, Object?>> _eggCategoriesById = const {};
   final List<_SaleLineState> _lines = [_SaleLineState()];
   int _eggsPerCrate = defaultEggsPerCrate;
@@ -122,8 +123,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
 
   bool get _isCreditSale => _paymentMethod == SalePaymentMethod.credit;
 
-  bool get _cashFieldEditable =>
-      _isWalkIn || _canOverridePrices || _isCreditSale;
+  bool get _cashFieldEditable => _canOverridePrices || _isCreditSale;
 
   @override
   void initState() {
@@ -200,6 +200,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
               ),
             )
             .toList(growable: false);
+        _fifoTotalEggs = eggStock.totalEggs;
         _inventoryOptions = saleInventoryRows
             .map(
               (row) {
@@ -326,8 +327,12 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       }
       return 0;
     }
-    final product = _selectedProduct(line);
-    return product?.available.floor() ?? 0;
+    return _fifoTotalEggs;
+  }
+
+  bool get _needsCompletionPrompt {
+    final cash = double.tryParse(_cashReceivedController.text.trim()) ?? 0;
+    return _isCreditSale || (_computedTotal - cash).abs() > 0.01;
   }
 
   Future<void> _pickEggSizeForLine(int index) async {
@@ -652,7 +657,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
     }).toList(growable: false);
   }
 
-  Future<void> _submit() async {
+  Future<void> _submit({bool? completeNow}) async {
     if (!_canSubmitStep2) {
       setState(() {
         _submitError = _canOverridePrices
@@ -660,6 +665,32 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
             : 'Cash received must equal the locked sale total';
       });
       return;
+    }
+
+    if (completeNow == null && _needsCompletionPrompt) {
+      final choice = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Complete this sale now?'),
+          content: const Text(
+            'This credit or partial-payment sale can be completed now to deduct stock, or saved to complete later.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Skip for now'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Complete sale now'),
+            ),
+          ],
+        ),
+      );
+      if (choice == null || !mounted) {
+        return;
+      }
+      return _submit(completeNow: choice);
     }
 
     setState(() {
@@ -695,6 +726,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
             : _paymentAccountNameController.text.trim(),
         requireExactCashTotal:
             !_isWalkIn && !_canOverridePrices && !_isCreditSale,
+        completeNow: completeNow,
       );
 
       if (!mounted) {
@@ -1094,7 +1126,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                     _isCreditSale
                         ? 'Credit sale: partial or zero payment allowed for saved customers.'
                         : _isWalkIn
-                        ? 'Walk-in sale: cash defaults to the sale total and can be adjusted.'
+                        ? 'Walk-in sale: cash is locked to the sale total'
                         : _canOverridePrices
                             ? 'Credit sale: cash can differ from total for named customers.'
                             : 'Workers cannot edit prices or discounts for named customers.',

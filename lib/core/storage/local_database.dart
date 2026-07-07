@@ -131,7 +131,7 @@ class LocalDatabase {
     final fullPath = path.join(databasePath, 'hatchlog_mobile.db');
     _database = await openDatabase(
       fullPath,
-      version: 19,
+      version: 20,
       onCreate: _createSchema,
       onUpgrade: _upgradeSchema,
     );
@@ -291,6 +291,19 @@ class LocalDatabase {
     final id = await _db.insert('pending_sync_inputs', input.toMap());
     _notifyTablesChanged(const ['pending_sync_inputs']);
     return id;
+  }
+
+  Future<void> updatePendingInputPayload(
+    int id,
+    Map<String, dynamic> payload,
+  ) async {
+    await _db.update(
+      'pending_sync_inputs',
+      {'payload_json': jsonEncode(payload)},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    _notifyTablesChanged(const ['pending_sync_inputs']);
   }
 
   Future<List<PendingSyncInput>> readPendingInputs({int limit = 50}) async {
@@ -765,6 +778,47 @@ class LocalDatabase {
     if (oldVersion < 19) {
       await _ensureOrderPaymentColumns(db);
     }
+    if (oldVersion < 20) {
+      await _ensureFifoSalesLedgerColumns(db);
+    }
+  }
+
+  Future<void> _ensureFifoSalesLedgerColumns(Database db) async {
+    await _addColumnIfMissing(
+      db,
+      'orders',
+      'cash_received',
+      'real not null default 0',
+    );
+    await _addColumnIfMissing(db, 'financial_transactions', 'order_id', 'text');
+    for (final column in const [
+      'egg_allocation_mode',
+      'egg_batch_id',
+      'line_discount_amount',
+      'line_discount_type',
+      'egg_quantity_unit',
+    ]) {
+      await _addColumnIfMissing(
+        db,
+        'order_items',
+        column,
+        column == 'line_discount_amount'
+            ? 'real not null default 0'
+            : 'text',
+      );
+    }
+    await db.execute('''
+      create table if not exists order_item_batch_allocations (
+        id text primary key,
+        order_item_id text not null,
+        batch_id text not null,
+        farm_id text not null,
+        eggs_used integer not null,
+        revenue_amount real not null,
+        created_at text,
+        updated_at text
+      )
+    ''');
   }
 
   Future<void> _ensureOrderPaymentColumns(Database db) async {
