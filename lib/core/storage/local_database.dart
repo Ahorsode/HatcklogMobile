@@ -131,7 +131,7 @@ class LocalDatabase {
     final fullPath = path.join(databasePath, 'hatchlog_mobile.db');
     _database = await openDatabase(
       fullPath,
-      version: 16,
+      version: 17,
       onCreate: _createSchema,
       onUpgrade: _upgradeSchema,
     );
@@ -174,6 +174,7 @@ class LocalDatabase {
     await _ensureBatchSyncParityColumns(db);
     await _ensureSettingsProfileParityColumns(db);
     await _ensureLivestockParityColumns(db);
+    await _ensureSaleLineEnhancementColumns(db);
   }
 
   void setLicenseTouchHandler(Future<void> Function()? handler) {
@@ -755,6 +756,34 @@ class LocalDatabase {
       await _repairSchemaParity(db);
       await _requeueMobileLivestockForSyncAllFarms(db);
     }
+    if (oldVersion < 17) {
+      await _ensureSaleLineEnhancementColumns(db);
+    }
+  }
+
+  Future<void> _ensureSaleLineEnhancementColumns(Database db) async {
+    await _addColumnIfMissing(db, 'farms', 'user_id', 'text');
+    for (final column in const [
+      'line_discount_amount',
+      'egg_allocation_mode',
+      'egg_batch_id',
+      'egg_quantity_unit',
+    ]) {
+      await _addColumnIfMissing(
+        db,
+        'sale_items',
+        column,
+        column == 'line_discount_amount'
+            ? 'real not null default 0'
+            : 'text',
+      );
+    }
+    await _addColumnIfMissing(
+      db,
+      'sale_items',
+      'line_discount_type',
+      "text not null default 'flat'",
+    );
   }
 
   Future<void> _requeueMobileLivestockForSyncAllFarms(Database db) async {
@@ -1176,6 +1205,7 @@ class LocalDatabase {
         capacity integer not null default 0,
         subscription_tier text,
         master_license_status text,
+        user_id text,
         updated_at text
       )
     ''');

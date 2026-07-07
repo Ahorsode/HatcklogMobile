@@ -440,7 +440,16 @@ class SupabaseRemoteApi {
       }
     }
     final users = await _selectRowsByIdsSafe('users', 'id', userIds);
-    addRows('local_users', users.map((row) => _mapUser(row, user)));
+    for (final row in users) {
+      addRows('local_users', [
+        _mapUser(
+          row,
+          user,
+          farmMembers: farmMembers,
+          farms: farms,
+        ),
+      ]);
+    }
 
     final farmScopedQueries = await Future.wait([
       _selectFarmRowsSafe(
@@ -978,7 +987,12 @@ class SupabaseRemoteApi {
     return rows.map((row) => Map<String, dynamic>.from(row as Map)).toList();
   }
 
-  Map<String, Object?> _mapUser(Map<String, dynamic> row, AppUser activeUser) {
+  Map<String, Object?> _mapUser(
+    Map<String, dynamic> row,
+    AppUser activeUser, {
+    List<Map<String, dynamic>> farmMembers = const [],
+    List<Map<String, dynamic>> farms = const [],
+  }) {
     final id = _asString(row['id']);
     final email = _asString(row['email']).trim().toLowerCase();
     final phone = _asString(row['phone_number']).trim();
@@ -988,14 +1002,38 @@ class SupabaseRemoteApi {
         ? email
         : id;
     final isActiveUser = id == activeUser.id;
+    final activeFarmId = isActiveUser ? activeUser.activeFarmId : '';
+    final UserRole role;
+    if (isActiveUser && activeFarmId.isNotEmpty) {
+      final farmOwnerId = farms
+              .where((farm) => _asString(farm['id']) == activeFarmId)
+              .map((farm) => _asString(farm['userId']))
+              .firstOrNull ??
+          '';
+      Map<String, dynamic>? membership;
+      for (final member in farmMembers) {
+        if (_asString(member['userId']) == id &&
+            _asString(member['farmId']) == activeFarmId) {
+          membership = member;
+          break;
+        }
+      }
+      role = resolveEffectiveFarmRole(
+        farmOwnerId: farmOwnerId,
+        userId: id,
+        membershipRole: UserRole.fromString(_asString(membership?['role'])),
+      );
+    } else {
+      role = UserRole.fromString(_asString(row['role']));
+    }
     return {
       'id': id,
       'phone_number': loginIdentifier,
       'email': email,
-      'role': _asString(row['role']),
+      'role': role.name.toLowerCase(),
       'first_name': _asString(row['firstname']),
       'last_name': _asString(row['surname']),
-      'active_farm_id': isActiveUser ? activeUser.activeFarmId : '',
+      'active_farm_id': activeFarmId,
       'active_batch_id': isActiveUser ? activeUser.activeBatchId : '',
       'updated_at': _timestamp(row['updated_at'] ?? row['created_at']),
     };
@@ -1009,6 +1047,7 @@ class SupabaseRemoteApi {
       'capacity': _asInt(row['capacity']),
       'subscription_tier': _asString(row['subscriptionTier']),
       'master_license_status': _asString(row['master_license_status']),
+      'user_id': _asString(row['userId']),
       'updated_at': _timestamp(row['updatedAt']),
     };
   }

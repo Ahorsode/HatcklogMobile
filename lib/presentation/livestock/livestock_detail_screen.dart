@@ -340,7 +340,7 @@ class _LivestockDetailScreenState extends State<LivestockDetailScreen>
           pdfService: pdf,
           currentUser: widget.currentUser,
           localDatabase: widget.localDatabase,
-          canOverridePrices: widget.permissions.canEditSales,
+          permissions: widget.permissions,
         ),
       ),
     );
@@ -586,7 +586,7 @@ class _ActivityTab extends StatelessWidget {
     return ListView.separated(
       padding: const EdgeInsets.all(16),
       itemCount: entries.length,
-      separatorBuilder: (_, __) => const Divider(height: 1),
+      separatorBuilder: (_, _) => const Divider(height: 1),
       itemBuilder: (context, index) {
         final entry = entries[index];
         return ListTile(
@@ -658,7 +658,7 @@ class _HealthTab extends StatelessWidget {
     return ListView.separated(
       padding: const EdgeInsets.all(16),
       itemCount: schedules.length,
-      separatorBuilder: (_, __) => const Divider(height: 1),
+      separatorBuilder: (_, _) => const Divider(height: 1),
       itemBuilder: (context, index) {
         final row = schedules[index];
         return ListTile(

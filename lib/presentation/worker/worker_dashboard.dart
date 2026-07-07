@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../../core/models/app_user.dart';
+import '../../core/permissions/permissions_repository.dart';
 import '../../core/models/worker_input_type.dart';
 import '../../core/storage/local_database.dart';
 import '../../features/sync/data/worker_input_sink.dart';
@@ -173,17 +173,20 @@ class _WorkerDashboardState extends State<WorkerDashboard> {
 
   Future<void> _openSaleEntry() async {
     HapticFeedback.lightImpact();
+    final permissions = await PermissionsRepository(
+      localDatabase: _localDatabase,
+    ).loadForUser(widget.currentUser);
+    if (!mounted) {
+      return;
+    }
     await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (context) => SaleEntryScreen(
           queue: widget.localSalesQueue,
           pdfService: widget.pdfInvoiceService,
           currentUser: widget.currentUser,
-          localDatabase: LocalDatabase(),
-          canOverridePrices:
-              widget.currentUser.role == UserRole.owner ||
-              widget.currentUser.role == UserRole.admin ||
-              widget.currentUser.role == UserRole.manager,
+          localDatabase: _localDatabase,
+          permissions: permissions,
         ),
       ),
     );

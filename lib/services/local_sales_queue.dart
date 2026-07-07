@@ -258,19 +258,29 @@ class LocalSalesQueue {
         'id': '${saleId}_item_$index',
         'sale_id': saleId,
         'description': item.description,
-        'quantity': item.quantity,
-        'unit_price': item.unitPrice,
+        'quantity': item.resolvedQuantityEggs,
+        'unit_price': item.productType == SaleProductType.inventory
+            ? item.resolvedUnitPricePerEgg
+            : item.unitPrice,
         'total_price': item.lineTotal,
+        'line_discount_amount': item.lineDiscountValue,
+        'line_discount_type': item.lineDiscountType,
         'farm_id': farmId,
         if (item.inventoryId != null && item.inventoryId!.isNotEmpty)
           'inventory_id': item.inventoryId,
         if (item.livestockId != null && item.livestockId!.isNotEmpty)
           'livestock_id': item.livestockId,
+        if (item.eggAllocationMode != null && item.eggAllocationMode!.isNotEmpty)
+          'egg_allocation_mode': item.eggAllocationMode,
+        if (item.eggBatchId != null && item.eggBatchId!.isNotEmpty)
+          'egg_batch_id': item.eggBatchId,
+        if (item.productType == SaleProductType.inventory)
+          'egg_quantity_unit': item.eggQuantityUnit.name,
       });
       await EggFifoService(localDatabase).deductForInventorySale(
         farmId: farmId,
         inventoryId: item.inventoryId,
-        quantity: item.quantity,
+        quantity: item.resolvedQuantityEggs,
         batchId: item.eggAllocationMode == 'batch' ? item.eggBatchId : null,
       );
     }

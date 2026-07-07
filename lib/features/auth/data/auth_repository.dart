@@ -7,6 +7,7 @@ import '../../../core/config/google_auth_config.dart';
 import '../../../core/license/device_fingerprint.dart';
 import '../../../core/license/license_service.dart';
 import '../../../core/models/app_user.dart';
+import '../../../core/permissions/local_effective_farm_role_resolver.dart';
 import '../../../core/storage/local_database.dart';
 import '../../../core/storage/secure_credential_store.dart';
 import 'supabase_remote_api.dart';
@@ -119,6 +120,10 @@ class AuthRepository {
       resolvedUser = resolvedUser.copyWith(activeFarmId: sessionFarmId);
     }
 
+    resolvedUser = await LocalEffectiveFarmRoleResolver(
+      _localDatabase,
+    ).applyToUser(resolvedUser);
+
     final online = await _connectivityService.isOnline;
     var authenticatedOffline = true;
     if (online && _remoteApi.isConfigured) {
@@ -134,6 +139,8 @@ class AuthRepository {
       } on Object {
         // Keep the cached local session when cloud auth is unavailable.
       }
+    } else {
+      await _localDatabase.upsertUser(resolvedUser);
     }
 
     return resolvedUser.copyWith(
@@ -143,13 +150,15 @@ class AuthRepository {
   }
 
   Future<void> _persistSession(AppUser user) async {
-    final cacheableUser = user.copyWith(
-      requiresInitialSetup: false,
+    final resolvedUser = await LocalEffectiveFarmRoleResolver(
+      _localDatabase,
+    ).applyToUser(
+      user.copyWith(requiresInitialSetup: false),
     );
-    await _localDatabase.upsertUser(cacheableUser);
+    await _localDatabase.upsertUser(resolvedUser);
     await _localDatabase.writeSessionContext(
-      userId: cacheableUser.id,
-      farmId: cacheableUser.activeFarmId,
+      userId: resolvedUser.id,
+      farmId: resolvedUser.activeFarmId,
     );
   }
 
@@ -433,17 +442,25 @@ class AuthRepository {
         await _localDatabase.readUserByIdentifier(normalizedIdentifier) ??
         credential.user;
 
-    final offlineUser = localUser.copyWith(
-      authenticatedOffline: true,
-      requiresInitialSetup: false,
+    final resolvedUser = await LocalEffectiveFarmRoleResolver(
+      _localDatabase,
+    ).applyToUser(
+      localUser.copyWith(
+        authenticatedOffline: true,
+        requiresInitialSetup: false,
+      ),
     );
-    await _localDatabase.upsertUser(offlineUser);
+    await _localDatabase.upsertUser(resolvedUser);
     await _localDatabase.writeSessionContext(
-      userId: offlineUser.id,
-      farmId: offlineUser.activeFarmId,
+      userId: resolvedUser.id,
+      farmId: resolvedUser.activeFarmId,
+    );
+    await _credentialStore.save(
+      user: resolvedUser,
+      password: password,
     );
 
-    return AuthResult(user: offlineUser, mode: AuthMode.offline);
+    return AuthResult(user: resolvedUser, mode: AuthMode.offline);
   }
 
   Future<AuthResult> _signInForInitialSetup({

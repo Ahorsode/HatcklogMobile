@@ -2,13 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../core/models/app_user.dart';
+import '../../core/permissions/farm_permissions.dart';
 import '../../core/storage/local_database.dart';
+import '../../services/farm_settings_service.dart';
 import '../../services/local_sales_queue.dart';
 import '../../services/pdf_invoice_service.dart';
 import '../../utils/inventory_sale_utils.dart';
 import '../../features/inventory/data/inventory_repository.dart';
 import '../../utils/egg_sale_allocation_utils.dart';
+import '../../utils/egg_log_utils.dart';
+import '../../utils/sale_quantity_utils.dart';
 import '../../presentation/sales/egg_size_picker_dialog.dart';
+import '../../presentation/sales/quick_add_customer_sheet.dart';
 import 'sale_line_draft.dart';
 
 enum _DiscountMode { flat, percentage }
@@ -43,12 +48,18 @@ class _SaleLineState {
   final TextEditingController unitPriceController = TextEditingController();
   final TextEditingController customDescriptionController =
       TextEditingController();
+  EggSaleQuantityUnit eggQuantityUnit = EggSaleQuantityUnit.crate;
+  _DiscountMode lineDiscountMode = _DiscountMode.flat;
+  final TextEditingController lineDiscountController = TextEditingController(
+    text: '0',
+  );
   String? stockError;
 
   void dispose() {
     quantityController.dispose();
     unitPriceController.dispose();
     customDescriptionController.dispose();
+    lineDiscountController.dispose();
   }
 }
 
@@ -59,6 +70,7 @@ class SaleEntryScreen extends StatefulWidget {
     required this.pdfService,
     required this.currentUser,
     required this.localDatabase,
+    this.permissions,
     this.canOverridePrices = false,
   });
 
@@ -66,6 +78,7 @@ class SaleEntryScreen extends StatefulWidget {
   final PdfInvoiceService pdfService;
   final AppUser currentUser;
   final LocalDatabase localDatabase;
+  final FarmPermissions? permissions;
   final bool canOverridePrices;
 
   @override
@@ -90,11 +103,19 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   List<EggBatchStockOption> _eggBatchOptions = const [];
   Map<String, Map<String, Object?>> _eggCategoriesById = const {};
   final List<_SaleLineState> _lines = [_SaleLineState()];
+  int _eggsPerCrate = defaultEggsPerCrate;
+
+  bool get _canOverridePrices =>
+      widget.permissions?.canEditSales ?? widget.canOverridePrices;
+
+  bool get _canAddCustomer =>
+      _canOverridePrices ||
+      (widget.permissions?.canViewSales ?? false) ||
+      (widget.permissions?.canEditSales ?? false);
 
   bool get _isWalkIn => _customerId == null;
 
-  bool get _cashFieldEditable =>
-      _isWalkIn || widget.canOverridePrices;
+  bool get _cashFieldEditable => _isWalkIn || _canOverridePrices;
 
   @override
   void initState() {
@@ -115,6 +136,9 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   Future<void> _loadCatalog() async {
     try {
       final farmId = widget.currentUser.activeFarmId;
+      final settings = await FarmSettingsService(widget.localDatabase).load(
+        farmId,
+      );
       final customers = await widget.localDatabase.queryLocalRecords(
         'customers',
         where: 'farm_id = ? and coalesce(is_active, 1) = 1',
@@ -153,6 +177,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         return;
       }
       setState(() {
+        _eggsPerCrate = settings.eggsPerCrate;
         _customers = customers;
         _eggInventoryRows = saleInventoryRows;
         _eggCategoriesById = eggCategoriesById;
@@ -168,17 +193,23 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         _inventoryOptions = saleInventoryRows
             .map(
               (row) {
-                final unitPrice = inventorySalePrice(
-                  row,
-                  eggCategoriesById: eggCategoriesById,
+                final unitPrice = saleUnitPriceForDisplay(
+                  catalogPricePerCrate: inventorySalePrice(
+                    row,
+                    eggCategoriesById: eggCategoriesById,
+                  ),
+                  unit: EggSaleQuantityUnit.crate,
+                  eggsPerCrate: settings.eggsPerCrate,
                 );
-                final label = formatSaleInventoryLabel(row);
+                final stockEggs = inventoryStockLevel(row['stock_level']).floor();
+                final label =
+                    '${formatSaleInventoryLabel(row)} (${formatEggStockCrateLabel(stockEggs, eggsPerCrate: settings.eggsPerCrate)})';
                 return _ProductOption(
                   id: _text(row['id']),
                   label: label,
                   description: label,
                   unitPrice: unitPrice,
-                  available: inventoryStockLevel(row['stock_level']),
+                  available: stockEggs.toDouble(),
                   productType: SaleProductType.inventory,
                 );
               },
@@ -243,9 +274,13 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   void _setEggProductFromRow(_SaleLineState line, Map<String, Object?> row) {
     line.productId = _text(row['id']);
     line.description = formatSaleInventoryLabel(row);
-    line.unitPriceController.text = inventorySalePrice(
-      row,
-      eggCategoriesById: _eggCategoriesById,
+    line.unitPriceController.text = saleUnitPriceForDisplay(
+      catalogPricePerCrate: inventorySalePrice(
+        row,
+        eggCategoriesById: _eggCategoriesById,
+      ),
+      unit: line.eggQuantityUnit,
+      eggsPerCrate: _eggsPerCrate,
     ).toStringAsFixed(2);
     line.stockError = null;
   }
@@ -351,11 +386,16 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
           (line.eggBatchId == null || line.eggBatchId!.isEmpty)) {
         return 'Select a batch';
       }
+      final quantityEggs = saleQuantityInEggs(
+        displayQuantity: quantity,
+        unit: line.eggQuantityUnit,
+        eggsPerCrate: _eggsPerCrate,
+      );
       final available = _eggAvailableForLine(line);
-      if (quantity > available) {
+      if (quantityEggs > available) {
         return line.eggAllocationMode == EggAllocationMode.batch
-            ? 'Selected batch only has $available eggs available'
-            : '${product.label} only has $available available';
+            ? 'Selected batch only has ${formatEggStockCrateLabel(available, eggsPerCrate: _eggsPerCrate)} available'
+            : '${product.label} only has ${formatEggStockCrateLabel(available, eggsPerCrate: _eggsPerCrate)} available';
       }
       return null;
     }
@@ -379,12 +419,29 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
     });
   }
 
+  double _lineSubtotalFor(_SaleLineState line) {
+    final quantity = int.tryParse(line.quantityController.text.trim()) ?? 0;
+    final unitPrice =
+        double.tryParse(line.unitPriceController.text.trim()) ?? 0;
+    return quantity * unitPrice;
+  }
+
+  double _lineDiscountFor(_SaleLineState line) {
+    final raw = double.tryParse(line.lineDiscountController.text.trim()) ?? 0;
+    final subtotal = _lineSubtotalFor(line);
+    if (line.lineDiscountMode == _DiscountMode.percentage) {
+      return (subtotal * raw / 100).clamp(0, subtotal);
+    }
+    return raw.clamp(0, subtotal);
+  }
+
+  double _lineTotalFor(_SaleLineState line) =>
+      (_lineSubtotalFor(line) - _lineDiscountFor(line)).clamp(0, double.infinity);
+
   double get _subtotal {
     var total = 0.0;
     for (final line in _lines) {
-      final quantity = int.tryParse(line.quantityController.text.trim()) ?? 0;
-      final unitPrice = double.tryParse(line.unitPriceController.text.trim()) ?? 0;
-      total += quantity * unitPrice;
+      total += _lineTotalFor(line);
     }
     return total;
   }
@@ -414,7 +471,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         return false;
       }
       if (line.productType == SaleProductType.custom) {
-        if (!widget.canOverridePrices ||
+        if (!_canOverridePrices ||
             line.customDescriptionController.text.trim().isEmpty) {
           return false;
         }
@@ -427,9 +484,20 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         return false;
       }
       final product = _selectedProduct(line);
-      if (product != null &&
-          quantity > product.available.floor()) {
-        return false;
+      if (product != null && line.productType != SaleProductType.inventory) {
+        if (quantity > product.available.floor()) {
+          return false;
+        }
+      }
+      if (line.productType == SaleProductType.inventory) {
+        final quantityEggs = saleQuantityInEggs(
+          displayQuantity: quantity,
+          unit: line.eggQuantityUnit,
+          eggsPerCrate: _eggsPerCrate,
+        );
+        if (quantityEggs > _eggAvailableForLine(line)) {
+          return false;
+        }
       }
       if (_stockErrorFor(line, product ?? _placeholderProduct(line)) != null) {
         return false;
@@ -445,7 +513,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
     if (_isWalkIn) {
       return cash >= 0;
     }
-    if (widget.canOverridePrices) {
+    if (_canOverridePrices) {
       return cash >= 0;
     }
     if (cash <= 0) {
@@ -466,7 +534,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   }
 
   void _syncCashReceived() {
-    if (!_isWalkIn && widget.canOverridePrices) {
+    if (!_isWalkIn && _canOverridePrices) {
       return;
     }
     _cashReceivedController.text = _computedTotal.toStringAsFixed(2);
@@ -497,6 +565,13 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                 line.eggAllocationMode == EggAllocationMode.batch
             ? line.eggBatchId
             : null,
+        eggQuantityUnit: line.eggQuantityUnit,
+        lineDiscountAmount:
+            double.tryParse(line.lineDiscountController.text.trim()) ?? 0,
+        lineDiscountType: line.lineDiscountMode == _DiscountMode.percentage
+            ? 'percent'
+            : 'flat',
+        eggsPerCrate: _eggsPerCrate,
       );
     }).toList(growable: false);
   }
@@ -504,7 +579,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   Future<void> _submit() async {
     if (!_canSubmit) {
       setState(() {
-        _submitError = widget.canOverridePrices
+        _submitError = _canOverridePrices
             ? 'Complete every line item before saving.'
             : 'Cash received must equal the locked sale total';
       });
@@ -534,8 +609,8 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         totalCashReceived: cashReceived,
         customerId: _customerId,
         customerName: customerName,
-        discountAmount: widget.canOverridePrices ? _discountAmount : 0,
-        requireExactCashTotal: !_isWalkIn && !widget.canOverridePrices,
+        discountAmount: _canOverridePrices ? _discountAmount : 0,
+        requireExactCashTotal: !_isWalkIn && !_canOverridePrices,
       );
 
       if (!mounted) {
@@ -663,6 +738,31 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                     _syncCashReceived();
                   }),
                 ),
+                if (_canAddCustomer) ...[
+                  const SizedBox(height: 4),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: () async {
+                        final created = await QuickAddCustomerSheet.show(
+                          context,
+                          localDatabase: widget.localDatabase,
+                          currentUser: widget.currentUser,
+                        );
+                        if (created == null || !mounted) {
+                          return;
+                        }
+                        setState(() {
+                          _customers = [..._customers, created];
+                          _customerId = created['id']?.toString();
+                          _syncCashReceived();
+                        });
+                      },
+                      icon: const Icon(Icons.person_add_alt_1_outlined, size: 18),
+                      label: const Text('Add new customer'),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 12),
                 ListTile(
                   contentPadding: EdgeInsets.zero,
@@ -679,7 +779,8 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                     key: ValueKey('sale-line-$index'),
                     line: _lines[index],
                     index: index,
-                    canOverridePrices: widget.canOverridePrices,
+                    canOverridePrices: _canOverridePrices,
+                    eggsPerCrate: _eggsPerCrate,
                     inventoryTypeLabel: 'Eggs',
                     options: _optionsFor(_lines[index].productType),
                     hideProductPicker: _shouldHideProductPicker(_lines[index]),
@@ -729,7 +830,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                   icon: const Icon(Icons.add),
                   label: const Text('Add Item'),
                 ),
-                if (widget.canOverridePrices) ...[
+                if (_canOverridePrices) ...[
                   const SizedBox(height: 16),
                   Text(
                     'Discount',
@@ -770,7 +871,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                 ],
                 const SizedBox(height: 16),
                 _SummaryRow(label: 'Subtotal', value: _money(_subtotal)),
-                if (widget.canOverridePrices && _discountAmount > 0)
+                if (_canOverridePrices && _discountAmount > 0)
                   _SummaryRow(
                     label: 'Discount',
                     value: '- ${_money(_discountAmount)}',
@@ -790,7 +891,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                   decoration: InputDecoration(
                     labelText: 'Total Cash Received (GHS)',
                     errorText: !_isWalkIn &&
-                            !widget.canOverridePrices &&
+                            !_canOverridePrices &&
                             ((double.tryParse(
                                       _cashReceivedController.text.trim(),
                                     ) ??
@@ -808,7 +909,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                   child: Text(
                     _isWalkIn
                         ? 'Walk-in sale: cash defaults to the sale total and can be adjusted.'
-                        : widget.canOverridePrices
+                        : _canOverridePrices
                             ? 'Credit sale: cash can differ from total for named customers.'
                             : 'Workers cannot edit prices or discounts for named customers.',
                     style: const TextStyle(color: Colors.grey),
@@ -854,6 +955,7 @@ class _LineCard extends StatelessWidget {
     required this.line,
     required this.index,
     required this.canOverridePrices,
+    required this.eggsPerCrate,
     required this.inventoryTypeLabel,
     required this.options,
     required this.hideProductPicker,
@@ -869,6 +971,7 @@ class _LineCard extends StatelessWidget {
   final _SaleLineState line;
   final int index;
   final bool canOverridePrices;
+  final int eggsPerCrate;
   final String inventoryTypeLabel;
   final List<_ProductOption> options;
   final bool hideProductPicker;
@@ -887,6 +990,46 @@ class _LineCard extends StatelessWidget {
       }
     }
     return options.isNotEmpty ? options.first : null;
+  }
+
+  double get _lineSubtotal {
+    final quantity = int.tryParse(line.quantityController.text.trim()) ?? 0;
+    final unitPrice =
+        double.tryParse(line.unitPriceController.text.trim()) ?? 0;
+    return quantity * unitPrice;
+  }
+
+  double get _lineDiscount {
+    final raw = double.tryParse(line.lineDiscountController.text.trim()) ?? 0;
+    if (line.lineDiscountMode == _DiscountMode.percentage) {
+      return (_lineSubtotal * raw / 100).clamp(0, _lineSubtotal);
+    }
+    return raw.clamp(0, _lineSubtotal);
+  }
+
+  double get _lineTotal =>
+      (_lineSubtotal - _lineDiscount).clamp(0, double.infinity);
+
+  void _toggleEggQuantityUnit() {
+    final quantity = int.tryParse(line.quantityController.text.trim()) ?? 0;
+    final unitPrice =
+        double.tryParse(line.unitPriceController.text.trim()) ?? 0;
+    if (line.eggQuantityUnit == EggSaleQuantityUnit.crate) {
+      line.eggQuantityUnit = EggSaleQuantityUnit.egg;
+      line.quantityController.text = quantity > 0
+          ? (quantity * eggsPerCrate).toString()
+          : line.quantityController.text;
+      line.unitPriceController.text = eggsPerCrate > 0
+          ? (unitPrice / eggsPerCrate).toStringAsFixed(2)
+          : line.unitPriceController.text;
+    } else {
+      line.eggQuantityUnit = EggSaleQuantityUnit.crate;
+      line.quantityController.text = quantity > 0 && eggsPerCrate > 0
+          ? (quantity / eggsPerCrate).ceil().toString()
+          : line.quantityController.text;
+      line.unitPriceController.text =
+          (unitPrice * eggsPerCrate).toStringAsFixed(2);
+    }
   }
 
   @override
@@ -994,7 +1137,7 @@ class _LineCard extends StatelessWidget {
                         DropdownMenuItem<String?>(
                           value: batch.batchId,
                           child: Text(
-                            '${batch.batchName} (${batch.eggsRemaining} eggs)',
+                            '${batch.batchName} (${formatEggStockCrateLabel(batch.eggsRemaining, eggsPerCrate: eggsPerCrate)})',
                           ),
                         ),
                     ],
@@ -1084,6 +1227,29 @@ class _LineCard extends StatelessWidget {
                 },
               ),
             const SizedBox(height: 12),
+            if (line.productType == SaleProductType.inventory) ...[
+              SegmentedButton<EggSaleQuantityUnit>(
+                segments: const [
+                  ButtonSegment(
+                    value: EggSaleQuantityUnit.crate,
+                    label: Text('Crates'),
+                  ),
+                  ButtonSegment(
+                    value: EggSaleQuantityUnit.egg,
+                    label: Text('Eggs'),
+                  ),
+                ],
+                selected: {line.eggQuantityUnit},
+                onSelectionChanged: (selection) {
+                  onChanged(() {
+                    if (selection.first != line.eggQuantityUnit) {
+                      _toggleEggQuantityUnit();
+                    }
+                  });
+                },
+              ),
+              const SizedBox(height: 12),
+            ],
             Row(
               children: [
                 Expanded(
@@ -1092,7 +1258,11 @@ class _LineCard extends StatelessWidget {
                     keyboardType: TextInputType.number,
                     inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                     decoration: InputDecoration(
-                      labelText: 'Quantity',
+                      labelText: line.productType == SaleProductType.inventory
+                          ? line.eggQuantityUnit == EggSaleQuantityUnit.crate
+                              ? 'Crates'
+                              : 'Eggs'
+                          : 'Quantity',
                       errorText: line.stockError,
                     ),
                     onChanged: (_) => onChanged(null),
@@ -1106,11 +1276,69 @@ class _LineCard extends StatelessWidget {
                     keyboardType: const TextInputType.numberWithOptions(
                       decimal: true,
                     ),
-                    decoration: const InputDecoration(
-                      labelText: 'Unit Price',
+                    decoration: InputDecoration(
+                      labelText: line.productType == SaleProductType.inventory
+                          ? line.eggQuantityUnit == EggSaleQuantityUnit.crate
+                              ? 'Price / crate'
+                              : 'Price / egg'
+                          : 'Unit Price',
                     ),
                     onChanged: canOverridePrices ? (_) => onChanged(null) : null,
                   ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: line.lineDiscountController,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    decoration: InputDecoration(
+                      labelText: line.lineDiscountMode == _DiscountMode.percentage
+                          ? 'Line discount %'
+                          : 'Line discount (GHS)',
+                    ),
+                    onChanged: (_) => onChanged(null),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                SegmentedButton<_DiscountMode>(
+                  segments: const [
+                    ButtonSegment(
+                      value: _DiscountMode.flat,
+                      label: Text('GHS'),
+                    ),
+                    ButtonSegment(
+                      value: _DiscountMode.percentage,
+                      label: Text('%'),
+                    ),
+                  ],
+                  selected: {line.lineDiscountMode},
+                  onSelectionChanged: (selection) {
+                    onChanged(() {
+                      line.lineDiscountMode = selection.first;
+                    });
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  'Line subtotal: ${_money(_lineSubtotal)}',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                Text(
+                  'Line total: ${_money(_lineTotal)}',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
                 ),
               ],
             ),
