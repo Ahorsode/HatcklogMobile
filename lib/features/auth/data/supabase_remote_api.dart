@@ -570,8 +570,8 @@ class SupabaseRemoteApi {
       _selectFarmRowsSafe(
         'order_item_batch_allocations',
         farmId,
-        farmColumn: 'farmId',
-        updatedColumn: 'updatedAt',
+        farmColumn: 'farm_id',
+        updatedColumn: 'updated_at',
         modifiedAfter: modifiedAfter,
       ),
     ]);
@@ -2779,7 +2779,7 @@ class SupabaseRemoteApi {
       'subtotalAmount': subtotal,
       'taxAmount': 0,
       'totalAmount': computedTotal,
-      'cashReceived': cashReceived,
+      'cash_received': cashReceived,
       'discountAmount': discount,
       'currency': 'GHS',
       'status': orderStatus,
@@ -2861,11 +2861,11 @@ class SupabaseRemoteApi {
           final allocMap = Map<String, dynamic>.from(alloc);
           await _verifiedUpsert('order_item_batch_allocations', {
             'id': _asString(allocMap['id']),
-            'orderItemId': _asString(allocMap['order_item_id']),
-            'batchId': _asString(allocMap['batch_id']),
-            'farmId': farmId,
-            'eggsUsed': _asInt(allocMap['eggs_used']),
-            'revenueAmount': _asDouble(allocMap['revenue_amount']),
+            'order_item_id': _asString(allocMap['order_item_id']),
+            'batch_id': _asString(allocMap['batch_id']),
+            'farm_id': farmId,
+            'eggs_used': _asInt(allocMap['eggs_used']),
+            'revenue_amount': _asDouble(allocMap['revenue_amount']),
           });
         }
       }
