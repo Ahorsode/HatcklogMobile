@@ -13,6 +13,7 @@ import '../../features/sync/data/worker_log_mutator.dart';
 import '../../services/local_sales_queue.dart';
 import '../../services/pdf_invoice_service.dart';
 import '../eggs/egg_quick_add_sheet.dart';
+import '../feeding/feed_formulation_create_sheet.dart';
 import '../feeding/feeding_quick_add_sheet.dart';
 import '../finance/log_expense_sheet.dart';
 import '../houses/climate_control_screen.dart';
@@ -523,7 +524,7 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
             inputSink: widget.inputSink,
             localDatabase: widget.localDatabase,
             onOpenInventory: _openInventoryFromEmptyFeed,
-            onCreateFormulation: () => _showUnavailable('Feed Formulations'),
+            onCreateFormulation: _openFeedFormulationCreate,
             editConfig: editConfig,
             initialRow: initialRow,
           ),
@@ -704,6 +705,37 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
     if (inventory != null) {
       await _openModule(inventory);
     }
+  }
+
+  Future<void> _openFeedFormulationCreate() async {
+    SupabaseClient? supabase;
+    try {
+      supabase = Supabase.instance.client;
+    } on Object {
+      supabase = null;
+    }
+
+    final message = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return FeedFormulationCreateSheet(
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+          supabase: supabase,
+        );
+      },
+    );
+
+    if (!mounted || message == null) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
+    );
   }
 
   Future<void> _openSaleEntry() async {

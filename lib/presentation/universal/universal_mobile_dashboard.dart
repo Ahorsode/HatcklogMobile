@@ -12,6 +12,7 @@ import '../../core/storage/local_database.dart';
 import '../../features/management/data/management_repository.dart';
 import '../../features/sync/data/worker_input_sink.dart';
 import '../../features/auth/data/supabase_remote_api.dart';
+import '../../services/feed_formulation_service.dart';
 import '../../services/local_house_service.dart';
 import '../../utils/active_farm_id.dart';
 import '../../utils/house_climate_utils.dart';
@@ -27,6 +28,7 @@ import '../../utils/feed_source_utils.dart';
 import '../../utils/inventory_sale_utils.dart';
 import '../../utils/egg_log_utils.dart';
 import '../eggs/egg_quick_add_sheet.dart';
+import '../feeding/feed_formulation_create_sheet.dart';
 import '../worker/widgets/quick_add_batch_grid.dart';
 import '../dashboard/mobile_dashboard_host.dart';
 import '../inventory/inventory_list_screen.dart';
@@ -332,6 +334,31 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       return;
     }
 
+    if (module.table == 'feed_formulations') {
+      final ingredients = (row['ingredients'] as List<dynamic>? ?? const [])
+          .map(
+            (item) => FeedFormulationIngredientInput(
+              inventoryId: _objectText(
+                (item as Map)['inventoryId'] ?? item['inventory_id'],
+              ),
+              bags: _objectDouble(item['bags'] ?? item['quantity']),
+            ),
+          )
+          .toList();
+      final service = FeedFormulationService(widget.localDatabase);
+      await service.createFormulation(
+        farmId: widget.currentUser.activeFarmId,
+        name: _objectText(row['name']),
+        type: _objectText(row['type']).isEmpty ? 'CUSTOM' : _objectText(row['type']),
+        targetLivestock: _objectText(
+          row['targetLivestock'] ?? row['target_livestock'],
+        ),
+        ingredients: ingredients,
+        supabase: _supabase,
+      );
+      return;
+    }
+
     final queuedInput = _queuedWorkerInputFor(module, row);
     if (queuedInput != null) {
       await widget.inputSink.enqueueWorkerInput(
@@ -510,6 +537,10 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
       await _openEggEntryForm(module);
       return;
     }
+    if (module.table == 'feed_formulations') {
+      await _openFeedFormulationForm(module);
+      return;
+    }
 
     final message = await showModalBottomSheet<String>(
       context: context,
@@ -522,6 +553,30 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
           localDatabase: widget.localDatabase,
           currentUser: widget.currentUser,
           onSubmit: (payload) => _insertRow(module, module.toRow(payload)),
+        );
+      },
+    );
+
+    if (!mounted || message == null) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
+    );
+  }
+
+  Future<void> _openFeedFormulationForm(_HatchModuleConfig module) async {
+    final message = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return FeedFormulationCreateSheet(
+          currentUser: widget.currentUser,
+          localDatabase: widget.localDatabase,
+          supabase: _supabase,
         );
       },
     );
