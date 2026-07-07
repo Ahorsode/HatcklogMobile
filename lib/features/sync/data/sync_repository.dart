@@ -499,7 +499,6 @@ class SyncRepository implements WorkerInputSink, WorkerLogMutator {
           'local_queue_id': queueId,
           'batch_id': payload['batch_id'],
           'farm_id': payload['farm_id'],
-          'house_id': payload['house_id'],
           'user_id': input.userId,
           'eggs_collected': eggsCollected,
           'crates_collected': crates,

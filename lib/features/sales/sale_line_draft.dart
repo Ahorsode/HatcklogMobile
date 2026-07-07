@@ -8,6 +8,8 @@ class SaleLineDraft {
     required this.unitPrice,
     this.inventoryId,
     this.livestockId,
+    this.eggAllocationMode,
+    this.eggBatchId,
   });
 
   final SaleProductType productType;
@@ -16,6 +18,9 @@ class SaleLineDraft {
   final double unitPrice;
   final String? inventoryId;
   final String? livestockId;
+  /// `fifo` = oldest eggs first farm-wide; `batch` = FIFO within [eggBatchId].
+  final String? eggAllocationMode;
+  final String? eggBatchId;
 
   double get lineTotal => quantity * unitPrice;
 
@@ -30,6 +35,10 @@ class SaleLineDraft {
         'inventory_id': inventoryId,
       if (livestockId != null && livestockId!.isNotEmpty)
         'livestock_id': livestockId,
+      if (eggAllocationMode != null && eggAllocationMode!.isNotEmpty)
+        'egg_allocation_mode': eggAllocationMode,
+      if (eggBatchId != null && eggBatchId!.isNotEmpty)
+        'egg_batch_id': eggBatchId,
     };
   }
 }

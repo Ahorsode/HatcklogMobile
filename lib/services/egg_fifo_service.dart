@@ -11,11 +11,18 @@ class EggFifoService {
   Future<void> deductFromProductionLogs({
     required String farmId,
     required int quantity,
+    String? batchId,
   }) async {
     if (quantity <= 0) {
       return;
     }
     var qtyToDeduct = quantity;
+    final args = <Object?>[farmId];
+    var batchFilter = '';
+    if (batchId != null && batchId.isNotEmpty) {
+      batchFilter = ' and batch_id = ?';
+      args.add(batchId);
+    }
     final rows = await localDatabase.rawLocalQuery(
       '''
       select id, eggs_remaining
@@ -23,9 +30,10 @@ class EggFifoService {
       where farm_id = ?
         and coalesce(is_deleted, 0) = 0
         and coalesce(eggs_remaining, 0) > 0
+        $batchFilter
       order by log_date asc
       ''',
-      [farmId],
+      args,
     );
     for (final row in rows) {
       if (qtyToDeduct <= 0) {
@@ -50,6 +58,7 @@ class EggFifoService {
     required String farmId,
     required String? inventoryId,
     required int quantity,
+    String? batchId,
   }) async {
     if (inventoryId == null || inventoryId.isEmpty || quantity <= 0) {
       return;
@@ -63,7 +72,11 @@ class EggFifoService {
     if (rows.isEmpty || !isEggInventoryRow(rows.first)) {
       return;
     }
-    await deductFromProductionLogs(farmId: farmId, quantity: quantity);
+    await deductFromProductionLogs(
+      farmId: farmId,
+      quantity: quantity,
+      batchId: batchId,
+    );
   }
 
   int _asInt(Object? value) {
