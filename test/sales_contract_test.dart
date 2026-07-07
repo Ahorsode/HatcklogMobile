@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hatchlog_m/features/sales/sale_line_draft.dart';
+import 'package:hatchlog_m/utils/sale_payment_utils.dart';
 
 double _roundMoney(double value) => (value * 100).roundToDouble() / 100;
 
@@ -45,6 +46,27 @@ void main() {
       expect(
         _paymentStatus(computedTotal: 100, cashReceived: 0),
         'UNPAID',
+      );
+    });
+
+    test('MoMo and credit payment validation', () {
+      expect(
+        validateSalePaymentFields(
+          paymentMethod: SalePaymentMethod.mobileMoney,
+        ),
+        contains('MoMo phone number is required'),
+      );
+      expect(
+        validateSalePaymentFields(
+          paymentMethod: SalePaymentMethod.credit,
+        ),
+        contains('Credit sales require a saved customer'),
+      );
+      expect(
+        validateSalePaymentFields(
+          paymentMethod: SalePaymentMethod.cash,
+        ),
+        isEmpty,
       );
     });
   });

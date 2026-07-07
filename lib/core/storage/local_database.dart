@@ -131,7 +131,7 @@ class LocalDatabase {
     final fullPath = path.join(databasePath, 'hatchlog_mobile.db');
     _database = await openDatabase(
       fullPath,
-      version: 17,
+      version: 18,
       onCreate: _createSchema,
       onUpgrade: _upgradeSchema,
     );
@@ -758,6 +758,15 @@ class LocalDatabase {
     }
     if (oldVersion < 17) {
       await _ensureSaleLineEnhancementColumns(db);
+    }
+    if (oldVersion < 18) {
+      await _ensureSalePaymentColumns(db);
+    }
+  }
+
+  Future<void> _ensureSalePaymentColumns(Database db) async {
+    for (final column in const ['payment_reference', 'payment_account_name']) {
+      await _addColumnIfMissing(db, 'sales', column, 'text');
     }
   }
 

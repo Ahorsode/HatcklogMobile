@@ -1420,6 +1420,9 @@ class SupabaseRemoteApi {
       'currency': _asString(row['currency']),
       'status': _asString(row['status']),
       'discount_amount': _asDouble(row['discountAmount']),
+      'payment_method': _asString(row['paymentMethod']),
+      'payment_reference': _asString(row['paymentReference']),
+      'payment_account_name': _asString(row['paymentAccountName']),
       'order_date': _timestamp(row['order_date']),
       'paid_at': _timestamp(row['paid_at']),
       'user_id': _asString(row['user_id']),
@@ -2712,6 +2715,8 @@ class SupabaseRemoteApi {
     final customerId = _optionalString(payload, 'customer_id');
     final customerName = _optionalString(payload, 'customer_name');
     final paymentMethod = _optionalString(payload, 'payment_method');
+    final paymentReference = _optionalString(payload, 'payment_reference');
+    final paymentAccountName = _optionalString(payload, 'payment_account_name');
     final timestamp = _optionalString(payload, 'order_date').isEmpty
         ? _optionalString(payload, 'device_timestamp').isEmpty
               ? input.createdAt.toIso8601String()
@@ -2727,6 +2732,9 @@ class SupabaseRemoteApi {
       'totalAmount': total,
       'saleDate': timestamp,
       'status': 'completed',
+      if (paymentMethod.isNotEmpty) 'paymentMethod': paymentMethod,
+      if (paymentReference.isNotEmpty) 'paymentReference': paymentReference,
+      if (paymentAccountName.isNotEmpty) 'paymentAccountName': paymentAccountName,
     });
 
     final descriptions = <String>[];
@@ -2767,10 +2775,13 @@ class SupabaseRemoteApi {
       'amount': total,
       'payment_status': 'PAID',
       'payment_method': paymentMethod.isEmpty ? 'CASH' : paymentMethod,
-      'reference_num': _optionalString(payload, 'transaction_hash'),
+      'reference_num': paymentReference.isNotEmpty
+          ? paymentReference
+          : _optionalString(payload, 'transaction_hash'),
       'transaction_date': timestamp,
-      'description':
-          '${descriptions.join(', ')} to ${customerName.isEmpty ? 'Walk-in Customer' : customerName}',
+      'description': paymentAccountName.isNotEmpty
+          ? '${descriptions.join(', ')} to ${customerName.isEmpty ? 'Walk-in Customer' : customerName} ($paymentAccountName)'
+          : '${descriptions.join(', ')} to ${customerName.isEmpty ? 'Walk-in Customer' : customerName}',
     });
   }
 

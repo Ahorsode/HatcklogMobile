@@ -132,6 +132,8 @@ class LocalSalesQueue {
     String? customerName,
     double discountAmount = 0,
     String paymentMethod = 'CASH',
+    String? paymentReference,
+    String? paymentAccountName,
     bool requireExactCashTotal = true,
   }) async {
     if (items.isEmpty) {
@@ -177,7 +179,10 @@ class LocalSalesQueue {
         'Cash received must equal the locked sale total.',
       );
     }
-    if (!requireExactCashTotal && cashReceived <= 0 && computedTotal > 0) {
+    if (!requireExactCashTotal &&
+        paymentMethod != 'CREDIT' &&
+        cashReceived <= 0 &&
+        computedTotal > 0) {
       throw ArgumentError.value(
         totalCashReceived,
         'totalCashReceived',
@@ -208,6 +213,10 @@ class LocalSalesQueue {
       'outstanding_credit': outstanding,
       'order_date': deviceTimestamp.toIso8601String(),
       'payment_method': paymentMethod,
+      if (paymentReference != null && paymentReference.trim().isNotEmpty)
+        'payment_reference': paymentReference.trim(),
+      if (paymentAccountName != null && paymentAccountName.trim().isNotEmpty)
+        'payment_account_name': paymentAccountName.trim(),
       'items': linePayloads,
     };
 
@@ -242,6 +251,10 @@ class LocalSalesQueue {
       'deposit_amount': cashReceived,
       'outstanding_credit': outstanding,
       'payment_method': paymentMethod,
+      if (paymentReference != null && paymentReference.trim().isNotEmpty)
+        'payment_reference': paymentReference.trim(),
+      if (paymentAccountName != null && paymentAccountName.trim().isNotEmpty)
+        'payment_account_name': paymentAccountName.trim(),
       'receipt_number': txHash,
       'sale_date': deviceTimestamp.toIso8601String(),
       'status': isPaid ? 'completed' : 'pending',
@@ -309,6 +322,9 @@ class LocalSalesQueue {
     final itemSummary = items
         .map((item) => '${item.quantity} x ${item.description}')
         .join(', ');
+    final resolvedReference = paymentReference?.trim().isNotEmpty == true
+        ? paymentReference!.trim()
+        : txHash;
     await localDatabase.insertLocalRecord('financial_transactions', {
       'id': '${saleId}_transaction',
       'farm_id': farmId,
@@ -318,9 +334,11 @@ class LocalSalesQueue {
       'amount': computedTotal,
       'payment_status': paymentStatus,
       'payment_method': paymentMethod,
-      'reference_num': txHash,
+      'reference_num': resolvedReference,
       'transaction_date': deviceTimestamp.toIso8601String(),
-      'description': '$itemSummary to $resolvedCustomerName',
+      'description': paymentAccountName != null && paymentAccountName.trim().isNotEmpty
+          ? '$itemSummary to $resolvedCustomerName (${paymentAccountName.trim()})'
+          : '$itemSummary to $resolvedCustomerName',
       'customer_id': customerId,
       'deposit_amount': cashReceived,
       'outstanding_credit': outstanding,

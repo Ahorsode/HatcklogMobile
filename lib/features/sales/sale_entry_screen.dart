@@ -12,6 +12,7 @@ import '../../features/inventory/data/inventory_repository.dart';
 import '../../utils/egg_sale_allocation_utils.dart';
 import '../../utils/egg_log_utils.dart';
 import '../../utils/sale_quantity_utils.dart';
+import '../../utils/sale_payment_utils.dart';
 import '../../presentation/sales/egg_size_picker_dialog.dart';
 import '../../presentation/sales/quick_add_customer_sheet.dart';
 import 'sale_line_draft.dart';
@@ -88,10 +89,14 @@ class SaleEntryScreen extends StatefulWidget {
 class _SaleEntryScreenState extends State<SaleEntryScreen> {
   final _cashReceivedController = TextEditingController();
   final _discountController = TextEditingController(text: '0');
+  final _paymentReferenceController = TextEditingController();
+  final _paymentAccountNameController = TextEditingController();
 
   String? _customerId;
   DateTime _orderDate = DateTime.now();
   _DiscountMode _discountMode = _DiscountMode.flat;
+  SalePaymentMethod _paymentMethod = SalePaymentMethod.cash;
+  int _step = 1;
   bool _busy = false;
   bool _loading = true;
   String? _submitError;
@@ -115,7 +120,10 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
 
   bool get _isWalkIn => _customerId == null;
 
-  bool get _cashFieldEditable => _isWalkIn || _canOverridePrices;
+  bool get _isCreditSale => _paymentMethod == SalePaymentMethod.credit;
+
+  bool get _cashFieldEditable =>
+      _isWalkIn || _canOverridePrices || _isCreditSale;
 
   @override
   void initState() {
@@ -127,6 +135,8 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   void dispose() {
     _cashReceivedController.dispose();
     _discountController.dispose();
+    _paymentReferenceController.dispose();
+    _paymentAccountNameController.dispose();
     for (final line in _lines) {
       line.dispose();
     }
@@ -513,7 +523,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
     if (_isWalkIn) {
       return cash >= 0;
     }
-    if (_canOverridePrices) {
+    if (_canOverridePrices || _isCreditSale) {
       return cash >= 0;
     }
     if (cash <= 0) {
@@ -534,10 +544,76 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   }
 
   void _syncCashReceived() {
-    if (!_isWalkIn && _canOverridePrices) {
+    if (!_isWalkIn && _canOverridePrices && !_isCreditSale) {
+      return;
+    }
+    if (_isCreditSale) {
       return;
     }
     _cashReceivedController.text = _computedTotal.toStringAsFixed(2);
+  }
+
+  bool get _canContinueStep1 {
+    if (_busy || _loading || _lines.isEmpty) {
+      return false;
+    }
+    return !_canSubmitStep1Blocked;
+  }
+
+  bool get _canSubmitStep1Blocked {
+    for (final line in _lines) {
+      final quantity = int.tryParse(line.quantityController.text.trim()) ?? 0;
+      final unitPrice = double.tryParse(line.unitPriceController.text.trim());
+      if (quantity <= 0 || unitPrice == null || unitPrice < 0) {
+        return true;
+      }
+      if (line.productType == SaleProductType.custom) {
+        if (!_canOverridePrices ||
+            line.customDescriptionController.text.trim().isEmpty) {
+          return true;
+        }
+      } else if (line.productId == null || line.productId!.isEmpty) {
+        return true;
+      }
+      if (line.productType == SaleProductType.inventory &&
+          line.eggAllocationMode == EggAllocationMode.batch &&
+          (line.eggBatchId == null || line.eggBatchId!.isEmpty)) {
+        return true;
+      }
+      final product = _selectedProduct(line);
+      if (product != null && line.productType != SaleProductType.inventory) {
+        if (quantity > product.available.floor()) {
+          return true;
+        }
+      }
+      if (line.productType == SaleProductType.inventory) {
+        final quantityEggs = saleQuantityInEggs(
+          displayQuantity: quantity,
+          unit: line.eggQuantityUnit,
+          eggsPerCrate: _eggsPerCrate,
+        );
+        if (quantityEggs > _eggAvailableForLine(line)) {
+          return true;
+        }
+      }
+      if (_stockErrorFor(line, product ?? _placeholderProduct(line)) != null) {
+        return true;
+      }
+    }
+    return _computedTotal <= 0;
+  }
+
+  bool get _canSubmitStep2 {
+    if (!_canSubmit) {
+      return false;
+    }
+    final paymentErrors = validateSalePaymentFields(
+      paymentMethod: _paymentMethod,
+      paymentReference: _paymentReferenceController.text,
+      paymentAccountName: _paymentAccountNameController.text,
+      customerId: _customerId,
+    );
+    return paymentErrors.isEmpty;
   }
 
   List<SaleLineDraft> _buildDrafts() {
@@ -577,7 +653,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   }
 
   Future<void> _submit() async {
-    if (!_canSubmit) {
+    if (!_canSubmitStep2) {
       setState(() {
         _submitError = _canOverridePrices
             ? 'Complete every line item before saving.'
@@ -610,7 +686,15 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         customerId: _customerId,
         customerName: customerName,
         discountAmount: _canOverridePrices ? _discountAmount : 0,
-        requireExactCashTotal: !_isWalkIn && !_canOverridePrices,
+        paymentMethod: _paymentMethod.apiValue,
+        paymentReference: _paymentReferenceController.text.trim().isEmpty
+            ? null
+            : _paymentReferenceController.text.trim(),
+        paymentAccountName: _paymentAccountNameController.text.trim().isEmpty
+            ? null
+            : _paymentAccountNameController.text.trim(),
+        requireExactCashTotal:
+            !_isWalkIn && !_canOverridePrices && !_isCreditSale,
       );
 
       if (!mounted) {
@@ -623,7 +707,9 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       final pending = {
         'total_cash_received': cashReceived,
         'customer_name': customerName ?? 'Walk-in Customer',
-        'payment_method': 'CASH',
+        'payment_method': _paymentMethod.apiValue,
+        'payment_reference': _paymentReferenceController.text.trim(),
+        'payment_account_name': _paymentAccountNameController.text.trim(),
         'device_timestamp': _orderDate.toUtc().toIso8601String(),
         'items': _buildDrafts().map((item) => item.toPayloadMap()).toList(),
       };
@@ -716,6 +802,27 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
           : ListView(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 120),
               children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: _WizardStepChip(
+                        label: '1. Customer & Products',
+                        active: _step == 1,
+                        completed: _step > 1,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _WizardStepChip(
+                        label: '2. Payment',
+                        active: _step == 2,
+                        completed: false,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                if (_step == 1) ...[
                 DropdownButtonFormField<String?>(
                   initialValue: _customerId,
                   decoration: const InputDecoration(
@@ -830,6 +937,19 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                   icon: const Icon(Icons.add),
                   label: const Text('Add Item'),
                 ),
+                const SizedBox(height: 16),
+                _SummaryRow(label: 'Line Subtotal', value: _money(_subtotal)),
+                if (_canSubmitStep1Blocked) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Complete every line item before continuing.',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+                ] else ...[
                 if (_canOverridePrices) ...[
                   const SizedBox(height: 16),
                   Text(
@@ -865,6 +985,58 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                       labelText: _discountMode == _DiscountMode.percentage
                           ? 'Discount (%)'
                           : 'Discount (GHS)',
+                    ),
+                    onChanged: (_) => _onFieldChanged(),
+                  ),
+                ],
+                DropdownButtonFormField<SalePaymentMethod>(
+                  value: _paymentMethod,
+                  decoration: const InputDecoration(
+                    labelText: 'Payment Method',
+                    prefixIcon: Icon(Icons.payments_outlined),
+                  ),
+                  items: SalePaymentMethod.values
+                      .map(
+                        (method) => DropdownMenuItem(
+                          value: method,
+                          child: Text(method.label),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) {
+                    if (value == null) {
+                      return;
+                    }
+                    _onFieldChanged(() {
+                      _paymentMethod = value;
+                      _syncCashReceived();
+                    });
+                  },
+                ),
+                if (_paymentMethod == SalePaymentMethod.mobileMoney) ...[
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _paymentReferenceController,
+                    keyboardType: TextInputType.phone,
+                    decoration: const InputDecoration(
+                      labelText: 'MoMo Phone Number',
+                    ),
+                    onChanged: (_) => _onFieldChanged(),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _paymentAccountNameController,
+                    decoration: const InputDecoration(
+                      labelText: 'Account Holder Name',
+                    ),
+                    onChanged: (_) => _onFieldChanged(),
+                  ),
+                ] else if (_paymentMethod == SalePaymentMethod.bankTransfer) ...[
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _paymentReferenceController,
+                    decoration: const InputDecoration(
+                      labelText: 'Bank Reference (optional)',
                     ),
                     onChanged: (_) => _onFieldChanged(),
                   ),
@@ -907,7 +1079,9 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                 Padding(
                   padding: const EdgeInsets.only(top: 8),
                   child: Text(
-                    _isWalkIn
+                    _isCreditSale
+                        ? 'Credit sale: partial or zero payment allowed for saved customers.'
+                        : _isWalkIn
                         ? 'Walk-in sale: cash defaults to the sale total and can be adjusted.'
                         : _canOverridePrices
                             ? 'Credit sale: cash can differ from total for named customers.'
@@ -915,6 +1089,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                     style: const TextStyle(color: Colors.grey),
                   ),
                 ),
+                ],
                 if (_submitError != null) ...[
                   const SizedBox(height: 12),
                   Text(
@@ -930,19 +1105,88 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       bottomNavigationBar: SafeArea(
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-          child: FilledButton.icon(
-            onPressed: _canSubmit && !_busy ? _submit : null,
-            icon: _busy
-                ? const SizedBox.square(
-                    dimension: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.check),
-            label: Text(_busy ? 'Saving...' : 'Record Sale'),
-            style: FilledButton.styleFrom(
-              minimumSize: const Size.fromHeight(52),
-            ),
-          ),
+          child: _step == 1
+              ? FilledButton.icon(
+                  onPressed: _canContinueStep1 && !_busy
+                      ? () => setState(() => _step = 2)
+                      : null,
+                  icon: const Icon(Icons.arrow_forward),
+                  label: const Text('Continue'),
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size.fromHeight(52),
+                  ),
+                )
+              : Row(
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: _busy ? null : () => setState(() => _step = 1),
+                      icon: const Icon(Icons.arrow_back),
+                      label: const Text('Back'),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _canSubmitStep2 && !_busy ? _submit : null,
+                        icon: _busy
+                            ? const SizedBox.square(
+                                dimension: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.check),
+                        label: Text(_busy ? 'Saving...' : 'Record Sale'),
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size.fromHeight(52),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+class _WizardStepChip extends StatelessWidget {
+  const _WizardStepChip({
+    required this.label,
+    required this.active,
+    required this.completed,
+  });
+
+  final String label;
+  final bool active;
+  final bool completed;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: active
+              ? colorScheme.primary
+              : completed
+                  ? colorScheme.outline
+                  : colorScheme.outlineVariant,
+        ),
+        color: active
+            ? colorScheme.primaryContainer.withValues(alpha: 0.35)
+            : colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+      ),
+      child: Text(
+        label,
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w800,
+          color: active
+              ? colorScheme.primary
+              : completed
+                  ? colorScheme.onSurface
+                  : colorScheme.onSurfaceVariant,
         ),
       ),
     );
