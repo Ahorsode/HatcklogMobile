@@ -130,7 +130,7 @@ class _EditLivestockSheetState extends State<EditLivestockSheet> {
               ),
               const SizedBox(height: 12),
               DropdownButtonFormField<String>(
-                value: _category,
+                initialValue: _category,
                 decoration: const InputDecoration(labelText: 'Category'),
                 items: [
                   for (final category in LivestockBreedCatalog.categories)
@@ -156,7 +156,7 @@ class _EditLivestockSheetState extends State<EditLivestockSheet> {
               ),
               const SizedBox(height: 12),
               DropdownButtonFormField<String>(
-                value: _houseId,
+                initialValue: _houseId,
                 decoration: const InputDecoration(labelText: 'House'),
                 items: [
                   for (final house in widget.houses)
@@ -176,7 +176,7 @@ class _EditLivestockSheetState extends State<EditLivestockSheet> {
               ),
               const SizedBox(height: 12),
               DropdownButtonFormField<String>(
-                value: _status,
+                initialValue: _status,
                 decoration: const InputDecoration(labelText: 'Status'),
                 items: const [
                   DropdownMenuItem(value: 'active', child: Text('Active')),

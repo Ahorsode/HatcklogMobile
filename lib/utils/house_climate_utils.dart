@@ -146,6 +146,6 @@ Map<String, dynamic> buildHouseCloudPayload({
     'currentHumidity': currentHumidity,
     'isIsolation': isIsolation,
     'updatedAt': updatedAt,
-    if (createdAt != null) 'createdAt': createdAt,
+    'createdAt': ?createdAt,
   };
 }

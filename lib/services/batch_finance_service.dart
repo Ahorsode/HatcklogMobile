@@ -66,6 +66,25 @@ class BatchFinanceService {
       where: 'farm_id = ? and is_deleted = 0',
       whereArgs: [farmId],
     );
+    final formulationRows = await _db.queryLocalRecords(
+      'feed_formulations',
+      where: 'farm_id = ?',
+      whereArgs: [farmId],
+    );
+    final formulationIds = formulationRows
+        .map((row) => row['id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toList(growable: false);
+    final formulationIngredientRows = formulationIds.isEmpty
+        ? const <Map<String, Object?>>[]
+        : await _db.rawLocalQuery(
+            'select * from feed_formulation_ingredients where formulation_id in (${List.filled(formulationIds.length, '?').join(',')})',
+            formulationIds,
+          );
+    final formulations = _loadFormulationInputs(
+      formulationRows,
+      formulationIngredientRows,
+    );
     final saleItems = await _db.queryLocalRecords(
       'sale_items',
       where: 'farm_id = ?',
@@ -119,6 +138,16 @@ class BatchFinanceService {
         .where((id) => id.isNotEmpty)
         .toSet();
 
+    final feedAllocationIndexes = _buildFeedAllocationIndexes(
+      expenses: expenses,
+      feedingLogs: feedingLogs,
+      inventory: inventory,
+      batchIds: batchIds,
+      formulations: formulations,
+    );
+    final feedFifoAllocationsByExpenseId =
+        feedAllocationIndexes.feedFifoAllocationsByExpenseId;
+
     for (final expense in expenses) {
       final expenseId = expense['id']?.toString() ?? '';
       final amount = _double(expense['amount']);
@@ -144,6 +173,7 @@ class BatchFinanceService {
       if (_isConsumptionBasedExpense(expense)) {
         _allocateConsumptionExpense(
           expense: expense,
+          feedFifoAllocationsByExpenseId: feedFifoAllocationsByExpenseId,
           inventory: inventory,
           feedingLogs: feedingLogs,
           vaccinations: vaccinations,
@@ -185,6 +215,14 @@ class BatchFinanceService {
       }
       final pct = _double(allocation['allocation_percentage']);
       totals[batchId]!.operating += _double(expense['amount']) * (pct / 100);
+    }
+
+    for (final batchId in batchIds) {
+      final formulationFeed =
+          feedAllocationIndexes.formulationFeedCostByBatchId[batchId] ?? 0;
+      if (formulationFeed > 0) {
+        totals[batchId]!.consumption += formulationFeed;
+      }
     }
 
     _allocateRevenue(
@@ -241,8 +279,424 @@ class BatchFinanceService {
     );
   }
 
+
+  List<_FormulationInput> _loadFormulationInputs(
+    List<Map<String, Object?>> formulationRows,
+    List<Map<String, Object?>> ingredientRows,
+  ) {
+    final ingredientsByFormulation =
+        <String, List<_FormulationIngredientInput>>{};
+    for (final row in ingredientRows) {
+      final formulationId = row['formulation_id']?.toString() ?? '';
+      final inventoryId = row['inventory_id']?.toString() ?? '';
+      final qty = _double(row['quantity']);
+      if (formulationId.isEmpty || inventoryId.isEmpty || qty <= 0) {
+        continue;
+      }
+      ingredientsByFormulation
+          .putIfAbsent(formulationId, () => [])
+          .add(
+            _FormulationIngredientInput(
+              inventoryId: inventoryId,
+              quantity: qty,
+            ),
+          );
+    }
+
+    final inputs = <_FormulationInput>[];
+    for (final row in formulationRows) {
+      final id = row['id']?.toString() ?? '';
+      if (id.isEmpty) {
+        continue;
+      }
+      inputs.add(
+        _FormulationInput(
+          id: id,
+          name: row['name']?.toString() ?? '',
+          createdAt: _parseDateTime(row['created_at'] ?? row['updated_at']),
+          ingredients: ingredientsByFormulation[id] ?? const [],
+        ),
+      );
+    }
+    return inputs;
+  }
+
+  Map<String, double> _inventoryCostPerUnitById(
+    List<Map<String, Object?>> inventory,
+  ) {
+    final costs = <String, double>{};
+    for (final item in inventory) {
+      final id = item['id']?.toString() ?? '';
+      final cost = _double(item['cost_per_unit']);
+      if (id.isEmpty || cost <= 0) {
+        continue;
+      }
+      costs[id] = cost;
+    }
+    return costs;
+  }
+
+  _FeedAllocationIndexes _buildFeedAllocationIndexes({
+    required List<Map<String, Object?>> expenses,
+    required List<Map<String, Object?>> feedingLogs,
+    required List<Map<String, Object?>> inventory,
+    required Set<String> batchIds,
+    required List<_FormulationInput> formulations,
+  }) {
+    final inventoryCostPerUnitById = _inventoryCostPerUnitById(inventory);
+    final lotsByInventoryId = _buildIngredientLotsFromFeedExpenses(
+      expenses: expenses,
+      inventory: inventory,
+    );
+
+    final formulationLots = _buildFormulationLots(
+      lotsByInventoryId: lotsByInventoryId,
+      formulations: formulations,
+      inventoryCostPerUnitById: inventoryCostPerUnitById,
+    );
+
+    final logsByInventoryId = <String, List<_FeedUsageLog>>{};
+    final logsByFormulationId = <String, List<_FeedUsageLog>>{};
+    for (final log in feedingLogs) {
+      final batchId = log['batch_id']?.toString() ?? '';
+      final qty = _double(log['amount_consumed']);
+      if (!batchIds.contains(batchId) || qty <= 0) {
+        continue;
+      }
+      final logDate = _parseDateTime(log['log_date']);
+      final feedTypeId = log['feed_type_id']?.toString() ?? '';
+      if (feedTypeId.isNotEmpty) {
+        final entries = logsByInventoryId.putIfAbsent(feedTypeId, () => []);
+        entries.add(
+          _FeedUsageLog(
+            batchId: batchId,
+            quantity: qty,
+            logDate: logDate,
+          ),
+        );
+        continue;
+      }
+      final formulationId = log['formulation_id']?.toString() ?? '';
+      if (formulationId.isNotEmpty) {
+        final entries =
+            logsByFormulationId.putIfAbsent(formulationId, () => []);
+        entries.add(
+          _FeedUsageLog(
+            batchId: batchId,
+            quantity: qty,
+            logDate: logDate,
+          ),
+        );
+      }
+    }
+    for (final logs in logsByInventoryId.values) {
+      logs.sort((a, b) => a.logDate.compareTo(b.logDate));
+    }
+    for (final logs in logsByFormulationId.values) {
+      logs.sort((a, b) => a.logDate.compareTo(b.logDate));
+    }
+
+    final feedFifoAllocationsByExpenseId = _allocateDirectFeedLotsFifo(
+      lotsByInventoryId: lotsByInventoryId,
+      logsByInventoryId: logsByInventoryId,
+    );
+    final formulationFeedCostByBatchId = _allocateFormulationFeedToBatches(
+      formulationLots: formulationLots,
+      logsByFormulationId: logsByFormulationId,
+    );
+
+    return _FeedAllocationIndexes(
+      feedFifoAllocationsByExpenseId: feedFifoAllocationsByExpenseId,
+      formulationFeedCostByBatchId: formulationFeedCostByBatchId,
+    );
+  }
+
+  Map<String, List<_FeedFifoLot>> _buildIngredientLotsFromFeedExpenses({
+    required List<Map<String, Object?>> expenses,
+    required List<Map<String, Object?>> inventory,
+  }) {
+    final lotsByInventoryId = <String, List<_FeedFifoLot>>{};
+    for (final expense in expenses) {
+      if (expense['category']?.toString().toUpperCase() != 'FEED') {
+        continue;
+      }
+      final parsed = _parseInventoryPurchaseExpense(
+        expense['description']?.toString() ?? '',
+      );
+      if (parsed == null || parsed.purchasedQty <= 0) {
+        continue;
+      }
+      final inventoryId = _inventoryIdForName(parsed.itemName, inventory);
+      if (inventoryId == null || inventoryId.isEmpty) {
+        continue;
+      }
+      final amount = _double(expense['amount']);
+      if (amount <= 0) {
+        continue;
+      }
+      final expenseId = expense['id']?.toString() ?? '';
+      if (expenseId.isEmpty) {
+        continue;
+      }
+      final lots = lotsByInventoryId.putIfAbsent(inventoryId, () => []);
+      lots.add(
+        _FeedFifoLot(
+          expenseId: expenseId,
+          expenseDate: _parseDateTime(expense['expense_date']),
+          remainingQty: parsed.purchasedQty,
+          unitCost: amount / parsed.purchasedQty,
+        ),
+      );
+    }
+
+    for (final lots in lotsByInventoryId.values) {
+      lots.sort((a, b) {
+        final byDate = a.expenseDate.compareTo(b.expenseDate);
+        if (byDate != 0) {
+          return byDate;
+        }
+        return a.expenseId.compareTo(b.expenseId);
+      });
+    }
+
+    return lotsByInventoryId;
+  }
+
+  ({double cost, double qtyUsed}) _depleteIngredientLots(
+    List<_FeedFifoLot>? lots,
+    double qty,
+    DateTime asOfDate, {
+    double? fallbackUnitCost,
+  }) {
+    var remaining = qty;
+    var cost = 0.0;
+
+    while (remaining > 0 && lots != null && lots.isNotEmpty) {
+      _FeedFifoLot? lot;
+      for (final candidate in lots) {
+        if (candidate.remainingQty <= 0) {
+          continue;
+        }
+        if (!candidate.expenseDate.isAfter(asOfDate)) {
+          lot = candidate;
+          break;
+        }
+      }
+      lot ??= () {
+        for (final candidate in lots) {
+          if (candidate.remainingQty > 0) {
+            return candidate;
+          }
+        }
+        return null;
+      }();
+      if (lot == null) {
+        break;
+      }
+
+      final usedQty =
+          remaining < lot.remainingQty ? remaining : lot.remainingQty;
+      if (usedQty <= 0) {
+        break;
+      }
+      lot.remainingQty -= usedQty;
+      remaining -= usedQty;
+      cost += usedQty * lot.unitCost;
+    }
+
+    if (remaining > 0 && fallbackUnitCost != null && fallbackUnitCost > 0) {
+      cost += remaining * fallbackUnitCost;
+      remaining = 0;
+    }
+
+    return (cost: cost, qtyUsed: qty - remaining);
+  }
+
+  List<_FormulationLot> _buildFormulationLots({
+    required Map<String, List<_FeedFifoLot>> lotsByInventoryId,
+    required List<_FormulationInput> formulations,
+    required Map<String, double> inventoryCostPerUnitById,
+  }) {
+    final formulationLots = <_FormulationLot>[];
+    final sortedFormulations = [...formulations]
+      ..sort((a, b) {
+        final byDate = a.createdAt.compareTo(b.createdAt);
+        if (byDate != 0) {
+          return byDate;
+        }
+        return a.id.compareTo(b.id);
+      });
+
+    for (final formulation in sortedFormulations) {
+      if (formulation.ingredients.isEmpty) {
+        continue;
+      }
+
+      var totalCost = 0.0;
+      var totalProducedQty = 0.0;
+      for (final ingredient in formulation.ingredients) {
+        final qty = ingredient.quantity;
+        if (ingredient.inventoryId.isEmpty || qty <= 0) {
+          continue;
+        }
+        final lots = lotsByInventoryId[ingredient.inventoryId];
+        final fallbackUnitCost =
+            inventoryCostPerUnitById[ingredient.inventoryId];
+        final depleted = _depleteIngredientLots(
+          lots,
+          qty,
+          formulation.createdAt,
+          fallbackUnitCost: fallbackUnitCost,
+        );
+        totalCost += depleted.cost;
+        totalProducedQty += qty;
+      }
+
+      if (totalProducedQty <= 0 || totalCost <= 0) {
+        continue;
+      }
+
+      formulationLots.add(
+        _FormulationLot(
+          formulationId: formulation.id,
+          createdAt: formulation.createdAt,
+          unitCost: totalCost / totalProducedQty,
+          remainingQty: totalProducedQty,
+        ),
+      );
+    }
+
+    return formulationLots;
+  }
+
+  Map<String, Map<String, double>> _allocateDirectFeedLotsFifo({
+    required Map<String, List<_FeedFifoLot>> lotsByInventoryId,
+    required Map<String, List<_FeedUsageLog>> logsByInventoryId,
+  }) {
+    final allocationsByExpenseId = <String, Map<String, double>>{};
+
+    for (final entry in logsByInventoryId.entries) {
+      final lots = lotsByInventoryId[entry.key];
+      if (lots == null || lots.isEmpty) {
+        continue;
+      }
+      for (final log in entry.value) {
+        var qtyToAllocate = log.quantity;
+        while (qtyToAllocate > 0) {
+          _FeedFifoLot? lot;
+          for (final candidate in lots) {
+            if (candidate.remainingQty <= 0) {
+              continue;
+            }
+            if (!candidate.expenseDate.isAfter(log.logDate)) {
+              lot = candidate;
+              break;
+            }
+          }
+          lot ??= () {
+            for (final candidate in lots) {
+              if (candidate.remainingQty > 0) {
+                return candidate;
+              }
+            }
+            return null;
+          }();
+          if (lot == null || lot.remainingQty <= 0) {
+            break;
+          }
+
+          final usedQty = qtyToAllocate < lot.remainingQty
+              ? qtyToAllocate
+              : lot.remainingQty;
+          if (usedQty <= 0) {
+            break;
+          }
+          lot.remainingQty -= usedQty;
+          qtyToAllocate -= usedQty;
+
+          final batchCosts = allocationsByExpenseId.putIfAbsent(
+            lot.expenseId,
+            () => {},
+          );
+          batchCosts[log.batchId] =
+              (batchCosts[log.batchId] ?? 0) + (usedQty * lot.unitCost);
+        }
+      }
+    }
+
+    return allocationsByExpenseId;
+  }
+
+  Map<String, double> _allocateFormulationFeedToBatches({
+    required List<_FormulationLot> formulationLots,
+    required Map<String, List<_FeedUsageLog>> logsByFormulationId,
+  }) {
+    final costByBatchId = <String, double>{};
+    final lotsByFormulationId = <String, List<_FormulationLot>>{};
+    for (final lot in formulationLots) {
+      lotsByFormulationId.putIfAbsent(lot.formulationId, () => []).add(lot);
+    }
+
+    for (final entry in logsByFormulationId.entries) {
+      final lots = lotsByFormulationId[entry.key];
+      if (lots == null || lots.isEmpty) {
+        continue;
+      }
+      for (final log in entry.value) {
+        var qtyToAllocate = log.quantity;
+        while (qtyToAllocate > 0) {
+          _FormulationLot? lot;
+          for (final candidate in lots) {
+            if (candidate.remainingQty <= 0) {
+              continue;
+            }
+            if (!candidate.createdAt.isAfter(log.logDate)) {
+              lot = candidate;
+              break;
+            }
+          }
+          lot ??= () {
+            for (final candidate in lots) {
+              if (candidate.remainingQty > 0) {
+                return candidate;
+              }
+            }
+            return null;
+          }();
+          if (lot == null) {
+            break;
+          }
+
+          final usedQty = qtyToAllocate < lot.remainingQty
+              ? qtyToAllocate
+              : lot.remainingQty;
+          if (usedQty <= 0) {
+            break;
+          }
+          lot.remainingQty -= usedQty;
+          qtyToAllocate -= usedQty;
+
+          final cost = _roundBatchMoney(usedQty * lot.unitCost);
+          costByBatchId[log.batchId] = (costByBatchId[log.batchId] ?? 0) + cost;
+        }
+      }
+    }
+
+    return costByBatchId;
+  }
+
+  double _roundBatchMoney(double value) => (value * 100).roundToDouble() / 100;
+
+  DateTime _parseDateTime(Object? value) {
+    if (value == null) return DateTime.fromMillisecondsSinceEpoch(0);
+    if (value is DateTime) return value;
+    return DateTime.tryParse(value.toString()) ??
+        DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
   void _allocateConsumptionExpense({
     required Map<String, Object?> expense,
+    required Map<String, Map<String, double>> feedFifoAllocationsByExpenseId,
     required List<Map<String, Object?>> inventory,
     required List<Map<String, Object?>> feedingLogs,
     required List<Map<String, Object?>> vaccinations,
@@ -261,18 +715,41 @@ class BatchFinanceService {
     final usageByBatch = <String, double>{};
 
     if (inventoryPurchase != null && category == 'FEED') {
-      final inventoryId = _inventoryIdForName(itemName, inventory);
-      for (final log in feedingLogs) {
-        if (inventoryId != null &&
-            log['feed_type_id']?.toString() != inventoryId) {
-          continue;
+      final expenseId = expense['id']?.toString() ?? '';
+      final fifoCosts = feedFifoAllocationsByExpenseId[expenseId];
+      if (fifoCosts != null && fifoCosts.isNotEmpty) {
+        usageByBatch.addAll(fifoCosts);
+      } else {
+        final inventoryId = _inventoryIdForName(itemName, inventory);
+        final purchasedQty = inventoryPurchase.purchasedQty;
+        if (purchasedQty > 0) {
+          final expenseDate = _parseDateTime(expense['expense_date']);
+          final sortedLogs = feedingLogs.where((log) {
+            if (inventoryId != null &&
+                log['feed_type_id']?.toString() != inventoryId) {
+              return false;
+            }
+            final batchId = log['batch_id']?.toString() ?? '';
+            return batchIds.contains(batchId);
+          }).toList()
+            ..sort(
+              (a, b) => _parseDateTime(a['log_date'])
+                  .compareTo(_parseDateTime(b['log_date'])),
+            );
+          var remainingQty = purchasedQty;
+          for (final log in sortedLogs) {
+            if (remainingQty <= 0) break;
+            if (_parseDateTime(log['log_date']).isBefore(expenseDate)) continue;
+            final consumed = _double(log['amount_consumed']);
+            if (consumed <= 0) continue;
+            final allocatedQty =
+                consumed < remainingQty ? consumed : remainingQty;
+            remainingQty -= allocatedQty;
+            final batchId = log['batch_id']?.toString() ?? '';
+            usageByBatch[batchId] =
+                (usageByBatch[batchId] ?? 0) + allocatedQty;
+          }
         }
-        final batchId = log['batch_id']?.toString() ?? '';
-        if (!batchIds.contains(batchId)) {
-          continue;
-        }
-        usageByBatch[batchId] =
-            (usageByBatch[batchId] ?? 0) + _double(log['amount_consumed']);
       }
     } else if ((inventoryPurchase != null && category == 'MEDICATION') ||
         healthStock != null) {
@@ -308,6 +785,25 @@ class BatchFinanceService {
       _splitByHeadcount(batches, amount, (id, share) {
         totals[id]!.consumption += share;
       });
+      return;
+    }
+
+    if (inventoryPurchase != null &&
+        category == 'FEED' &&
+        inventoryPurchase.purchasedQty > 0) {
+      final expenseId = expense['id']?.toString() ?? '';
+      final fifoCosts = feedFifoAllocationsByExpenseId[expenseId];
+      if (fifoCosts != null && fifoCosts.isNotEmpty) {
+        for (final entry in fifoCosts.entries) {
+          totals[entry.key]!.consumption += entry.value;
+        }
+        return;
+      }
+      final purchasedQty = inventoryPurchase.purchasedQty;
+      for (final entry in usageByBatch.entries) {
+        final share = (entry.value / purchasedQty).clamp(0, 1);
+        totals[entry.key]!.consumption += amount * share;
+      }
       return;
     }
 
@@ -524,6 +1020,80 @@ class BatchFinanceService {
     }
     return int.tryParse(value.toString()) ?? 0;
   }
+}
+
+class _FeedAllocationIndexes {
+  const _FeedAllocationIndexes({
+    required this.feedFifoAllocationsByExpenseId,
+    required this.formulationFeedCostByBatchId,
+  });
+
+  final Map<String, Map<String, double>> feedFifoAllocationsByExpenseId;
+  final Map<String, double> formulationFeedCostByBatchId;
+}
+
+class _FormulationInput {
+  const _FormulationInput({
+    required this.id,
+    required this.name,
+    required this.createdAt,
+    required this.ingredients,
+  });
+
+  final String id;
+  final String name;
+  final DateTime createdAt;
+  final List<_FormulationIngredientInput> ingredients;
+}
+
+class _FormulationIngredientInput {
+  const _FormulationIngredientInput({
+    required this.inventoryId,
+    required this.quantity,
+  });
+
+  final String inventoryId;
+  final double quantity;
+}
+
+class _FormulationLot {
+  _FormulationLot({
+    required this.formulationId,
+    required this.createdAt,
+    required this.unitCost,
+    required this.remainingQty,
+  });
+
+  final String formulationId;
+  final DateTime createdAt;
+  final double unitCost;
+  double remainingQty;
+}
+
+class _FeedUsageLog {
+  const _FeedUsageLog({
+    required this.batchId,
+    required this.quantity,
+    required this.logDate,
+  });
+
+  final String batchId;
+  final double quantity;
+  final DateTime logDate;
+}
+
+class _FeedFifoLot {
+  _FeedFifoLot({
+    required this.expenseId,
+    required this.expenseDate,
+    required this.remainingQty,
+    required this.unitCost,
+  });
+
+  final String expenseId;
+  final DateTime expenseDate;
+  final double unitCost;
+  double remainingQty;
 }
 
 class _BatchAccumulator {

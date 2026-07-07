@@ -312,7 +312,7 @@ class _RegisterLivestockSheetState extends State<RegisterLivestockSheet> {
                 ),
                 const SizedBox(height: 12),
                 DropdownButtonFormField<String>(
-                  value: _category,
+                  initialValue: _category,
                   decoration: const InputDecoration(
                     labelText: 'Livestock Category',
                     prefixIcon: Icon(Icons.category_outlined),
@@ -365,7 +365,7 @@ class _RegisterLivestockSheetState extends State<RegisterLivestockSheet> {
                 ),
                 const SizedBox(height: 12),
                 DropdownButtonFormField<String>(
-                  value: _houseId,
+                  initialValue: _houseId,
                   decoration: const InputDecoration(
                     labelText: 'Farm House',
                     prefixIcon: Icon(Icons.home_work_outlined),
