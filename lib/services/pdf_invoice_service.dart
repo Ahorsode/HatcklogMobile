@@ -15,9 +15,25 @@ class PdfInvoiceService {
   }) async {
     final pdf = pw.Document();
 
-    final total = (sale['amount_received'] as num).toDouble();
+    final total = _readMoney(
+      sale,
+      const [
+        'total_cash_received',
+        'amount_received',
+        'computed_total',
+        'total_amount',
+        'total',
+      ],
+    );
     final tax = total * taxRate;
     final net = total - tax;
+    final items = sale['items'];
+    final customerName =
+        sale['customer_name']?.toString().trim().isNotEmpty == true
+        ? sale['customer_name'].toString()
+        : 'Walk-in Customer';
+    final timestamp = sale['device_timestamp'] ?? sale['order_date'];
+    final paymentMethod = sale['payment_method']?.toString() ?? 'CASH';
 
     pdf.addPage(
       pw.Page(
@@ -37,12 +53,29 @@ class PdfInvoiceService {
                 ),
                 pw.SizedBox(height: 8),
                 pw.Text('Invoice: $invoiceNumber'),
-                pw.Text(
-                  'Date: ${DateTime.parse(sale['device_timestamp']).toLocal()}',
-                ),
+                if (timestamp != null)
+                  pw.Text(
+                    'Date: ${DateTime.tryParse(timestamp.toString())?.toLocal() ?? timestamp}',
+                  ),
+                pw.Text('Customer: $customerName'),
                 pw.Divider(),
-                pw.Text('Quantity: ${sale['quantity_crates']} ${sale['unit']}'),
-                pw.Text('Payment: ${sale['payment_method']}'),
+                if (items is List && items.isNotEmpty) ...[
+                  for (final raw in items)
+                    if (raw is Map) ...[
+                      pw.Text(
+                        '${raw['quantity']} x ${raw['description'] ?? 'Sale item'}',
+                      ),
+                      pw.Text(
+                        'Line total: ${_readMoney(Map<String, dynamic>.from(raw), const ['total_price']).toStringAsFixed(2)}',
+                      ),
+                      pw.SizedBox(height: 6),
+                    ],
+                ] else ...[
+                  pw.Text(
+                    'Quantity: ${sale['quantity_crates'] ?? sale['quantity'] ?? '-'} ${sale['unit'] ?? ''}',
+                  ),
+                ],
+                pw.Text('Payment: $paymentMethod'),
                 pw.SizedBox(height: 12),
                 pw.Row(
                   children: [
@@ -71,7 +104,7 @@ class PdfInvoiceService {
                     ),
                   ],
                 ),
-                pw.Spacer(),
+                pw.SizedBox(height: 24),
                 pw.Align(
                   alignment: pw.Alignment.center,
                   child: pw.Opacity(
@@ -93,6 +126,23 @@ class PdfInvoiceService {
     );
 
     return pdf.save();
+  }
+
+  double _readMoney(Map<String, dynamic> source, List<String> keys) {
+    for (final key in keys) {
+      final value = source[key];
+      if (value == null) {
+        continue;
+      }
+      if (value is num) {
+        return value.toDouble();
+      }
+      final parsed = double.tryParse(value.toString());
+      if (parsed != null) {
+        return parsed;
+      }
+    }
+    return 0;
   }
 
   Future<String> savePdfToTemp(Uint8List data, String filename) async {

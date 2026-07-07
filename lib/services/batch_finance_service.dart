@@ -76,6 +76,16 @@ class BatchFinanceService {
       where: 'farm_id = ? and is_deleted = 0',
       whereArgs: [farmId],
     );
+    final orderIds = orders
+        .map((row) => row['id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toList(growable: false);
+    final orderItems = orderIds.isEmpty
+        ? const <Map<String, Object?>>[]
+        : await _db.rawLocalQuery(
+            'select * from order_items where order_id in (${List.filled(orderIds.length, '?').join(',')})',
+            orderIds,
+          );
 
     final batchIds = batches.map((b) => b['id'] as String).toSet();
     final totals = {
@@ -176,6 +186,13 @@ class BatchFinanceService {
       saleItems,
       cancelledOrderIds,
       totals,
+    );
+    _allocateRevenue(
+      batches,
+      orderItems,
+      cancelledOrderIds,
+      totals,
+      orderIdKey: 'order_id',
     );
 
     return totals.values
@@ -295,13 +312,15 @@ class BatchFinanceService {
     List<Map<String, Object?>> batches,
     List<Map<String, Object?>> saleItems,
     Set<String> cancelledOrderIds,
-    Map<String, _BatchAccumulator> totals,
-  ) {
+    Map<String, _BatchAccumulator> totals, {
+    String orderIdKey = 'order_id',
+  }) {
     final linked = <String, double>{};
     var unlinked = 0.0;
 
     for (final item in saleItems) {
-      if (cancelledOrderIds.contains(item['order_id']?.toString())) {
+      if (cancelledOrderIds.contains(item[orderIdKey]?.toString()) ||
+          cancelledOrderIds.contains(item['sale_id']?.toString())) {
         continue;
       }
       final total = _double(item['total_price']);

@@ -713,44 +713,56 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
         'device_timestamp': _orderDate.toUtc().toIso8601String(),
         'items': _buildDrafts().map((item) => item.toPayloadMap()).toList(),
       };
-      final bytes = await widget.pdfService.buildInvoiceBytes(
-        sale: pending,
-        invoiceNumber: 'INV-${DateTime.now().millisecondsSinceEpoch}',
-        taxRate: 0.0,
-        paid: true,
-      );
-      final path = await widget.pdfService.savePdfToTemp(
-        bytes,
-        'invoice_$id.pdf',
-      );
-      if (!mounted) {
-        return;
-      }
-      await showModalBottomSheet<void>(
-        context: context,
-        builder: (_) => SafeArea(
-          child: Wrap(
-            children: [
-              ListTile(
-                leading: const Icon(Icons.send_outlined),
-                title: const Text('Send Invoice via WhatsApp'),
-                onTap: () async {
-                  Navigator.of(context).pop();
-                  await widget.pdfService.sharePdfToWhatsApp(
-                    filePath: path,
-                    text: 'Invoice for your purchase',
-                  );
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.close),
-                title: const Text('Close'),
-                onTap: () => Navigator.of(context).pop(),
-              ),
-            ],
+      try {
+        final bytes = await widget.pdfService.buildInvoiceBytes(
+          sale: pending,
+          invoiceNumber: 'INV-${DateTime.now().millisecondsSinceEpoch}',
+          taxRate: 0.0,
+          paid: true,
+        );
+        final path = await widget.pdfService.savePdfToTemp(
+          bytes,
+          'invoice_$id.pdf',
+        );
+        if (!mounted) {
+          return;
+        }
+        await showModalBottomSheet<void>(
+          context: context,
+          builder: (_) => SafeArea(
+            child: Wrap(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.send_outlined),
+                  title: const Text('Send Invoice via WhatsApp'),
+                  onTap: () async {
+                    Navigator.of(context).pop();
+                    await widget.pdfService.sharePdfToWhatsApp(
+                      filePath: path,
+                      text: 'Invoice for your purchase',
+                    );
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.close),
+                  title: const Text('Close'),
+                  onTap: () => Navigator.of(context).pop(),
+                ),
+              ],
+            ),
           ),
-        ),
-      );
+        );
+      } on Object catch (invoiceError) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Sale saved, but invoice preview failed: $invoiceError',
+              ),
+            ),
+          );
+        }
+      }
       if (mounted) {
         Navigator.of(context).pop(true);
       }

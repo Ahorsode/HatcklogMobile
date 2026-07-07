@@ -3336,7 +3336,7 @@ List<_HatchModuleConfig> _buildModules([
       creatorColumn: 'user_id',
       viewPermissionKey: 'can_view_sales',
       editPermissionKey: 'can_edit_sales',
-      streamEquals: const {'type': 'sale'},
+      streamEquals: const {'category': 'SALES'},
       includeRow: _includeRevenueTransaction,
       icon: Icons.receipt_long_outlined,
       color: const Color(0xff16845c),

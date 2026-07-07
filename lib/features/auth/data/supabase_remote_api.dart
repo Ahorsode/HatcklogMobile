@@ -2710,8 +2710,18 @@ class SupabaseRemoteApi {
   ) async {
     final payload = input.payload;
     final farmId = _requiredString(payload, 'farm_id');
-    final saleId = input.resolvedServerRecordId;
-    final total = _asDouble(payload['total_cash_received']);
+    final orderId = input.resolvedServerRecordId;
+    final cashReceived = _asDouble(payload['total_cash_received']);
+    final computedTotal = _asDouble(
+      payload['computed_total'],
+      fallback: cashReceived,
+    );
+    final subtotal = _asDouble(
+      payload['subtotal_amount'],
+      fallback: computedTotal,
+    );
+    final discount = _asDouble(payload['discount_amount']);
+    final outstanding = _asDouble(payload['outstanding_credit']);
     final customerId = _optionalString(payload, 'customer_id');
     final customerName = _optionalString(payload, 'customer_name');
     final paymentMethod = _optionalString(payload, 'payment_method');
@@ -2722,19 +2732,28 @@ class SupabaseRemoteApi {
               ? input.createdAt.toIso8601String()
               : _optionalString(payload, 'device_timestamp')
         : _optionalString(payload, 'order_date');
+    final isPaid = outstanding <= 0.01;
+    final paymentStatus = isPaid
+        ? 'PAID'
+        : (cashReceived > 0 ? 'PARTIALLY_PAID' : 'UNPAID');
 
-    await _verifiedUpsert('sales', {
-      'id': saleId,
+    await _verifiedUpsert('orders', {
+      'id': orderId,
       'farmId': farmId,
       'userId': input.userId,
       'customerId': customerId.isEmpty ? null : customerId,
-      'customerName': customerName.isEmpty ? 'Walk-in Customer' : customerName,
-      'totalAmount': total,
-      'saleDate': timestamp,
-      'status': 'completed',
-      if (paymentMethod.isNotEmpty) 'paymentMethod': paymentMethod,
+      'subtotalAmount': subtotal,
+      'taxAmount': 0,
+      'totalAmount': computedTotal,
+      'discountAmount': discount,
+      'currency': 'GHS',
+      'status': isPaid ? 'PAID' : 'PENDING',
+      'paymentMethod': paymentMethod.isEmpty ? 'CASH' : paymentMethod,
       if (paymentReference.isNotEmpty) 'paymentReference': paymentReference,
-      if (paymentAccountName.isNotEmpty) 'paymentAccountName': paymentAccountName,
+      if (paymentAccountName.isNotEmpty)
+        'paymentAccountName': paymentAccountName,
+      'orderDate': timestamp,
+      if (isPaid) 'paidAt': timestamp,
     });
 
     final descriptions = <String>[];
@@ -2749,31 +2768,39 @@ class SupabaseRemoteApi {
       final lineTotal = _asDouble(itemMap['total_price']);
       final description = _optionalString(itemMap, 'description');
       descriptions.add('$quantity x $description');
-      await _verifiedUpsert('sale_items', {
-        'id': '${saleId}_item_$index',
-        'saleId': saleId,
-        'farmId': farmId,
+      final lineDiscount = _asDouble(itemMap['line_discount_amount']);
+      final lineDiscountType = _optionalString(itemMap, 'line_discount_type');
+      final eggAllocationMode = _optionalString(itemMap, 'egg_allocation_mode');
+      final eggBatchId = _optionalString(itemMap, 'egg_batch_id');
+      await _verifiedUpsert('order_items', {
+        'id': '${orderId}_item_$index',
+        'orderId': orderId,
         'description': description.isEmpty ? 'Sale item' : description,
         'quantity': quantity,
         'unitPrice': unitPrice,
         'totalPrice': lineTotal <= 0 ? quantity * unitPrice : lineTotal,
+        if (lineDiscount > 0) 'lineDiscountAmount': lineDiscount,
+        if (lineDiscountType.isNotEmpty) 'lineDiscountType': lineDiscountType,
         'inventoryId': _optionalString(itemMap, 'inventory_id').isEmpty
             ? null
             : _optionalString(itemMap, 'inventory_id'),
         'livestockId': _optionalString(itemMap, 'livestock_id').isEmpty
             ? null
             : _optionalString(itemMap, 'livestock_id'),
+        if (eggAllocationMode.isNotEmpty)
+          'eggAllocationMode': eggAllocationMode,
+        if (eggBatchId.isNotEmpty) 'eggBatchId': eggBatchId,
       });
     }
 
     await _verifiedUpsert('financial_transactions', {
-      'id': '${saleId}_transaction',
+      'id': '${orderId}_transaction',
       'farm_id': farmId,
       'user_id': input.userId,
       'type': 'REVENUE',
       'category': 'SALES',
-      'amount': total,
-      'payment_status': 'PAID',
+      'amount': computedTotal,
+      'payment_status': paymentStatus,
       'payment_method': paymentMethod.isEmpty ? 'CASH' : paymentMethod,
       'reference_num': paymentReference.isNotEmpty
           ? paymentReference
@@ -2782,6 +2809,7 @@ class SupabaseRemoteApi {
       'description': paymentAccountName.isNotEmpty
           ? '${descriptions.join(', ')} to ${customerName.isEmpty ? 'Walk-in Customer' : customerName} ($paymentAccountName)'
           : '${descriptions.join(', ')} to ${customerName.isEmpty ? 'Walk-in Customer' : customerName}',
+      if (isPaid) 'settled_at': timestamp,
     });
   }
 
