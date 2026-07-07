@@ -153,7 +153,7 @@ class DashboardStatsService {
     final thirtyDaysAgo = today.subtract(const Duration(days: 30));
     final trendDates = _lastSevenDayLabels(today);
 
-    final batches = await _loadActiveBatches(farmId);
+    final batches = await _loadFarmBatches(farmId);
     final totalBirds = batches.fold<int>(
       0,
       (sum, batch) => sum + _int(batch['current_count']),
@@ -528,7 +528,7 @@ class DashboardStatsService {
     return rows.first['batch_name']?.toString() ?? batchId;
   }
 
-  Future<List<Map<String, Object?>>> _loadActiveBatches(String farmId) async {
+  Future<List<Map<String, Object?>>> _loadFarmBatches(String farmId) async {
     var rows = await _loadLocalBatchRows(farmId);
     if (rows.isEmpty) {
       rows = await _hydrateBatchesFromCloud(farmId);
@@ -537,20 +537,11 @@ class DashboardStatsService {
   }
 
   Future<List<Map<String, Object?>>> _loadLocalBatchRows(String farmId) async {
-    final activeRows = await _db.queryLocalRecords(
-      'batches',
-      where: "farm_id = ? and is_deleted = 0 and lower(status) = 'active'",
-      whereArgs: [farmId],
-    );
-    if (activeRows.isNotEmpty) {
-      return activeRows;
-    }
-
     return _db.queryLocalRecords(
       'batches',
       where: 'farm_id = ? and is_deleted = 0',
       whereArgs: [farmId],
-      orderBy: 'batch_name asc',
+      orderBy: "case when lower(status) = 'active' then 0 else 1 end, batch_name asc",
     );
   }
 

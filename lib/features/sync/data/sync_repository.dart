@@ -465,8 +465,30 @@ class SyncRepository implements WorkerInputSink, WorkerLogMutator {
         whereArgs: [user.activeFarmId],
         limit: 1,
       );
+      final cachedEggs = await _localDatabase.queryLocalRecords(
+        'egg_production',
+        where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+        whereArgs: [user.activeFarmId],
+        limit: 1,
+      );
+      final cachedFeeding = await _localDatabase.queryLocalRecords(
+        'daily_feeding_logs',
+        where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+        whereArgs: [user.activeFarmId],
+        limit: 1,
+      );
+      final cachedMortality = await _localDatabase.queryLocalRecords(
+        'mortality',
+        where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+        whereArgs: [user.activeFarmId],
+        limit: 1,
+      );
       shouldForceFullRefresh =
-          cachedHouses.isEmpty || cachedBatches.isEmpty;
+          cachedHouses.isEmpty ||
+          cachedBatches.isEmpty ||
+          (cachedEggs.isEmpty &&
+              cachedFeeding.isEmpty &&
+              cachedMortality.isEmpty);
     }
     await _syncEngineService.syncWebEntitiesToLocalCache(
       user: user,

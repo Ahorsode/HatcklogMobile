@@ -681,15 +681,31 @@ class SupabaseRemoteApi {
     String? updatedColumn,
     DateTime? modifiedAfter,
   }) async {
-    dynamic query = _requireClient()
-        .from(table)
-        .select()
-        .eq(farmColumn, farmId);
-    if (modifiedAfter != null && updatedColumn != null) {
-      query = query.gte(updatedColumn, modifiedAfter.toUtc().toIso8601String());
+    const pageSize = 1000;
+    final allRows = <Map<String, dynamic>>[];
+    var from = 0;
+
+    while (true) {
+      dynamic query = _requireClient()
+          .from(table)
+          .select()
+          .eq(farmColumn, farmId);
+      if (modifiedAfter != null && updatedColumn != null) {
+        query = query.gte(
+          updatedColumn,
+          modifiedAfter.toUtc().toIso8601String(),
+        );
+      }
+      final response = await query.range(from, from + pageSize - 1);
+      final rows = _asRows(response);
+      allRows.addAll(rows);
+      if (rows.length < pageSize) {
+        break;
+      }
+      from += pageSize;
     }
-    final response = await query.limit(1000);
-    return _asRows(response);
+
+    return allRows;
   }
 
   Future<List<Map<String, dynamic>>> _selectFarmRowsSafe(

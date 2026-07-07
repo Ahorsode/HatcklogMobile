@@ -159,7 +159,42 @@ class _HatchLogAppState extends State<HatchLogApp> {
     });
 
     if (online && !user.authenticatedOffline) {
-      await widget.services.syncRepository.syncWithCloud(user);
+      final farmId = user.activeFarmId.trim();
+      var forceFullRefresh = false;
+      if (farmId.isNotEmpty) {
+        final batches = await widget.services.localDatabase.queryLocalRecords(
+          'batches',
+          where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+          whereArgs: [farmId],
+          limit: 1,
+        );
+        if (batches.isNotEmpty) {
+          final eggs = await widget.services.localDatabase.queryLocalRecords(
+            'egg_production',
+            where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+            whereArgs: [farmId],
+            limit: 1,
+          );
+          final feeding = await widget.services.localDatabase.queryLocalRecords(
+            'daily_feeding_logs',
+            where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+            whereArgs: [farmId],
+            limit: 1,
+          );
+          final mortality = await widget.services.localDatabase.queryLocalRecords(
+            'mortality',
+            where: 'farm_id = ? and coalesce(is_deleted, 0) = 0',
+            whereArgs: [farmId],
+            limit: 1,
+          );
+          forceFullRefresh =
+              eggs.isEmpty && feeding.isEmpty && mortality.isEmpty;
+        }
+      }
+      await widget.services.syncRepository.syncWithCloud(
+        user,
+        forceFullRefresh: forceFullRefresh,
+      );
     }
     final permissions = await widget.services.permissionsRepository.loadForUser(
       user,

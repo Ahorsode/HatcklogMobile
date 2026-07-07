@@ -1016,7 +1016,7 @@ class WorkerModuleListScreen extends StatefulWidget {
 class _WorkerModuleListScreenState extends State<WorkerModuleListScreen> {
   StreamSubscription<void>? _subscription;
   List<Map<String, Object?>> _rows = const [];
-  String _eggStockFilter = 'active';
+  String _eggStockFilter = 'all';
 
   bool get _isEggsModule => widget.module.module == WorkerModule.eggs;
 
@@ -1077,7 +1077,7 @@ class _WorkerModuleListScreenState extends State<WorkerModuleListScreen> {
         left join batches b on b.id = e.batch_id
         where e.farm_id = ? and coalesce(e.is_deleted, 0) = 0
         order by log_date desc
-        limit 80
+        limit 200
         ''',
         [farmId],
       ),
@@ -1100,7 +1100,7 @@ class _WorkerModuleListScreenState extends State<WorkerModuleListScreen> {
         where: _whereFor(widget.module.module),
         whereArgs: [farmId],
         orderBy: _orderByFor(widget.module.module),
-        limit: 80,
+        limit: 200,
       ),
     };
     if (mounted) {

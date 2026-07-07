@@ -123,7 +123,7 @@ class ExecutiveMetricsService {
         ? await _sumColumn('customers', 'balance_owed', farmId)
         : 0;
 
-    final batches = await _loadActiveBatches(farmId);
+    final batches = await _loadFarmBatches(farmId);
     final activeLivestock = batches.fold<int>(
       0,
       (sum, batch) => sum + _int(batch['current_count']),
@@ -216,7 +216,7 @@ class ExecutiveMetricsService {
     return _double(rows.first['total']);
   }
 
-  Future<List<Map<String, Object?>>> _loadActiveBatches(String farmId) async {
+  Future<List<Map<String, Object?>>> _loadFarmBatches(String farmId) async {
     var rows = await _loadLocalBatchRows(farmId);
     if (rows.isEmpty) {
       rows = await _hydrateBatchesFromCloud(farmId);
@@ -225,20 +225,11 @@ class ExecutiveMetricsService {
   }
 
   Future<List<Map<String, Object?>>> _loadLocalBatchRows(String farmId) async {
-    final activeRows = await _db.queryLocalRecords(
-      'batches',
-      where: "farm_id = ? and is_deleted = 0 and lower(status) = 'active'",
-      whereArgs: [farmId],
-    );
-    if (activeRows.isNotEmpty) {
-      return activeRows;
-    }
-
     return _db.queryLocalRecords(
       'batches',
       where: 'farm_id = ? and is_deleted = 0',
       whereArgs: [farmId],
-      orderBy: 'batch_name asc',
+      orderBy: "case when lower(status) = 'active' then 0 else 1 end, batch_name asc",
     );
   }
 

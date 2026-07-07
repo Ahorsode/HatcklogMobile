@@ -156,8 +156,8 @@ class BatchReportService {
       left join houses h on h.id = b.house_id
       where b.farm_id = ?
         and coalesce(b.is_deleted, 0) = 0
-        and lower(coalesce(b.status, '')) = 'active'
-      order by b.batch_name asc
+      order by case when lower(coalesce(b.status, '')) = 'active' then 0 else 1 end,
+               b.batch_name asc
       ''',
       [farmId],
     );

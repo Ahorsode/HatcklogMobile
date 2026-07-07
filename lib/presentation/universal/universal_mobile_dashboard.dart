@@ -1905,7 +1905,7 @@ class _ModuleDataView extends StatefulWidget {
 }
 
 class _ModuleDataViewState extends State<_ModuleDataView> {
-  String _eggStockFilter = 'active';
+  String _eggStockFilter = 'all';
 
   bool get _isEggModule => widget.module.table == 'egg_production';
 
