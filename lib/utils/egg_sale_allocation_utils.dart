@@ -59,10 +59,14 @@ Map<String, Object?>? defaultEggInventoryRow(
     return rows.first;
   }
   for (final row in rows) {
-    final name = row['item_name']?.toString().toLowerCase() ?? '';
-    if (name.contains('unsorted') || name == 'eggs') {
+    if (isUnsortedEggInventoryRow(row)) {
       return row;
     }
   }
   return rows.first;
+}
+
+bool isUnsortedEggInventoryRow(Map<String, Object?> row) {
+  final name = row['item_name']?.toString().toLowerCase() ?? '';
+  return name.contains('unsorted') || name == 'eggs';
 }

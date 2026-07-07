@@ -2,6 +2,7 @@ import 'dart:math';
 
 import '../core/storage/local_database.dart';
 import '../utils/inventory_sale_utils.dart';
+import '../utils/egg_sale_allocation_utils.dart';
 
 class BatchEggAllocation {
   const BatchEggAllocation({
@@ -158,7 +159,9 @@ class EggFifoService {
       farmId: farmId,
       quantity: quantity,
       batchId: batchId,
-      categoryId: categoryId ?? rows.first['egg_category_id']?.toString(),
+      categoryId: isUnsortedEggInventoryRow(rows.first)
+          ? null
+          : (categoryId ?? rows.first['egg_category_id']?.toString()),
     );
     final currentStock = _asDouble(rows.first['stock_level']);
     await localDatabase.updateLocalRecord(

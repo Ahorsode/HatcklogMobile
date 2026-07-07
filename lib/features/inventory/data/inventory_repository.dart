@@ -136,6 +136,36 @@ class InventoryRepository {
     return ActiveBatchEggStock(totalEggs: totalEggs, batches: batches);
   }
 
+  Future<({int totalEggs, Map<String, int> byCategoryId})> getEggFifoAvailabilityMap(
+    String farmId,
+  ) async {
+    final rows = await _db.rawLocalQuery(
+      '''
+      SELECT ep.eggs_remaining, ep.category_id
+      FROM egg_production ep
+      INNER JOIN batches b ON b.id = ep.batch_id
+      WHERE ep.farm_id = ?
+        AND coalesce(ep.is_deleted, 0) = 0
+        AND coalesce(b.is_deleted, 0) = 0
+        AND lower(b.status) = 'active'
+        AND b.type = 'POULTRY_LAYER'
+        AND ep.eggs_remaining > 0
+      ''',
+      [farmId],
+    );
+
+    final byCategoryId = <String, int>{};
+    var totalEggs = 0;
+    for (final row in rows) {
+      final remaining = _int(row['eggs_remaining']);
+      totalEggs += remaining;
+      final categoryId = row['category_id']?.toString().trim() ?? '';
+      final key = categoryId.isEmpty ? '__uncategorized__' : categoryId;
+      byCategoryId[key] = (byCategoryId[key] ?? 0) + remaining;
+    }
+    return (totalEggs: totalEggs, byCategoryId: byCategoryId);
+  }
+
   Future<List<Map<String, Object?>>> getHealthInventory(String farmId) async {
     final rows = await getAllInventory(
       farmId: farmId,

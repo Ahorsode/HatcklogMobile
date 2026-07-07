@@ -107,6 +107,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   List<Map<String, Object?>> _eggInventoryRows = const [];
   List<EggBatchStockOption> _eggBatchOptions = const [];
   int _fifoTotalEggs = 0;
+  Map<String, int> _fifoByCategoryId = const {};
   Map<String, Map<String, Object?>> _eggCategoriesById = const {};
   final List<_SaleLineState> _lines = [_SaleLineState()];
   int _eggsPerCrate = defaultEggsPerCrate;
@@ -176,6 +177,9 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       final eggStock = await InventoryRepository(
         widget.localDatabase,
       ).getActiveBatchEggStock(farmId);
+      final fifoAvailability = await InventoryRepository(
+        widget.localDatabase,
+      ).getEggFifoAvailabilityMap(farmId);
       final batchRows = await widget.localDatabase.queryLocalRecords(
         'batches',
         where:
@@ -200,7 +204,8 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
               ),
             )
             .toList(growable: false);
-        _fifoTotalEggs = eggStock.totalEggs;
+        _fifoTotalEggs = fifoAvailability.totalEggs;
+        _fifoByCategoryId = fifoAvailability.byCategoryId;
         _inventoryOptions = saleInventoryRows
             .map(
               (row) {
@@ -212,7 +217,7 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                   unit: EggSaleQuantityUnit.crate,
                   eggsPerCrate: settings.eggsPerCrate,
                 );
-                final stockEggs = inventoryStockLevel(row['stock_level']).floor();
+                final stockEggs = _fifoEggsForInventoryRow(row);
                 final label =
                     '${formatSaleInventoryLabel(row)} (${formatEggStockCrateLabel(stockEggs, eggsPerCrate: settings.eggsPerCrate)})';
                 return _ProductOption(
@@ -327,7 +332,39 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       }
       return 0;
     }
+    return _fifoEggsForLine(line);
+  }
+
+  Map<String, Object?>? _inventoryRowForLine(_SaleLineState line) {
+    final productId = line.productId;
+    if (productId == null || productId.isEmpty) {
+      return null;
+    }
+    for (final row in _eggInventoryRows) {
+      if (_text(row['id']) == productId) {
+        return row;
+      }
+    }
+    return null;
+  }
+
+  int _fifoEggsForInventoryRow(Map<String, Object?> row) {
+    if (isUnsortedEggInventoryRow(row)) {
+      return _fifoTotalEggs;
+    }
+    final categoryId = row['egg_category_id']?.toString().trim() ?? '';
+    if (categoryId.isNotEmpty) {
+      return _fifoByCategoryId[categoryId] ?? 0;
+    }
     return _fifoTotalEggs;
+  }
+
+  int _fifoEggsForLine(_SaleLineState line) {
+    final row = _inventoryRowForLine(line);
+    if (row == null) {
+      return _fifoTotalEggs;
+    }
+    return _fifoEggsForInventoryRow(row);
   }
 
   bool get _needsCompletionPrompt {
