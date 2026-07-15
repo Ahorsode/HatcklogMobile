@@ -131,7 +131,7 @@ class LocalDatabase {
     final fullPath = path.join(databasePath, 'hatchlog_mobile.db');
     _database = await openDatabase(
       fullPath,
-      version: 20,
+      version: 21,
       onCreate: _createSchema,
       onUpgrade: _upgradeSchema,
     );
@@ -175,6 +175,10 @@ class LocalDatabase {
     await _ensureSettingsProfileParityColumns(db);
     await _ensureLivestockParityColumns(db);
     await _ensureSaleLineEnhancementColumns(db);
+    await _ensureSalePaymentColumns(db);
+    await _ensureOrderPaymentColumns(db);
+    await _ensureFifoSalesLedgerColumns(db);
+    await _ensureEggLoggingAndSalesSettingsColumns(db);
   }
 
   void setLicenseTouchHandler(Future<void> Function()? handler) {
@@ -229,6 +233,15 @@ class LocalDatabase {
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
     _notifyTablesChanged(const ['farm_settings']);
+  }
+
+  Future<void> upsertSalesSettings(SalesSettingsCacheRecord settings) async {
+    await _db.insert(
+      'sales_settings',
+      settings.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    _notifyTablesChanged(const ['sales_settings']);
   }
 
   Future<AppUser?> readUserByPhone(String phoneNumber) async {
@@ -514,18 +527,27 @@ class LocalDatabase {
     Map<String, List<Map<String, Object?>>> recordsByTable,
   ) async {
     final changedTables = <String>{};
-    await _db.transaction((txn) async {
-      for (final entry in recordsByTable.entries) {
-        for (final row in entry.value) {
-          await txn.insert(
-            entry.key,
-            row,
-            conflictAlgorithm: ConflictAlgorithm.replace,
-          );
-          changedTables.add(entry.key);
-        }
+    for (final entry in recordsByTable.entries) {
+      if (entry.value.isEmpty) {
+        continue;
       }
-    });
+      try {
+        await _db.transaction((txn) async {
+          for (final row in entry.value) {
+            await txn.insert(
+              entry.key,
+              row,
+              conflictAlgorithm: ConflictAlgorithm.replace,
+            );
+          }
+        });
+        changedTables.add(entry.key);
+      } on Object catch (error) {
+        debugPrint(
+          'WARN: Cloud upsert skipped table ${entry.key}: $error',
+        );
+      }
+    }
     if (changedTables.isNotEmpty) {
       _notifyTablesChanged(changedTables);
     }
@@ -781,6 +803,44 @@ class LocalDatabase {
     if (oldVersion < 20) {
       await _ensureFifoSalesLedgerColumns(db);
     }
+    if (oldVersion < 21) {
+      await _ensureEggLoggingAndSalesSettingsColumns(db);
+    }
+  }
+
+  Future<void> _ensureEggLoggingAndSalesSettingsColumns(Database db) async {
+    await _addColumnIfMissing(
+      db,
+      'farm_settings',
+      'default_egg_unit',
+      "text not null default 'crate'",
+    );
+    await _addColumnIfMissing(
+      db,
+      'farm_settings',
+      'allow_egg_unit_change',
+      'integer not null default 0',
+    );
+    await _addColumnIfMissing(
+      db,
+      'farm_settings',
+      'default_egg_sort_mode',
+      "text not null default 'unsorted'",
+    );
+    await _addColumnIfMissing(
+      db,
+      'farm_settings',
+      'allow_egg_sort_mode_change',
+      'integer not null default 0',
+    );
+    await db.execute('''
+      create table if not exists sales_settings (
+        farm_id text primary key,
+        allow_batch_override integer not null default 0,
+        allow_worker_discounts integer not null default 0,
+        default_discount_type text not null default 'item'
+      )
+    ''');
   }
 
   Future<void> _ensureFifoSalesLedgerColumns(Database db) async {
@@ -1335,7 +1395,20 @@ class LocalDatabase {
         currency text not null default 'GHS',
         egg_record_reminder_time text,
         feed_record_reminder_time text,
-        growth_target_standard integer
+        growth_target_standard integer,
+        default_egg_unit text not null default 'crate',
+        allow_egg_unit_change integer not null default 0,
+        default_egg_sort_mode text not null default 'unsorted',
+        allow_egg_sort_mode_change integer not null default 0
+      )
+    ''');
+
+    await db.execute('''
+      create table if not exists sales_settings (
+        farm_id text primary key,
+        allow_batch_override integer not null default 0,
+        allow_worker_discounts integer not null default 0,
+        default_discount_type text not null default 'item'
       )
     ''');
 
@@ -1635,9 +1708,13 @@ class LocalDatabase {
         subtotal_amount real not null default 0,
         tax_amount real not null default 0,
         total_amount real not null,
+        cash_received real not null default 0,
         currency text not null default 'USD',
         status text not null default 'PENDING',
         discount_amount real not null default 0,
+        payment_method text,
+        payment_reference text,
+        payment_account_name text,
         order_date text not null,
         paid_at text,
         user_id text not null,

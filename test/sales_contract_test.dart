@@ -82,5 +82,25 @@ void main() {
       expect(needsPrompt(isCredit: false, total: 100, cash: 50), isTrue);
       expect(needsPrompt(isCredit: true, total: 100, cash: 100), isTrue);
     });
+
+    test('item giveaway is additive free stock with paid billing', () {
+      const draft = SaleLineDraft(
+        productType: SaleProductType.inventory,
+        description: 'Eggs',
+        quantity: 10,
+        unitPrice: 30,
+        lineDiscountAmount: 2,
+        lineDiscountType: 'item',
+        eggsPerCrate: 30,
+      );
+
+      expect(draft.giveawayQuantity, 2);
+      expect(draft.stockQuantityDisplay, 12);
+      expect(draft.resolvedQuantityEggs, 360);
+      expect(draft.lineTotal, 300);
+      expect(draft.lineDiscountValue, 60);
+      expect(draft.toPayloadMap()['quantity'], 360);
+      expect(draft.toPayloadMap()['total_price'], 300);
+    });
   });
 }

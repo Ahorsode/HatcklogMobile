@@ -21,7 +21,7 @@ class SaleLineDraft {
 
   final SaleProductType productType;
   final String description;
-  /// User-entered quantity in [eggQuantityUnit] for eggs, or birds for livestock.
+  /// Paid quantity in [eggQuantityUnit] for eggs, or birds for livestock.
   final int quantity;
   /// Display unit price (per crate or per egg for inventory).
   final double unitPrice;
@@ -31,16 +31,28 @@ class SaleLineDraft {
   final String? eggAllocationMode;
   final String? eggBatchId;
   final EggSaleQuantityUnit eggQuantityUnit;
+  /// For `item` discounts this is free unit count; otherwise money or percent.
   final double lineDiscountAmount;
   final String lineDiscountType;
   final int eggsPerCrate;
 
+  int get giveawayQuantity {
+    if (lineDiscountType != 'item') {
+      return 0;
+    }
+    return lineDiscountAmount.round().clamp(0, 999999);
+  }
+
+  /// Display units leaving stock (paid + free giveaway).
+  int get stockQuantityDisplay =>
+      saleQuantityWithGiveaway(quantity, giveawayQuantity);
+
   int get resolvedQuantityEggs {
     if (productType != SaleProductType.inventory) {
-      return quantity;
+      return stockQuantityDisplay;
     }
     return saleQuantityInEggs(
-      displayQuantity: quantity,
+      displayQuantity: stockQuantityDisplay,
       unit: eggQuantityUnit,
       eggsPerCrate: eggsPerCrate,
     );
@@ -52,10 +64,16 @@ class SaleLineDraft {
         lineSubtotal: lineSubtotal,
         discountAmount: lineDiscountAmount,
         discountType: lineDiscountType,
+        unitPrice: unitPrice,
       );
 
-  double get lineTotal =>
-      (lineSubtotal - lineDiscountValue).clamp(0, double.infinity);
+  /// Billed total: paid units only for item giveaways (additive free stock).
+  double get lineTotal {
+    if (lineDiscountType == 'item') {
+      return lineSubtotal.clamp(0, double.infinity);
+    }
+    return (lineSubtotal - lineDiscountValue).clamp(0, double.infinity);
+  }
 
   double get resolvedUnitPricePerEgg {
     if (productType != SaleProductType.inventory) {
@@ -71,17 +89,24 @@ class SaleLineDraft {
   Map<String, dynamic> toPayloadMap() {
     final syncQuantity = productType == SaleProductType.inventory
         ? resolvedQuantityEggs
-        : quantity;
+        : stockQuantityDisplay;
     final syncUnitPrice = productType == SaleProductType.inventory
         ? resolvedUnitPricePerEgg
         : unitPrice;
+    // Server expects money discount for item giveaway (qty already includes free).
+    final syncDiscountAmount = lineDiscountType == 'item'
+        ? computeItemGiveawayDiscount(
+            giveawayQuantity.toDouble(),
+            syncUnitPrice,
+          )
+        : lineDiscountValue;
     return {
       'description': description,
       'quantity': syncQuantity,
       'unit_price': syncUnitPrice,
       'total_price': lineTotal,
       'product_type': productType.name,
-      'line_discount_amount': lineDiscountValue,
+      'line_discount_amount': syncDiscountAmount,
       'line_discount_type': lineDiscountType,
       if (inventoryId != null && inventoryId!.isNotEmpty)
         'inventory_id': inventoryId,

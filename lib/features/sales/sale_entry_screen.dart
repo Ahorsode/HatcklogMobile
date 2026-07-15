@@ -17,7 +17,29 @@ import '../../presentation/sales/egg_size_picker_dialog.dart';
 import '../../presentation/sales/quick_add_customer_sheet.dart';
 import 'sale_line_draft.dart';
 
-enum _DiscountMode { flat, percentage }
+enum _DiscountMode { flat, percentage, item }
+
+_DiscountMode _discountModeFromSettings(String type) {
+  switch (type) {
+    case 'percent':
+      return _DiscountMode.percentage;
+    case 'item':
+      return _DiscountMode.item;
+    default:
+      return _DiscountMode.flat;
+  }
+}
+
+String _discountTypePayload(_DiscountMode mode) {
+  switch (mode) {
+    case _DiscountMode.percentage:
+      return 'percent';
+    case _DiscountMode.item:
+      return 'item';
+    case _DiscountMode.flat:
+      return 'flat';
+  }
+}
 
 class _ProductOption {
   const _ProductOption({
@@ -111,9 +133,17 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   Map<String, Map<String, Object?>> _eggCategoriesById = const {};
   final List<_SaleLineState> _lines = [_SaleLineState()];
   int _eggsPerCrate = defaultEggsPerCrate;
+  bool _allowBatchOverride = false;
+  bool _allowWorkerDiscounts = false;
+  String _defaultDiscountType = 'item';
 
   bool get _canOverridePrices =>
       widget.permissions?.canEditSales ?? widget.canOverridePrices;
+
+  bool get _showBatchToggle => _canOverridePrices || _allowBatchOverride;
+
+  bool get _showDiscountSection =>
+      _canOverridePrices || _allowWorkerDiscounts;
 
   bool get _canAddCustomer =>
       _canOverridePrices ||
@@ -148,6 +178,10 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
     try {
       final farmId = widget.currentUser.activeFarmId;
       final settings = await FarmSettingsService(widget.localDatabase).load(
+        farmId,
+      );
+      final salesSettings =
+          await FarmSettingsService(widget.localDatabase).loadSalesSettings(
         farmId,
       );
       final customers = await widget.localDatabase.queryLocalRecords(
@@ -192,6 +226,15 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
       }
       setState(() {
         _eggsPerCrate = settings.eggsPerCrate;
+        _allowBatchOverride = salesSettings.allowBatchOverride;
+        _allowWorkerDiscounts = salesSettings.allowWorkerDiscounts;
+        _defaultDiscountType = salesSettings.defaultDiscountType;
+        for (final line in _lines) {
+          if (!_canOverridePrices && _allowWorkerDiscounts) {
+            line.lineDiscountMode =
+                _discountModeFromSettings(_defaultDiscountType);
+          }
+        }
         _customers = customers;
         _eggInventoryRows = saleInventoryRows;
         _eggCategoriesById = eggCategoriesById;
@@ -438,8 +481,14 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
           (line.eggBatchId == null || line.eggBatchId!.isEmpty)) {
         return 'Select a batch';
       }
+      final giveaway = line.lineDiscountMode == _DiscountMode.item
+          ? (double.tryParse(line.lineDiscountController.text.trim()) ?? 0)
+              .round()
+              .clamp(0, 999999)
+          : 0;
+      final stockQty = saleQuantityWithGiveaway(quantity, giveaway);
       final quantityEggs = saleQuantityInEggs(
-        displayQuantity: quantity,
+        displayQuantity: stockQty,
         unit: line.eggQuantityUnit,
         eggsPerCrate: _eggsPerCrate,
       );
@@ -481,6 +530,10 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
   double _lineDiscountFor(_SaleLineState line) {
     final raw = double.tryParse(line.lineDiscountController.text.trim()) ?? 0;
     final subtotal = _lineSubtotalFor(line);
+    // Item giveaway is additive free stock — does not reduce billed total.
+    if (line.lineDiscountMode == _DiscountMode.item) {
+      return 0;
+    }
     if (line.lineDiscountMode == _DiscountMode.percentage) {
       return (subtotal * raw / 100).clamp(0, subtotal);
     }
@@ -677,17 +730,20 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
             ? line.productId
             : null,
         eggAllocationMode: line.productType == SaleProductType.inventory
-            ? line.eggAllocationMode.name
+            ? (_showBatchToggle
+                ? line.eggAllocationMode.name
+                : EggAllocationMode.fifo.name)
             : null,
         eggBatchId: line.productType == SaleProductType.inventory &&
+                _showBatchToggle &&
                 line.eggAllocationMode == EggAllocationMode.batch
             ? line.eggBatchId
             : null,
         eggQuantityUnit: line.eggQuantityUnit,
         lineDiscountAmount:
             double.tryParse(line.lineDiscountController.text.trim()) ?? 0,
-        lineDiscountType: line.lineDiscountMode == _DiscountMode.percentage
-            ? 'percent'
+        lineDiscountType: _showDiscountSection
+            ? _discountTypePayload(line.lineDiscountMode)
             : 'flat',
         eggsPerCrate: _eggsPerCrate,
       );
@@ -968,6 +1024,8 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                     line: _lines[index],
                     index: index,
                     canOverridePrices: _canOverridePrices,
+                    showDiscountSection: _showDiscountSection,
+                    showBatchToggle: _showBatchToggle,
                     eggsPerCrate: _eggsPerCrate,
                     inventoryTypeLabel: 'Eggs',
                     options: _optionsFor(_lines[index].productType),
@@ -1010,6 +1068,10 @@ class _SaleEntryScreenState extends State<SaleEntryScreen> {
                   onPressed: () {
                     setState(() {
                       final line = _SaleLineState();
+                      if (!_canOverridePrices && _allowWorkerDiscounts) {
+                        line.lineDiscountMode =
+                            _discountModeFromSettings(_defaultDiscountType);
+                      }
                       _lines.add(line);
                       _autoSelectProduct(line);
                       _syncCashReceived();
@@ -1280,6 +1342,8 @@ class _LineCard extends StatelessWidget {
     required this.line,
     required this.index,
     required this.canOverridePrices,
+    required this.showDiscountSection,
+    required this.showBatchToggle,
     required this.eggsPerCrate,
     required this.inventoryTypeLabel,
     required this.options,
@@ -1296,6 +1360,8 @@ class _LineCard extends StatelessWidget {
   final _SaleLineState line;
   final int index;
   final bool canOverridePrices;
+  final bool showDiscountSection;
+  final bool showBatchToggle;
   final int eggsPerCrate;
   final String inventoryTypeLabel;
   final List<_ProductOption> options;
@@ -1326,10 +1392,22 @@ class _LineCard extends StatelessWidget {
 
   double get _lineDiscount {
     final raw = double.tryParse(line.lineDiscountController.text.trim()) ?? 0;
+    if (line.lineDiscountMode == _DiscountMode.item) {
+      return 0;
+    }
     if (line.lineDiscountMode == _DiscountMode.percentage) {
       return (_lineSubtotal * raw / 100).clamp(0, _lineSubtotal);
     }
     return raw.clamp(0, _lineSubtotal);
+  }
+
+  int get _giveawayQty {
+    if (line.lineDiscountMode != _DiscountMode.item) {
+      return 0;
+    }
+    return (double.tryParse(line.lineDiscountController.text.trim()) ?? 0)
+        .round()
+        .clamp(0, 999999);
   }
 
   double get _lineTotal =>
@@ -1414,29 +1492,36 @@ class _LineCard extends StatelessWidget {
               ),
             ] else if (line.productType == SaleProductType.inventory &&
                 !inventoryEmpty) ...[
-              SegmentedButton<EggAllocationMode>(
-                segments: const [
-                  ButtonSegment(
-                    value: EggAllocationMode.fifo,
-                    label: Text('FIFO'),
-                  ),
-                  ButtonSegment(
-                    value: EggAllocationMode.batch,
-                    label: Text('By Batch'),
-                  ),
-                ],
-                selected: {line.eggAllocationMode},
-                onSelectionChanged: (selection) {
-                  onChanged(() {
-                    line.eggAllocationMode = selection.first;
-                    if (selection.first == EggAllocationMode.fifo) {
-                      line.eggBatchId = null;
-                    }
-                  });
-                },
-              ),
+              if (showBatchToggle)
+                SegmentedButton<EggAllocationMode>(
+                  segments: const [
+                    ButtonSegment(
+                      value: EggAllocationMode.fifo,
+                      label: Text('FIFO'),
+                    ),
+                    ButtonSegment(
+                      value: EggAllocationMode.batch,
+                      label: Text('By Batch'),
+                    ),
+                  ],
+                  selected: {line.eggAllocationMode},
+                  onSelectionChanged: (selection) {
+                    onChanged(() {
+                      line.eggAllocationMode = selection.first;
+                      if (selection.first == EggAllocationMode.fifo) {
+                        line.eggBatchId = null;
+                      }
+                    });
+                  },
+                )
+              else
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Chip(label: Text('FIFO (oldest eggs first)')),
+                ),
               const SizedBox(height: 12),
-              if (line.eggAllocationMode == EggAllocationMode.batch) ...[
+              if (showBatchToggle &&
+                  line.eggAllocationMode == EggAllocationMode.batch) ...[
                 if (eggBatchOptions.isEmpty)
                   InputDecorator(
                     decoration: const InputDecoration(
@@ -1614,43 +1699,61 @@ class _LineCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: line.lineDiscountController,
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
+            if (showDiscountSection)
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: line.lineDiscountController,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: InputDecoration(
+                        labelText: line.lineDiscountMode == _DiscountMode.item
+                            ? 'Extra free crates (on top)'
+                            : line.lineDiscountMode == _DiscountMode.percentage
+                                ? 'Line discount %'
+                                : 'Line discount (GHS)',
+                      ),
+                      onChanged: (_) => onChanged(null),
                     ),
-                    decoration: InputDecoration(
-                      labelText: line.lineDiscountMode == _DiscountMode.percentage
-                          ? 'Line discount %'
-                          : 'Line discount (GHS)',
-                    ),
-                    onChanged: (_) => onChanged(null),
                   ),
-                ),
-                const SizedBox(width: 8),
-                SegmentedButton<_DiscountMode>(
-                  segments: const [
-                    ButtonSegment(
-                      value: _DiscountMode.flat,
-                      label: Text('GHS'),
+                  const SizedBox(width: 8),
+                  if (canOverridePrices)
+                    SegmentedButton<_DiscountMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: _DiscountMode.flat,
+                          label: Text('GHS'),
+                        ),
+                        ButtonSegment(
+                          value: _DiscountMode.percentage,
+                          label: Text('%'),
+                        ),
+                        ButtonSegment(
+                          value: _DiscountMode.item,
+                          label: Text('Free'),
+                        ),
+                      ],
+                      selected: {line.lineDiscountMode},
+                      onSelectionChanged: (selection) {
+                        onChanged(() {
+                          line.lineDiscountMode = selection.first;
+                        });
+                      },
                     ),
-                    ButtonSegment(
-                      value: _DiscountMode.percentage,
-                      label: Text('%'),
+                ],
+              ),
+            if (showDiscountSection && _giveawayQty > 0) ...[
+              const SizedBox(height: 6),
+              Text(
+                '+$_giveawayQty free ${line.eggQuantityUnit == EggSaleQuantityUnit.crate ? (_giveawayQty == 1 ? 'crate' : 'crates') : (_giveawayQty == 1 ? 'egg' : 'eggs')} (stock will deduct paid + free)',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(context).colorScheme.primary,
+                      fontWeight: FontWeight.w700,
                     ),
-                  ],
-                  selected: {line.lineDiscountMode},
-                  onSelectionChanged: (selection) {
-                    onChanged(() {
-                      line.lineDiscountMode = selection.first;
-                    });
-                  },
-                ),
-              ],
-            ),
+              ),
+            ],
             const SizedBox(height: 8),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,

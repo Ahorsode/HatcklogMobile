@@ -302,6 +302,7 @@ class _LivestockDetailScreenState extends State<LivestockDetailScreen>
         currentUser: widget.currentUser,
         batch: _batchSummary(batch),
         inputSink: sink,
+        localDatabase: widget.localDatabase,
       ),
     );
     await _reload(silent: true);

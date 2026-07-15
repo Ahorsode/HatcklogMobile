@@ -335,6 +335,8 @@ class SupabaseRemoteApi {
         await _pushRestoreRecord(input);
       case 'farm_settings_update':
         await _pushFarmSettingsUpdate(input);
+      case 'sales_settings_update':
+        await _pushSalesSettingsUpdate(input);
       case 'inventory_reorder_update':
         await _pushInventoryReorderUpdate(input);
       case 'profile_update':
@@ -574,6 +576,13 @@ class SupabaseRemoteApi {
         updatedColumn: 'updated_at',
         modifiedAfter: modifiedAfter,
       ),
+      _selectFarmRowsSafe(
+        'sales_settings',
+        farmId,
+        farmColumn: 'farm_id',
+        updatedColumn: 'updated_at',
+        modifiedAfter: modifiedAfter,
+      ),
     ]);
 
     final userPermissions = farmScopedQueries[0];
@@ -602,9 +611,11 @@ class SupabaseRemoteApi {
     final isolationRooms = farmScopedQueries[21];
     final expenseAllocations = farmScopedQueries[22];
     final batchAllocations = farmScopedQueries[23];
+    final salesSettings = farmScopedQueries[24];
 
     addRows('user_permissions', userPermissions.map(_mapUserPermission));
     addRows('farm_settings', farmSettings.map(_mapFarmSettings));
+    addRows('sales_settings', salesSettings.map(_mapSalesSettings));
     addRows('houses', houses.map(_mapHouse));
     addRows(
       'house_environment_logs',
@@ -656,6 +667,18 @@ class SupabaseRemoteApi {
     addRows(
       'feed_formulation_ingredients',
       formulationIngredients.map(_mapFeedIngredient),
+    );
+
+    _enrichFeedingLogLabels(
+      records,
+      inventoryNames: {
+        for (final row in inventory)
+          _asString(row['id']): _asString(row['itemName']),
+      },
+      formulationNames: {
+        for (final row in feedFormulations)
+          _asString(row['id']): _asString(row['name']),
+      },
     );
 
     return CloudSyncSnapshot(
@@ -923,6 +946,27 @@ class SupabaseRemoteApi {
     }
   }
 
+  Future<String> createIsolationRoom({
+    required String farmId,
+    required String userId,
+    required String name,
+    required int capacity,
+    String? id,
+  }) async {
+    final roomId = id ?? 'room_${DateTime.now().microsecondsSinceEpoch}';
+    final now = DateTime.now().toUtc().toIso8601String();
+    await _requireClient().from('isolation_rooms').upsert({
+      'id': roomId,
+      'farmId': farmId,
+      'userId': userId,
+      'name': name.trim(),
+      'capacity': capacity,
+      'createdAt': now,
+      'updatedAt': now,
+    });
+    return roomId;
+  }
+
   Future<void> returnLivestockFromIsolation({
     required String batchId,
     required String farmId,
@@ -1129,6 +1173,25 @@ class SupabaseRemoteApi {
       'currency': _asString(row['currency']),
       'egg_record_reminder_time': _asString(row['eggRecordReminderTime']),
       'feed_record_reminder_time': _asString(row['feedRecordReminderTime']),
+      'default_egg_unit': _asString(row['defaultEggUnit']).isEmpty
+          ? 'crate'
+          : _asString(row['defaultEggUnit']),
+      'allow_egg_unit_change': _boolInt(row['allowEggUnitChange']),
+      'default_egg_sort_mode': _asString(row['defaultEggSortMode']).isEmpty
+          ? 'unsorted'
+          : _asString(row['defaultEggSortMode']),
+      'allow_egg_sort_mode_change': _boolInt(row['allowEggSortModeChange']),
+    };
+  }
+
+  Map<String, Object?> _mapSalesSettings(Map<String, dynamic> row) {
+    return {
+      'farm_id': _asString(row['farmId'] ?? row['farm_id']),
+      'allow_batch_override': _boolInt(row['allowBatchOverride']),
+      'allow_worker_discounts': _boolInt(row['allowWorkerDiscounts']),
+      'default_discount_type': _asString(row['defaultDiscountType']).isEmpty
+          ? 'item'
+          : _asString(row['defaultDiscountType']),
     };
   }
 
@@ -1264,21 +1327,55 @@ class SupabaseRemoteApi {
   Map<String, Object?> _mapFeedingLog(Map<String, dynamic> row) {
     return {
       'id': _asString(row['id']),
-      'batch_id': _asString(row['batch_id']),
-      'feed_type_id': _asString(row['feed_type_id']),
-      'feed_type_label': _asString(row['feedTypeLabel']),
-      'formulation_id': _asString(row['formulation_id']),
-      'farm_id': _asString(row['farmId']),
-      'user_id': _asString(row['user_id']),
-      'amount_consumed': _asDouble(row['amount_consumed']),
-      'remaining_sack_count': _asDouble(row['remainingSackCount']),
+      'batch_id': _asString(row['batch_id'] ?? row['batchId']),
+      'feed_type_id': _asString(row['feed_type_id'] ?? row['feedTypeId']),
+      'feed_type_label': _asString(row['feedTypeLabel'] ?? row['feed_type_label']),
+      'formulation_id': _asString(row['formulation_id'] ?? row['formulationId']),
+      'farm_id': _asString(row['farmId'] ?? row['farm_id']),
+      'user_id': _asString(row['user_id'] ?? row['userId']),
+      'amount_consumed': _asDouble(row['amount_consumed'] ?? row['amountConsumed']),
+      'remaining_sack_count': _asDouble(
+        row['remainingSackCount'] ?? row['remaining_sack_count'],
+      ),
       'note': _asString(row['note']),
-      'log_date': _timestamp(row['log_date']),
-      'created_at': _timestamp(row['createdAt'] ?? row['log_date']),
-      'is_deleted': _boolInt(row['is_deleted']),
-      'deleted_at': _timestamp(row['deleted_at']),
+      'log_date': _timestamp(row['log_date'] ?? row['logDate']),
+      'created_at': _timestamp(
+        row['createdAt'] ?? row['created_at'] ?? row['log_date'] ?? row['logDate'],
+      ),
+      'is_deleted': _boolInt(row['is_deleted'] ?? row['isDeleted']),
+      'deleted_at': _timestamp(row['deleted_at'] ?? row['deletedAt']),
       'is_synced': 1,
     };
+  }
+
+  void _enrichFeedingLogLabels(
+    Map<String, List<Map<String, Object?>>> records, {
+    required Map<String, String> inventoryNames,
+    required Map<String, String> formulationNames,
+  }) {
+    final feedingRows = records['daily_feeding_logs'];
+    if (feedingRows == null || feedingRows.isEmpty) {
+      return;
+    }
+    for (final row in feedingRows) {
+      final existingLabel = row['feed_type_label']?.toString().trim() ?? '';
+      if (existingLabel.isNotEmpty) {
+        continue;
+      }
+      final feedTypeId = row['feed_type_id']?.toString() ?? '';
+      final formulationId = row['formulation_id']?.toString() ?? '';
+      if (feedTypeId.isNotEmpty) {
+        final name = inventoryNames[feedTypeId];
+        if (name != null && name.isNotEmpty) {
+          row['feed_type_label'] = name;
+        }
+      } else if (formulationId.isNotEmpty) {
+        final name = formulationNames[formulationId];
+        if (name != null && name.isNotEmpty) {
+          row['feed_type_label'] = name;
+        }
+      }
+    }
   }
 
   Map<String, Object?> _mapMortality(Map<String, dynamic> row) {
@@ -1479,13 +1576,22 @@ class SupabaseRemoteApi {
   Map<String, Object?> _mapOrderItem(Map<String, dynamic> row) {
     return {
       'id': _asString(row['id']),
-      'order_id': _asString(row['orderId']),
+      'order_id': _asString(row['orderId'] ?? row['order_id']),
       'description': _asString(row['description']),
       'quantity': _asInt(row['quantity']),
-      'unit_price': _asDouble(row['unitPrice']),
-      'total_price': _asDouble(row['totalPrice']),
-      'inventory_id': _asString(row['inventoryId']),
-      'livestock_id': _asString(row['livestockId']),
+      'unit_price': _asDouble(row['unitPrice'] ?? row['unit_price']),
+      'total_price': _asDouble(row['totalPrice'] ?? row['total_price']),
+      'inventory_id': _asString(row['inventoryId'] ?? row['inventory_id']),
+      'livestock_id': _asString(row['livestockId'] ?? row['livestock_id']),
+      'line_discount_amount':
+          _asDouble(row['lineDiscountAmount'] ?? row['line_discount_amount']),
+      'line_discount_type':
+          _asString(row['lineDiscountType'] ?? row['line_discount_type']),
+      'egg_allocation_mode':
+          _asString(row['eggAllocationMode'] ?? row['egg_allocation_mode']),
+      'egg_batch_id': _asString(row['eggBatchId'] ?? row['egg_batch_id']),
+      'egg_quantity_unit':
+          _asString(row['eggQuantityUnit'] ?? row['egg_quantity_unit']),
     };
   }
 
@@ -2581,9 +2687,35 @@ class SupabaseRemoteApi {
       'eggsPerCrate': _asInt(payload['eggs_per_crate'], fallback: 30),
       'eggRecordReminderTime': _optionalString(payload, 'egg_record_reminder_time'),
       'feedRecordReminderTime': _optionalString(payload, 'feed_record_reminder_time'),
+      'defaultEggUnit': _optionalString(payload, 'default_egg_unit').isEmpty
+          ? 'crate'
+          : _optionalString(payload, 'default_egg_unit'),
+      'allowEggUnitChange': payload['allow_egg_unit_change'] == true,
+      'defaultEggSortMode':
+          _optionalString(payload, 'default_egg_sort_mode').isEmpty
+              ? 'unsorted'
+              : _optionalString(payload, 'default_egg_sort_mode'),
+      'allowEggSortModeChange': payload['allow_egg_sort_mode_change'] == true,
       if (payload['growth_target_standard'] != null)
         'growth_target_standard': _asInt(payload['growth_target_standard']),
       'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    });
+  }
+
+  Future<void> _pushSalesSettingsUpdate(PendingSyncInput input) async {
+    final payload = input.payload;
+    final farmId = _requiredString(payload, 'farm_id');
+    final client = _requireClient();
+    final discountType = _optionalString(payload, 'default_discount_type');
+    await client.from('sales_settings').upsert({
+      'farm_id': farmId,
+      'allow_batch_override': payload['allow_batch_override'] == true,
+      'allow_worker_discounts': payload['allow_worker_discounts'] == true,
+      'default_discount_type':
+          discountType == 'flat' || discountType == 'percent'
+              ? discountType
+              : 'item',
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
     });
   }
 

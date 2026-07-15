@@ -114,6 +114,10 @@ class FarmSettingsCacheRecord {
     this.eggRecordReminderTime,
     this.feedRecordReminderTime,
     this.growthTargetStandard,
+    this.defaultEggUnit = 'crate',
+    this.allowEggUnitChange = false,
+    this.defaultEggSortMode = 'unsorted',
+    this.allowEggSortModeChange = false,
   });
 
   final String farmId;
@@ -122,6 +126,10 @@ class FarmSettingsCacheRecord {
   final String? eggRecordReminderTime;
   final String? feedRecordReminderTime;
   final int? growthTargetStandard;
+  final String defaultEggUnit;
+  final bool allowEggUnitChange;
+  final String defaultEggSortMode;
+  final bool allowEggSortModeChange;
 
   Map<String, Object?> toMap() {
     return {
@@ -131,6 +139,33 @@ class FarmSettingsCacheRecord {
       'egg_record_reminder_time': eggRecordReminderTime,
       'feed_record_reminder_time': feedRecordReminderTime,
       'growth_target_standard': growthTargetStandard,
+      'default_egg_unit': defaultEggUnit,
+      'allow_egg_unit_change': allowEggUnitChange ? 1 : 0,
+      'default_egg_sort_mode': defaultEggSortMode,
+      'allow_egg_sort_mode_change': allowEggSortModeChange ? 1 : 0,
+    };
+  }
+}
+
+class SalesSettingsCacheRecord {
+  const SalesSettingsCacheRecord({
+    required this.farmId,
+    this.allowBatchOverride = false,
+    this.allowWorkerDiscounts = false,
+    this.defaultDiscountType = 'item',
+  });
+
+  final String farmId;
+  final bool allowBatchOverride;
+  final bool allowWorkerDiscounts;
+  final String defaultDiscountType;
+
+  Map<String, Object?> toMap() {
+    return {
+      'farm_id': farmId,
+      'allow_batch_override': allowBatchOverride ? 1 : 0,
+      'allow_worker_discounts': allowWorkerDiscounts ? 1 : 0,
+      'default_discount_type': defaultDiscountType,
     };
   }
 }

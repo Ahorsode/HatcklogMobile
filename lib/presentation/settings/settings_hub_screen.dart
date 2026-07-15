@@ -29,6 +29,7 @@ class _SettingsHubScreenState extends State<SettingsHubScreen> {
   late final FarmSettingsService _service;
   _SettingsTab _tab = _SettingsTab.farm;
   FarmSettingsData? _settings;
+  SalesSettingsData? _salesSettings;
   List<FeedReorderItem> _feedItems = const [];
   final Map<String, TextEditingController> _reorderControllers = {};
   bool _loading = true;
@@ -43,6 +44,13 @@ class _SettingsHubScreenState extends State<SettingsHubScreen> {
   final _eggReminderController = TextEditingController();
   final _feedReminderController = TextEditingController();
   int? _growthTarget;
+  String _defaultEggUnit = SettingsProfileContract.defaultEggUnit;
+  bool _allowEggUnitChange = false;
+  String _defaultEggSortMode = SettingsProfileContract.defaultEggSortMode;
+  bool _allowEggSortModeChange = false;
+  bool _allowBatchOverride = false;
+  bool _allowWorkerDiscounts = false;
+  String _defaultDiscountType = SettingsProfileContract.defaultDiscountType;
 
   @override
   void initState() {
@@ -69,6 +77,7 @@ class _SettingsHubScreenState extends State<SettingsHubScreen> {
     setState(() => _loading = true);
     final farmId = widget.currentUser.activeFarmId;
     final settings = await _service.load(farmId);
+    final salesSettings = await _service.loadSalesSettings(farmId);
     final feedItems = await _service.loadFeedReorderItems(farmId);
     for (final controller in _reorderControllers.values) {
       controller.dispose();
@@ -82,6 +91,7 @@ class _SettingsHubScreenState extends State<SettingsHubScreen> {
     if (!mounted) return;
     setState(() {
       _settings = settings;
+      _salesSettings = salesSettings;
       _feedItems = feedItems;
       _nameController.text = settings.farmName;
       _locationController.text = settings.farmLocation;
@@ -91,6 +101,13 @@ class _SettingsHubScreenState extends State<SettingsHubScreen> {
       _eggReminderController.text = settings.eggRecordReminderTime;
       _feedReminderController.text = settings.feedRecordReminderTime;
       _growthTarget = settings.growthTargetStandard;
+      _defaultEggUnit = settings.defaultEggUnit;
+      _allowEggUnitChange = settings.allowEggUnitChange;
+      _defaultEggSortMode = settings.defaultEggSortMode;
+      _allowEggSortModeChange = settings.allowEggSortModeChange;
+      _allowBatchOverride = salesSettings.allowBatchOverride;
+      _allowWorkerDiscounts = salesSettings.allowWorkerDiscounts;
+      _defaultDiscountType = salesSettings.defaultDiscountType;
       _loading = false;
     });
   }
@@ -113,11 +130,26 @@ class _SettingsHubScreenState extends State<SettingsHubScreen> {
         eggRecordReminderTime: _eggReminderController.text.trim(),
         feedRecordReminderTime: _feedReminderController.text.trim(),
         growthTargetStandard: _growthTarget,
+        defaultEggUnit: _defaultEggUnit,
+        allowEggUnitChange: _allowEggUnitChange,
+        defaultEggSortMode: _defaultEggSortMode,
+        allowEggSortModeChange: _allowEggSortModeChange,
+      );
+      final salesData = SalesSettingsData(
+        farmId: _settings!.farmId,
+        allowBatchOverride: _allowBatchOverride,
+        allowWorkerDiscounts: _allowWorkerDiscounts,
+        defaultDiscountType: _defaultDiscountType,
       );
       await _service.saveFarmSettings(user: widget.currentUser, data: data);
+      await _service.saveSalesSettings(
+        user: widget.currentUser,
+        data: salesData,
+      );
       if (!mounted) return;
       setState(() {
         _settings = data;
+        _salesSettings = salesData;
         _message = 'Settings saved.';
       });
     } catch (error) {
@@ -266,6 +298,121 @@ class _SettingsHubScreenState extends State<SettingsHubScreen> {
                           'Standard crate size',
                           _eggsPerCrateController,
                           keyboard: TextInputType.number,
+                        ),
+                        const SizedBox(height: 12),
+                        _sectionTitle('Egg Logging Defaults'),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Allow changing egg unit'),
+                          subtitle: const Text(
+                            'Workers can switch between crates and individual eggs',
+                          ),
+                          value: _allowEggUnitChange,
+                          onChanged: (value) =>
+                              setState(() => _allowEggUnitChange = value),
+                        ),
+                        DropdownButtonFormField<String>(
+                          initialValue: _defaultEggUnit,
+                          decoration: const InputDecoration(
+                            labelText: 'Default logging unit',
+                            border: OutlineInputBorder(),
+                          ),
+                          items: const [
+                            DropdownMenuItem(
+                              value: 'crate',
+                              child: Text('Crates'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'individual',
+                              child: Text('Individual eggs'),
+                            ),
+                          ],
+                          onChanged: (value) {
+                            if (value != null) {
+                              setState(() => _defaultEggUnit = value);
+                            }
+                          },
+                        ),
+                        const SizedBox(height: 8),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Allow changing sort mode'),
+                          subtitle: const Text(
+                            'Workers can switch between sorted and unsorted',
+                          ),
+                          value: _allowEggSortModeChange,
+                          onChanged: (value) =>
+                              setState(() => _allowEggSortModeChange = value),
+                        ),
+                        DropdownButtonFormField<String>(
+                          initialValue: _defaultEggSortMode,
+                          decoration: const InputDecoration(
+                            labelText: 'Default sort mode',
+                            border: OutlineInputBorder(),
+                          ),
+                          items: const [
+                            DropdownMenuItem(
+                              value: 'unsorted',
+                              child: Text('Unsorted'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'sorted',
+                              child: Text('Sorted'),
+                            ),
+                          ],
+                          onChanged: (value) {
+                            if (value != null) {
+                              setState(() => _defaultEggSortMode = value);
+                            }
+                          },
+                        ),
+                        const SizedBox(height: 12),
+                        _sectionTitle('Sales Settings'),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Allow worker batch override'),
+                          subtitle: const Text(
+                            'Workers can choose FIFO vs specific batch',
+                          ),
+                          value: _allowBatchOverride,
+                          onChanged: (value) =>
+                              setState(() => _allowBatchOverride = value),
+                        ),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Allow worker line discounts'),
+                          subtitle: const Text(
+                            'Workers can apply line discounts / free crates',
+                          ),
+                          value: _allowWorkerDiscounts,
+                          onChanged: (value) =>
+                              setState(() => _allowWorkerDiscounts = value),
+                        ),
+                        DropdownButtonFormField<String>(
+                          initialValue: _defaultDiscountType,
+                          decoration: const InputDecoration(
+                            labelText: 'Worker default discount type',
+                            border: OutlineInputBorder(),
+                          ),
+                          items: const [
+                            DropdownMenuItem(
+                              value: 'item',
+                              child: Text('Free items (giveaway)'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'flat',
+                              child: Text('Flat amount'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'percent',
+                              child: Text('Percent'),
+                            ),
+                          ],
+                          onChanged: (value) {
+                            if (value != null) {
+                              setState(() => _defaultDiscountType = value);
+                            }
+                          },
                         ),
                       ],
                       if (_tab == _SettingsTab.stock) ...[

@@ -6,6 +6,9 @@ class SettingsProfileContract {
   static const defaultFeedReminder = '18:00';
   static const defaultCurrency = 'GHS';
   static const defaultEggsPerCrate = 30;
+  static const defaultEggUnit = 'crate';
+  static const defaultEggSortMode = 'unsorted';
+  static const defaultDiscountType = 'item';
   static const defaultReorderLevelKg = 500.0;
 
   static const currencyOptions = <String, String>{
@@ -144,6 +147,10 @@ class FarmSettingsData {
     required this.eggRecordReminderTime,
     required this.feedRecordReminderTime,
     this.growthTargetStandard,
+    this.defaultEggUnit = SettingsProfileContract.defaultEggUnit,
+    this.allowEggUnitChange = false,
+    this.defaultEggSortMode = SettingsProfileContract.defaultEggSortMode,
+    this.allowEggSortModeChange = false,
   });
 
   final String farmId;
@@ -155,6 +162,13 @@ class FarmSettingsData {
   final String eggRecordReminderTime;
   final String feedRecordReminderTime;
   final int? growthTargetStandard;
+  final String defaultEggUnit;
+  final bool allowEggUnitChange;
+  final String defaultEggSortMode;
+  final bool allowEggSortModeChange;
+
+  bool get defaultUseCrates => defaultEggUnit != 'individual';
+  bool get defaultIsSorted => defaultEggSortMode == 'sorted';
 
   factory FarmSettingsData.defaults({required String farmId}) {
     return FarmSettingsData(
@@ -167,6 +181,24 @@ class FarmSettingsData {
       eggRecordReminderTime: SettingsProfileContract.defaultEggReminder,
       feedRecordReminderTime: SettingsProfileContract.defaultFeedReminder,
     );
+  }
+}
+
+class SalesSettingsData {
+  const SalesSettingsData({
+    required this.farmId,
+    this.allowBatchOverride = false,
+    this.allowWorkerDiscounts = false,
+    this.defaultDiscountType = SettingsProfileContract.defaultDiscountType,
+  });
+
+  final String farmId;
+  final bool allowBatchOverride;
+  final bool allowWorkerDiscounts;
+  final String defaultDiscountType;
+
+  factory SalesSettingsData.defaults({required String farmId}) {
+    return SalesSettingsData(farmId: farmId);
   }
 }
 

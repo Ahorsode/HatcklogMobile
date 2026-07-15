@@ -13,6 +13,7 @@ import '../../features/sync/data/worker_log_mutator.dart';
 import '../../services/local_sales_queue.dart';
 import '../../services/pdf_invoice_service.dart';
 import '../eggs/egg_quick_add_sheet.dart';
+import 'worker_quarantine_screen.dart';
 import '../feeding/feed_formulation_create_sheet.dart';
 import '../feeding/feeding_quick_add_sheet.dart';
 import '../finance/log_expense_sheet.dart';
@@ -122,6 +123,8 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
           'farms',
           'batches',
           'houses',
+          'inventory',
+          'feed_formulations',
           'egg_production',
           'daily_feeding_logs',
           'mortality',
@@ -158,6 +161,8 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
                b.batch_name,
                b.type,
                b.current_count,
+               b.isolation_count,
+               b.status,
                b.house_id,
                h.name as house_name
         from batches b
@@ -178,6 +183,8 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
               batchLabel: row['batch_name']?.toString() ?? 'Batch',
               livestockType: row['type']?.toString() ?? '',
               currentCount: _asInt(row['current_count']),
+              isolationCount: _asInt(row['isolation_count']),
+              status: row['status']?.toString() ?? 'active',
               houseId: row['house_id']?.toString() ?? '',
               houseLabel: row['house_name']?.toString() ?? '',
             ),
@@ -259,6 +266,22 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
       await _openReportsWizard();
       return;
     }
+    if (module.module == WorkerModule.quarantine) {
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (context) => WorkerQuarantineScreen(
+            currentUser: widget.currentUser,
+            localDatabase: widget.localDatabase,
+            inputSink: widget.inputSink,
+            batches: _batches,
+            canEdit: module.canEdit,
+            remoteApi: widget.remoteApi,
+          ),
+        ),
+      );
+      _loadDashboardData();
+      return;
+    }
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (context) => WorkerModuleListScreen(
@@ -270,6 +293,10 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
           batches: _batches,
           canEditModule: module.canEdit,
           onQuickAdd: module.canEdit ? () => _openQuickAdd(module) : null,
+          onCreateFormulation: module.module == WorkerModule.feeding &&
+                  module.canEdit
+              ? _openFeedFormulationCreate
+              : null,
           onEditLog: (row) => _openLogEdit(module, row),
         ),
       ),
@@ -286,6 +313,8 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
       case WorkerModule.feeding:
       case WorkerModule.mortality:
         await _openBatchScopedQuickAdd(module);
+      case WorkerModule.quarantine:
+        await _openQuarantinePage();
       case WorkerModule.health:
         await _openHealthScreen(canEdit: module.canEdit);
       case WorkerModule.reports:
@@ -515,6 +544,7 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
             currentUser: widget.currentUser,
             batch: batch,
             inputSink: widget.inputSink,
+            localDatabase: widget.localDatabase,
             editConfig: editConfig,
             initialRow: initialRow,
           ),
@@ -707,6 +737,13 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
     }
   }
 
+  Future<void> _openQuarantinePage() async {
+    final module = _moduleFor(WorkerModule.quarantine);
+    if (module != null) {
+      await _openModule(module);
+    }
+  }
+
   Future<void> _openFeedFormulationCreate() async {
     SupabaseClient? supabase;
     try {
@@ -725,6 +762,7 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
           currentUser: widget.currentUser,
           localDatabase: widget.localDatabase,
           supabase: supabase,
+          onOpenInventory: _openInventoryFromEmptyFeed,
         );
       },
     );
@@ -776,6 +814,8 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
           workerModule,
           defaultHealthType: defaultHealthType,
         );
+      case WorkerModule.quarantine:
+        await _openQuarantinePage();
       case WorkerModule.health:
         await _openHealthScreen(canEdit: workerModule.canEdit);
       default:
@@ -917,10 +957,7 @@ class _WorkerHomeScreenState extends State<WorkerHomeScreen> {
                             WorkerModule.mortality,
                             defaultHealthType: MortalityHealthType.dead,
                           ),
-                          onLogQuarantine: () => _openDashboardQuickAction(
-                            WorkerModule.mortality,
-                            defaultHealthType: MortalityHealthType.sick,
-                          ),
+                          onLogQuarantine: _openQuarantinePage,
                           onLogHealth: () => _openHealthScreen(
                             canEdit: widget.permissions.canEditHealth,
                           ),
@@ -996,6 +1033,7 @@ class WorkerModuleListScreen extends StatefulWidget {
     this.batches = const [],
     this.canEditModule = false,
     this.onQuickAdd,
+    this.onCreateFormulation,
     this.onEditLog,
   });
 
@@ -1007,6 +1045,7 @@ class WorkerModuleListScreen extends StatefulWidget {
   final List<BatchSummary> batches;
   final bool canEditModule;
   final VoidCallback? onQuickAdd;
+  final VoidCallback? onCreateFormulation;
   final Future<void> Function(Map<String, Object?> row)? onEditLog;
 
   @override
@@ -1019,14 +1058,28 @@ class _WorkerModuleListScreenState extends State<WorkerModuleListScreen> {
   String _eggStockFilter = 'all';
 
   bool get _isEggsModule => widget.module.module == WorkerModule.eggs;
+  bool get _isFeedingModule => widget.module.module == WorkerModule.feeding;
 
   @override
   void initState() {
     super.initState();
     _subscription = widget.localDatabase
-        .watchTables([_tableFor(widget.module.module)])
+        .watchTables(_watchedTablesFor(widget.module.module))
         .listen((_) => _loadRows());
     _loadRows();
+  }
+
+  List<String> _watchedTablesFor(WorkerModule module) {
+    return switch (module) {
+      WorkerModule.eggs => const ['egg_production'],
+      WorkerModule.feeding => const [
+        'daily_feeding_logs',
+        'inventory',
+        'feed_formulations',
+      ],
+      WorkerModule.quarantine => const ['quarantine', 'batches', 'isolation_rooms'],
+      _ => [_tableFor(module)],
+    };
   }
 
   @override
@@ -1076,7 +1129,29 @@ class _WorkerModuleListScreenState extends State<WorkerModuleListScreen> {
         from egg_production e
         left join batches b on b.id = e.batch_id
         where e.farm_id = ? and coalesce(e.is_deleted, 0) = 0
-        order by log_date desc
+        order by log_date desc, e.id desc
+        limit 200
+        ''',
+        [farmId],
+      ),
+      WorkerModule.feeding => await widget.localDatabase.rawLocalQuery(
+        '''
+        select f.*, b.batch_name
+        from daily_feeding_logs f
+        left join batches b on b.id = f.batch_id
+        where f.farm_id = ? and coalesce(f.is_deleted, 0) = 0
+        order by f.log_date desc, f.id desc
+        limit 200
+        ''',
+        [farmId],
+      ),
+      WorkerModule.quarantine => await widget.localDatabase.rawLocalQuery(
+        '''
+        select q.*, b.batch_name
+        from quarantine q
+        left join batches b on b.id = q.batch_id
+        where q.farm_id = ? and coalesce(q.is_deleted, 0) = 0
+        order by q.log_date desc, q.id desc
         limit 200
         ''',
         [farmId],
@@ -1122,6 +1197,16 @@ class _WorkerModuleListScreenState extends State<WorkerModuleListScreen> {
         backgroundColor: Colors.white,
         surfaceTintColor: Colors.white,
         title: Text(widget.module.label),
+        actions: [
+          if (_isFeedingModule &&
+              widget.canEditModule &&
+              widget.onCreateFormulation != null)
+            TextButton.icon(
+              onPressed: widget.onCreateFormulation,
+              icon: const Icon(Icons.science_outlined, size: 18),
+              label: const Text('Create Formulation'),
+            ),
+        ],
       ),
       floatingActionButton: widget.onQuickAdd == null
           ? null
@@ -1144,6 +1229,34 @@ class _WorkerModuleListScreenState extends State<WorkerModuleListScreen> {
             : ListView(
                 padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
                 children: [
+                  if (_isFeedingModule &&
+                      widget.canEditModule &&
+                      widget.onQuickAdd != null &&
+                      widget.onCreateFormulation != null) ...[
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: widget.onQuickAdd,
+                            icon: const Icon(Icons.grass_outlined, size: 18),
+                            label: const Text('Log Feeding'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: widget.onCreateFormulation,
+                            icon: const Icon(Icons.add, size: 18),
+                            label: const Text('Create Formulation'),
+                            style: FilledButton.styleFrom(
+                              backgroundColor: const Color(0xff1f7a4d),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                  ],
                   if (_isEggsModule) ...[
                     Wrap(
                       spacing: 8,
@@ -1498,7 +1611,7 @@ _RecordVm _recordFor(WorkerModule module, Map<String, Object?> row) {
     WorkerModule.feeding => _RecordVm(
       title: '${_asDouble(row['amount_consumed']).toStringAsFixed(2)} bags',
       subtitle:
-          '${_text(row['feed_type_label'], 'Feed')} | ${_dateText(row['log_date'])}',
+          '${_text(row['feed_type_label'], 'Feed')} | ${_batchDisplayName(row)} | ${_dateText(row['log_date'])}',
       metric: '',
     ),
     WorkerModule.mortality => _RecordVm(
@@ -1506,6 +1619,12 @@ _RecordVm _recordFor(WorkerModule module, Map<String, Object?> row) {
           '${_asInt(row['count'])} ${_text(row['type'], 'DEAD').toLowerCase()}',
       subtitle:
           '${_text(row['sub_category'], _text(row['reason'], 'Unknown'))} | ${_dateText(row['log_date'])}',
+      metric: _text(row['category']),
+    ),
+    WorkerModule.quarantine => _RecordVm(
+      title: '${_asInt(row['count'] ?? row['sick_count'])} sick',
+      subtitle:
+          '${_batchDisplayName(row)} | ${_text(row['sub_category'], _text(row['reason'], 'Quarantine'))} | ${_dateText(row['log_date'])}',
       metric: _text(row['category']),
     ),
     WorkerModule.health => const _RecordVm(
@@ -1580,6 +1699,7 @@ String _tableFor(WorkerModule module) {
     WorkerModule.eggs => 'egg_production',
     WorkerModule.feeding => 'daily_feeding_logs',
     WorkerModule.mortality => 'mortality',
+    WorkerModule.quarantine => 'quarantine',
     WorkerModule.health => 'health_schedules',
     WorkerModule.reports => 'batches',
     WorkerModule.houses => 'houses',
@@ -1605,6 +1725,7 @@ String _orderByFor(WorkerModule module) {
     WorkerModule.eggs => 'log_date desc',
     WorkerModule.feeding => 'log_date desc',
     WorkerModule.mortality => 'log_date desc',
+    WorkerModule.quarantine => 'log_date desc',
     WorkerModule.health => 'scheduled_date desc',
     WorkerModule.reports => 'batch_name asc',
     WorkerModule.sales => 'sale_date desc',
@@ -1621,6 +1742,7 @@ Color _colorFor(WorkerModule module) {
     WorkerModule.eggs => const Color(0xffc7851f),
     WorkerModule.feeding => const Color(0xff1f7a4d),
     WorkerModule.mortality => const Color(0xffb83b3b),
+    WorkerModule.quarantine => const Color(0xffb45309),
     WorkerModule.health => const Color(0xff2f7a6d),
     WorkerModule.reports => const Color(0xff4d6475),
     WorkerModule.houses => const Color(0xff2f5f8f),

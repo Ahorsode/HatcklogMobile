@@ -40,11 +40,30 @@ double saleUnitPricePerEgg({
   return eggsPerCrate > 0 ? displayUnitPrice / eggsPerCrate : displayUnitPrice;
 }
 
+/// Money value of free units given on top of paid quantity.
+double computeItemGiveawayDiscount(double giveawayQty, double unitPrice) {
+  if (giveawayQty <= 0 || unitPrice <= 0) {
+    return 0;
+  }
+  return giveawayQty * unitPrice;
+}
+
+/// Stock quantity leaving inventory = paid units + free giveaway units.
+int saleQuantityWithGiveaway(int paidQuantity, int giveawayQuantity) {
+  final paid = paidQuantity < 0 ? 0 : paidQuantity;
+  final free = giveawayQuantity < 0 ? 0 : giveawayQuantity;
+  return paid + free;
+}
+
 double computeLineDiscount({
   required double lineSubtotal,
   required double discountAmount,
   String discountType = 'flat',
+  double unitPrice = 0,
 }) {
+  if (discountType == 'item') {
+    return computeItemGiveawayDiscount(discountAmount, unitPrice);
+  }
   if (lineSubtotal <= 0) {
     return 0;
   }

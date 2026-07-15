@@ -3,8 +3,10 @@ import 'package:flutter/services.dart';
 
 import '../../core/models/app_user.dart';
 import '../../core/models/worker_input_type.dart';
+import '../../core/storage/local_database.dart';
 import '../../features/sync/data/worker_input_sink.dart';
 import '../../features/sync/data/worker_log_mutator.dart';
+import '../../services/farm_settings_service.dart';
 import '../../utils/egg_log_utils.dart';
 import '../worker/widgets/quick_add_batch_grid.dart';
 
@@ -14,6 +16,7 @@ class EggQuickAddSheet extends StatefulWidget {
     required this.currentUser,
     required this.batch,
     required this.inputSink,
+    this.localDatabase,
     this.editConfig,
     this.initialRow,
   });
@@ -21,6 +24,7 @@ class EggQuickAddSheet extends StatefulWidget {
   final AppUser currentUser;
   final BatchSummary batch;
   final WorkerInputSink inputSink;
+  final LocalDatabase? localDatabase;
   final WorkerLogEditConfig? editConfig;
   final Map<String, Object?>? initialRow;
 
@@ -37,18 +41,23 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
   final _largeController = TextEditingController();
   final _unusableController = TextEditingController();
 
-  bool _useCrates = false;
+  bool _useCrates = true;
   bool _isSorted = false;
+  bool _allowEggUnitChange = false;
+  bool _allowEggSortModeChange = false;
   bool _isSaving = false;
+  bool _settingsLoaded = false;
+  int _eggsPerCrate = defaultEggsPerCrate;
   DateTime _logDate = DateTime.now();
   String _qualityGrade = 'MEDIUM';
 
   int get _eggsCollected => calculateEggsCollected(
-    useCrates: _useCrates,
-    crates: _intValue(_cratesController),
-    remainder: _intValue(_remainderController),
-    individualTotal: _intValue(_totalEggsController),
-  );
+        useCrates: _useCrates,
+        crates: _intValue(_cratesController),
+        remainder: _intValue(_remainderController),
+        individualTotal: _intValue(_totalEggsController),
+        eggsPerCrate: _eggsPerCrate,
+      );
 
   int get _allocated =>
       _intValue(_smallController) +
@@ -58,13 +67,13 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
   int get _unusable => _intValue(_unusableController);
 
   String? get _validationError => validateEggLog(
-    eggsCollected: _eggsCollected,
-    unusableCount: _unusable,
-    isSorted: _isSorted,
-    smallCount: _intValue(_smallController),
-    mediumCount: _intValue(_mediumController),
-    largeCount: _intValue(_largeController),
-  );
+        eggsCollected: _eggsCollected,
+        unusableCount: _unusable,
+        isSorted: _isSorted,
+        smallCount: _intValue(_smallController),
+        mediumCount: _intValue(_mediumController),
+        largeCount: _intValue(_largeController),
+      );
 
   bool get _canSubmit => !_isSaving && _validationError == null;
 
@@ -72,6 +81,45 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
   void initState() {
     super.initState();
     _hydrateFromInitialRow();
+    _loadFarmSettings();
+  }
+
+  Future<void> _loadFarmSettings() async {
+    final db = widget.localDatabase;
+    if (db == null) {
+      setState(() => _settingsLoaded = true);
+      return;
+    }
+    final settings = await FarmSettingsService(db).load(
+      widget.currentUser.activeFarmId,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _eggsPerCrate = settings.eggsPerCrate;
+      _allowEggUnitChange = settings.allowEggUnitChange;
+      _allowEggSortModeChange = settings.allowEggSortModeChange;
+      if (widget.initialRow == null) {
+        _useCrates = settings.defaultUseCrates;
+        _isSorted = settings.defaultIsSorted;
+      } else {
+        // Keep hydrated crate/sort mode but refresh remainder clamp via eggsPerCrate.
+        if (_useCrates) {
+          final eggsCollected = _rowInt(widget.initialRow!['eggs_collected']);
+          final crates = _rowDouble(widget.initialRow!['crates_collected']);
+          if (crates > 0) {
+            final remainder =
+                eggsCollected - (crates * _eggsPerCrate).round();
+            if (remainder > 0) {
+              _remainderController.text =
+                  remainder.clamp(0, _eggsPerCrate - 1).toString();
+            }
+          }
+        }
+      }
+      _settingsLoaded = true;
+    });
   }
 
   void _hydrateFromInitialRow() {
@@ -84,7 +132,7 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
     if (crates > 0) {
       _useCrates = true;
       _cratesController.text = crates.toString();
-      final remainder = eggsCollected - (crates * defaultEggsPerCrate).round();
+      final remainder = eggsCollected - (crates * _eggsPerCrate).round();
       if (remainder > 0) {
         _remainderController.text = remainder.toString();
       }
@@ -165,6 +213,7 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
         useCrates: _useCrates,
         crates: _intValue(_cratesController),
         remainder: _intValue(_remainderController),
+        eggsPerCrate: _eggsPerCrate,
       );
       final editConfig = widget.editConfig;
       if (editConfig != null) {
@@ -243,24 +292,41 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
                   color: const Color(0xffc7851f),
                 ),
                 const SizedBox(height: 16),
-                SegmentedButton<bool>(
-                  segments: const [
-                    ButtonSegment(
-                      value: false,
-                      label: Text('Individual Eggs'),
-                      icon: Icon(Icons.egg_alt_outlined),
+                if (!_settingsLoaded)
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 14),
+                    child: LinearProgressIndicator(minHeight: 2),
+                  ),
+                if (_allowEggUnitChange)
+                  SegmentedButton<bool>(
+                    segments: [
+                      const ButtonSegment(
+                        value: false,
+                        label: Text('Individual Eggs'),
+                        icon: Icon(Icons.egg_alt_outlined),
+                      ),
+                      ButtonSegment(
+                        value: true,
+                        label: Text('Crates ($_eggsPerCrate/ea)'),
+                        icon: const Icon(Icons.inventory_2_outlined),
+                      ),
+                    ],
+                    selected: {_useCrates},
+                    onSelectionChanged: (values) {
+                      setState(() => _useCrates = values.first);
+                    },
+                  )
+                else
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Chip(
+                      label: Text(
+                        _useCrates
+                            ? 'Logging in crates ($_eggsPerCrate/ea)'
+                            : 'Logging individual eggs',
+                      ),
                     ),
-                    ButtonSegment(
-                      value: true,
-                      label: Text('Crates (30/ea)'),
-                      icon: Icon(Icons.inventory_2_outlined),
-                    ),
-                  ],
-                  selected: {_useCrates},
-                  onSelectionChanged: (values) {
-                    setState(() => _useCrates = values.first);
-                  },
-                ),
+                  ),
                 const SizedBox(height: 14),
                 if (_useCrates)
                   Row(
@@ -277,7 +343,7 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
                         child: _NumberField(
                           controller: _remainderController,
                           label: 'Remainder Eggs',
-                          maxValue: 29,
+                          maxValue: _eggsPerCrate - 1,
                           onChanged: () => setState(() {}),
                         ),
                       ),
@@ -290,23 +356,31 @@ class _EggQuickAddSheetState extends State<EggQuickAddSheet> {
                     onChanged: () => setState(() {}),
                   ),
                 const SizedBox(height: 14),
-                SegmentedButton<bool>(
-                  segments: const [
-                    ButtonSegment(value: false, label: Text('Unsorted')),
-                    ButtonSegment(value: true, label: Text('Sorted')),
-                  ],
-                  selected: {_isSorted},
-                  onSelectionChanged: (values) {
-                    setState(() {
-                      _isSorted = values.first;
-                      if (!_isSorted) {
-                        _smallController.clear();
-                        _mediumController.clear();
-                        _largeController.clear();
-                      }
-                    });
-                  },
-                ),
+                if (_allowEggSortModeChange)
+                  SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(value: false, label: Text('Unsorted')),
+                      ButtonSegment(value: true, label: Text('Sorted')),
+                    ],
+                    selected: {_isSorted},
+                    onSelectionChanged: (values) {
+                      setState(() {
+                        _isSorted = values.first;
+                        if (!_isSorted) {
+                          _smallController.clear();
+                          _mediumController.clear();
+                          _largeController.clear();
+                        }
+                      });
+                    },
+                  )
+                else
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Chip(
+                      label: Text(_isSorted ? 'Sorted eggs' : 'Unsorted eggs'),
+                    ),
+                  ),
                 const SizedBox(height: 14),
                 if (!_isSorted)
                   DropdownButtonFormField<String>(
@@ -446,9 +520,9 @@ class _SheetHeader extends StatelessWidget {
               Text(
                 title,
                 style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                  fontWeight: FontWeight.w900,
-                  letterSpacing: 0,
-                ),
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0,
+                    ),
               ),
               Text(
                 subtitle,

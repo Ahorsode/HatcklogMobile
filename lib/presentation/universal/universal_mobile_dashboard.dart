@@ -24,6 +24,7 @@ import '../../features/inventory/data/inventory_repository.dart';
 import '../../services/dashboard_stats_service.dart';
 import '../../services/executive_metrics_service.dart';
 import '../../utils/livestock_breed_options.dart';
+import '../../utils/feed_inventory_filter.dart';
 import '../../utils/feed_source_utils.dart';
 import '../../utils/inventory_sale_utils.dart';
 import '../../utils/egg_log_utils.dart';
@@ -688,6 +689,7 @@ class _UniversalMobileDashboardState extends State<UniversalMobileDashboard> {
                             currentUser: widget.currentUser,
                             batch: batch,
                             inputSink: widget.inputSink,
+                            localDatabase: widget.localDatabase,
                           ),
                         );
                         if (!mounted || saved != true) {
@@ -2311,8 +2313,7 @@ class _ModuleEntrySheetState extends State<_ModuleEntrySheet> {
         from inventory
         where farm_id = ?
           and is_deleted = 0
-          and (lower(coalesce(category, '')) = 'feed'
-            or lower(coalesce(item_group, '')) = 'feed')
+          and $feedInventorySqlWhere
         order by item_name asc
         ''',
         [user.activeFarmId],
